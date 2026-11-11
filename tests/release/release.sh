@@ -2,10 +2,9 @@
 # `just release X.Y.Z`: the one-command, resumable release (docs/m4/release.md section 9.5). It binds
 # a run to the version and the release commit, takes the lock, runs the preflight, and works out from
 # the world (git refs, GitHub's runs and releases, crates.io, the Homebrew tap) which of the seventeen
-# steps are done. This version ACTS on steps 1-12 (candidate: checks only, through verify-signed) and
-# stops at step 13 `publish` with what to do by hand; the later actions arrive in PR 6 (publish to
-# finish). Re-run the same command after any failure: every step is detected again first, and no
-# action that is done is repeated.
+# steps are done, then does the next step's action and the ones after it, through `finish`. Re-run the
+# same command after any failure: every step is detected again first, and no action that is done is
+# repeated.
 #
 #   release.sh VERSION [--status] [--reset-state] [--from STEP | --redo STEP] [--confirm-each]
 #                      [--ttl 8h] [--lock-keys] [--repo OWNER/REPO] [--origin REMOTE]
@@ -16,7 +15,7 @@
 #                  run ids, the tag object) in the state, run the preflight for the next step and
 #                  the ones after it, at a terminal unlock the keys the remaining steps need (one
 #                  block, release-keys.sh unlock --ttl), then do the next step's action and the ones
-#                  after it, through verify-signed:
+#                  after it, through finish:
 #                    mirror      [confirmation] a commit signed by the owner (git commit-tree -S) with
 #                                the release commit's exact tree on top of GitHub's main, pushed there
 #                    dry-run     dispatch release.yml, and linux-check and macos-check with suite=all
@@ -55,11 +54,44 @@
 #                                differ from the draft's (all five on --redo)
 #                    verify-signed  release-verify --reuse-rebuild (with the signature; it reuses step
 #                                7's rebuild of the tag's commit)
-#                  Exit 0: every step through `brew` is done; 1: failed (the failure says what, what
-#                  to do, and to run the same command again; the step's log is
-#                  target/release-verify/VERSION/logs/NN-STEP.log); 2: paused for a human (a
-#                  confirmation or other prompt not answered yes, no terminal at a prompt, keys
-#                  locked with no terminal to unlock them, or the next step is not automated yet).
+#                    publish     [confirmation, again in every run that did not confirm `publish` itself;
+#                                by default it covers crates and brew too] the draft is read again after
+#                                the answer and must be exactly the files step 12 verified (each asset's
+#                                digest is the one SHA256SUMS lists, or the signed file's), then
+#                                gh release edit vV --draft=false
+#                    verify-published  release-verify --no-rebuild of what is published; its success is
+#                                recorded in the state (verify_published, with the published SHA256SUMS's
+#                                digest). A failure is a loud stop: nothing goes to crates.io or the tap
+#                    crates      [confirmation: covered by `publish` in the same run, else asked as
+#                                `crates`, covering brew] the crates-io job of the tag's run: its pending
+#                                deployment of the crates-io environment is approved through
+#                                pending_deployments (once per run attempt; a deployment not created yet
+#                                is polled for, one already approved is not approved again; one the gh
+#                                user may not approve pauses the run, exit 2, with the run's URL); the
+#                                job is polled until it succeeds, then crates.io until it lists every
+#                                crate. A failed job, at a terminal: one `gh run rerun --failed`
+#                                (publish-crates.sh skips the crates already on crates.io), approved again
+#                    brew        [confirmation: covered by `publish` or `crates` in the same run, else asked
+#                                as `brew`] done when the tap's formula names VERSION with the published
+#                                checksums. Only a tap with no formula, or an older version's, is changed:
+#                                the formula rendered from the published SHA256SUMS, committed (signed, git
+#                                commit -S) on the tap clone's main (--tap; a commit an earlier run made and
+#                                could not push is reused), pushed to the tap's origin. A newer version's,
+#                                or VERSION's with other checksums, is never overwritten. Then brew update,
+#                                brew upgrade (or install) OWNER/tap/fil, and `fil --version` must name
+#                                VERSION; a pass is recorded (brew_tested, with the tested formula's sha256)
+#                    finish      (on every run once brew is done; it changes nothing public) the keys
+#                                forgotten first (release-keys.sh forget; publish forgot them already),
+#                                the AUR PKGBUILD rendered into target/packaging/aur (not published), the
+#                                published SHA256SUMS and .sig copied to /Users/Shared/fil-VERSION for the
+#                                coordinator (a directory of yours, 755, files 644; a symlink or another
+#                                user's directory is refused), and a summary, with the install test's
+#                                result (brew_tested)
+#                  Exit 0: finish is done; 1: failed (the failure says what, what to do, and to run the
+#                  same command again; the step's log is target/release-verify/VERSION/logs/NN-STEP.log);
+#                  2: paused for a human (a confirmation or other prompt not answered yes, no terminal
+#                  at a prompt, keys locked with no terminal to unlock them, or a crates-io deployment
+#                  the gh user may not approve).
 #   --status       per step: done (checked), done (recorded), done (waived), done (implied), next or
 #                  pending, with the run URLs, and whether the release keys are unlocked
 #                  (release-keys.sh status).
@@ -74,13 +106,17 @@
 #   --redo STEP    do STEP's action again although it detects as done, and the actions of the steps
 #                  that consume its output (dry-run: dry-verify; verify-presign, sign-macos: sign-packages
 #                  to verify-signed; sign-packages: sign-sums to verify-signed; sign-sums: upload and
-#                  verify-signed; upload: verify-signed). Only for a step that is done (verify-presign
-#                  only before the upload: a signed draft cannot pass a pre-sign check); dry-run and
-#                  dry-verify only before the tag, verify-presign to verify-signed only while the
-#                  release is a draft. Refused for mirror, tag and tag-run (GitHub keeps them; a failed
-#                  tag run is offered a rerun anyway) and for the steps after verify-signed.
-#   --confirm-each one confirmation per irreversible point. The default is two: `tag` (asked before
-#                  the mirror push, it covers the mirror and the tag) and `publish` (PR 6). Each
+#                  verify-signed; upload: verify-signed; verify-published and brew: only themselves).
+#                  Only for a step that is done (verify-presign only before the upload: a signed draft
+#                  cannot pass a pre-sign check); dry-run and dry-verify only before the tag,
+#                  verify-presign to verify-signed only while the release is a draft, verify-published
+#                  and brew only once it is published (--redo brew never commits or pushes: it runs the
+#                  install test again). Refused for mirror, tag and tag-run (GitHub keeps them;
+#                  a failed tag run is offered a rerun anyway), for publish and crates (they cannot be
+#                  undone) and for finish (it runs on every run once brew is done).
+#   --confirm-each one confirmation per irreversible point (mirror, tag, publish, crates, brew). The
+#                  default is two: `tag` (asked before the mirror push, it covers the mirror and the
+#                  tag) and `publish` (it covers publish, crates and brew). Each
 #                  shows what becomes public and wants the version typed back; there is no --yes,
 #                  and a run whose input is not a terminal stops (exit 2) at the first one.
 #   --ttl T        the key session for release-keys.sh unlock (default 8h).
@@ -89,7 +125,7 @@
 #
 # The state: target/release-verify/VERSION/release.state, `key=value` lines written atomically
 # (temp file and mv), only identifiers the world cannot be asked for cheaply and the results of
-# purely local checks or decisions (dry_verify, checks_waived, verify_published). Never a secret, never
+# purely local checks or decisions (dry_verify, checks_waived, verify_published, brew_tested). Never a secret, never
 # a confirmation, and not the gpg reaper (release-keys.sh keeps it in ~/.cache/fil/release-keys/).
 # Real state beats the state file: every recorded identifier is checked against the world before it
 # counts.
@@ -107,14 +143,25 @@
 #
 # GitHub writes, all in the actions above: the mirror push and the tag push (git), `gh workflow run`
 # of the three workflows, `gh run rerun --failed` when the owner says so, the deletion of a stale
-# DRAFT for the tag (gh api -X DELETE .../releases/ID) when the owner says so, and `gh release upload
-# --clobber` to the draft. Everything else is a read. The tools, each a test-only override refused
-# outside the self-test (FIL_RELEASE_SELFTEST=1): FIL_GH, FIL_GPG, FIL_CARGO, FIL_CRATES_CURL,
-# FIL_RELEASE_ROOT, FIL_RELEASE_VERIFY (verify.sh), FIL_SIGN_MACOS (sign-macos.sh), FIL_SIGN_PACKAGES
+# DRAFT for the tag (gh api -X DELETE .../releases/ID) when the owner says so, `gh release upload
+# --clobber` to the draft, `gh release edit --draft=false` (publish), the approval of the tag run's
+# crates-io deployment (gh api -X POST .../actions/runs/ID/pending_deployments) and the tap push
+# (git). Everything else is a read. No token or passphrase passes through this script: gh, git and
+# release-keys.sh hold their own. The tools, each a test-only override refused outside the self-test
+# (FIL_RELEASE_SELFTEST=1): FIL_GH, FIL_GPG, FIL_CARGO, FIL_CRATES_CURL, FIL_BREW, FIL_RELEASE_ROOT,
+# FIL_RELEASE_VERIFY (verify.sh), FIL_SIGN_MACOS (sign-macos.sh), FIL_SIGN_PACKAGES
 # (sign-packages.sh), FIL_RELEASE_KEYS (release-keys.sh), FIL_RELEASE_POLL (seconds between polls of
-# the tag's run, default 30), FIL_RELEASE_TTY (=1: treat the input as a terminal),
-# FIL_RELEASE_LOCK_HOLD (hold the lock while a file exists), and the preflight's
+# the tag's run and the crates-io job, default 30), FIL_RELEASE_SHARED (finish's copy for the
+# coordinator, default /Users/Shared/fil-VERSION), FIL_RELEASE_TTY (=1: treat the input as a
+# terminal), FIL_RELEASE_LOCK_HOLD (hold the lock while a file exists), and the preflight's
 # (release-preflight.sh). Written for bash 3.2.
+#
+# The whole script is one { ... } group that ends in `exit`: bash reads all of it before it runs any
+# of it, so this file rewritten IN PLACE under a running release (some editors, `cat >`, `sed -i` on
+# some systems; `git pull` writes a new file, which a running bash never reads) cannot make the run
+# execute a mix of the old and the new text. The scripts it starts later (verify.sh, release-keys.sh,
+# the sign scripts, render.sh) are read when they start, and are not covered.
+{
 set -euo pipefail
 # shellcheck source=tests/release/release-preflight.sh
 source "$(dirname "${BASH_SOURCE[0]}")/release-preflight.sh"
@@ -162,7 +209,10 @@ if [ -n "$redo" ]; then
     candidate) die "--redo candidate: it only checks, and every run checks it" ;;
     mirror | tag) die "--redo $redo: refused, it cannot be redone (GitHub keeps what it pushed; a bad $redo means a new version)" ;;
     tag-run) die "--redo tag-run: refused (the tag's run is GitHub's: a failed one is offered a rerun of its failed jobs, and a stale draft its deletion, by the command itself)" ;;
-    publish | verify-published | crates | brew | finish) die "--redo $redo: refused (the steps from publish on are not redone by this version of the command; publish and crates cannot be undone)" ;;
+    verify-published) REDO_LEFT="verify-published" ;;
+    brew) REDO_LEFT="brew" ;;
+    publish | crates) die "--redo $redo: refused, it cannot be undone (a published release is immutable; a crates.io version can only be yanked)" ;;
+    finish) die "--redo finish: refused, there is nothing to redo: finish runs on every run once brew is done (run it without --redo)" ;;
     *) die "--redo $redo: no such step (one of: $PF_STEPS)" ;;
   esac
 fi
@@ -186,6 +236,8 @@ GH=${FIL_GH:-gh}
 GPG=${FIL_GPG:-gpg}
 CARGO=${FIL_CARGO:-cargo}
 CURL=${FIL_CRATES_CURL:-curl}
+BREW=${FIL_BREW:-brew}
+SHARED=${FIL_RELEASE_SHARED:-/Users/Shared/fil-$V}
 VERIFIER=${FIL_RELEASE_VERIFY:-$RELEASE_DIR/verify.sh}
 SIGN_MACOS=${FIL_SIGN_MACOS:-$RELEASE_DIR/sign-macos.sh}
 SIGN_PACKAGES=${FIL_SIGN_PACKAGES:-$RELEASE_DIR/sign-packages.sh}
@@ -221,7 +273,7 @@ tree_of() { rg rev-parse -q --verify "$1^{tree}" 2> /dev/null || true; }
 has_commit() { [ -n "$1" ] && rg cat-file -e "$1^{commit}" 2> /dev/null; }
 
 # ---- the state file
-STATE_KEYS="version release_commit github_commit dry_run checks_linux checks_macos checks_waived dry_verify tag_object tag_run verify_published"
+STATE_KEYS="version release_commit github_commit dry_run checks_linux checks_macos checks_waived dry_verify tag_object tag_run verify_published brew_tested"
 # st_get KEY: the value of the last KEY= line ("" if none).
 st_get() {
   [ -f "$STATE" ] || return 0
@@ -847,20 +899,76 @@ for p in sorted(m["packages"], key=lambda p: p["name"]):
   NOTE="all $(printf '%s\n' $names | grep -c .) crates are on crates.io at $V"
 }
 
-# The formula on the tap's main must be the one render.sh makes from the published SHA256SUMS.
+# formula_read FILE: the version the formula's archive URLs name ("-" unless they all name one), then
+# "NAME SHA256" for each url and sha256 pair.
+formula_read() {
+  python3 -I -c 'import re, sys
+t = open(sys.argv[1]).read()
+pairs = re.findall(r"url\s+\"[^\"]*/(fil-[^\"/]+\.tar\.gz)\"\s*\n\s*sha256\s+\"([0-9a-f]{64})\"", t)
+vs = set()
+for n, _ in pairs:
+    m = re.fullmatch(r"fil-(.+)-(universal-apple-darwin|x86_64-linux-musl|aarch64-linux-musl)\.tar\.gz", n)
+    vs.add(m.group(1) if m else "?")
+print(vs.pop() if len(vs) == 1 and "?" not in vs else "-")
+for n, h in pairs:
+    print(n, h)' "$1"
+}
+# ver_older A B: version A sorts before B (semver precedence: a pre-release before its release).
+# 0 yes, 1 no, 2 not a version.
+ver_older() {
+  python3 -I -c 'import sys
+def key(v):
+    core, _, pre = v.partition("-")
+    nums = [int(x) for x in core.split(".")]
+    if len(nums) != 3:
+        raise ValueError(v)
+    if not pre:
+        return (nums, 1, [])
+    return (nums, 0, [(0, int(p), "") if p.isdigit() else (1, 0, p) for p in pre.split(".")])
+try:
+    sys.exit(0 if key(sys.argv[1]) < key(sys.argv[2]) else 1)
+except ValueError:
+    sys.exit(2)' "$1" "$2"
+}
+# tap_formula_state MAIN: TAP_STATE of Formula/fil.rb at the tap's commit MAIN: done (version V, with
+# the published SHA256SUMS's checksums: DRAFT_SUMS), other (version V, other checksums), none, older,
+# newer or unknown; TAP_VER its version.
+TAP_STATE='' TAP_VER=''
+tap_formula_state() {
+  local n h c=0 bad=0 rc
+  TAP_STATE=none TAP_VER=''
+  git -C "$tap" show "$1:Formula/fil.rb" > "$scratch/tap-fil.rb" 2> /dev/null || return 0
+  formula_read "$scratch/tap-fil.rb" > "$scratch/tap-formula" 2> /dev/null || { TAP_STATE=unknown; return 0; }
+  TAP_VER=$(head -n 1 "$scratch/tap-formula")
+  if [ "$TAP_VER" = "$V" ]; then
+    while read -r n h; do
+      c=$((c + 1))
+      grep -qxF "$h  $n" "$DRAFT_SUMS" || bad=1
+    done < <(tail -n +2 "$scratch/tap-formula")
+    if [ "$c" = 3 ] && [ "$bad" = 0 ]; then TAP_STATE=done; else TAP_STATE=other; fi
+    return 0
+  fi
+  rc=0
+  ver_older "$TAP_VER" "$V" || rc=$?
+  case $rc in 0) TAP_STATE=older ;; 1) TAP_STATE=newer ;; *) TAP_STATE=unknown ;; esac
+}
+# The formula on the tap's main must name V, with the checksums the published SHA256SUMS lists (not
+# byte for byte the rendered one: a fix made in the tap afterwards still counts).
 det_brew() {
-  local sums d main
+  local main
   need_published || return 1
   draft_sums || { UNKNOWN=1 NOTE="cannot read the published SHA256SUMS: $(gh_err)"; return 1; }
-  sums=$DRAFT_SUMS
-  "$REPO_ROOT/packaging/render.sh" brew "$V" "$sums" "$scratch/brew" > /dev/null 2>&1 || { NOTE="render.sh cannot make the formula from the published SHA256SUMS"; return 1; }
   git -C "$tap" rev-parse --git-dir > /dev/null 2>&1 || { UNKNOWN=1 NOTE="no tap clone at $tap (--tap DIR)"; return 1; }
   main=$(git -C "$tap" ls-remote origin refs/heads/main 2> /dev/null | awk '{ print $1 }') || main=''
   [ -n "$main" ] || { UNKNOWN=1 NOTE="cannot read main of the tap's origin ($tap)"; return 1; }
   git -C "$tap" cat-file -e "$main^{commit}" 2> /dev/null || { UNKNOWN=1 NOTE="the tap's main ($(short "$main")) is not fetched: git -C $tap fetch origin"; return 1; }
-  git -C "$tap" show "$main:Formula/fil.rb" > "$scratch/tap-fil.rb" 2> /dev/null || { NOTE="the tap's main has no Formula/fil.rb"; return 1; }
-  cmp -s "$scratch/tap-fil.rb" "$scratch/brew/fil.rb" || { NOTE="Formula/fil.rb on the tap's main is not $V's formula"; return 1; }
-  NOTE="Formula/fil.rb on the tap's main ($(short "$main")) is $V's"
+  tap_formula_state "$main"
+  case $TAP_STATE in
+    done) NOTE="Formula/fil.rb on the tap's main ($(short "$main")) is $V's (its version and the published checksums)" ;;
+    none) NOTE="the tap's main has no Formula/fil.rb"; return 1 ;;
+    other) NOTE="Formula/fil.rb on the tap's main names $V, but not with the published SHA256SUMS's checksums"; return 1 ;;
+    *) NOTE="Formula/fil.rb on the tap's main is version ${TAP_VER:--}, not $V"; return 1 ;;
+  esac
 }
 
 det_finish() { NOTE="the summary, forgetting the keys, the copy for the coordinator"; return 1; }
@@ -906,7 +1014,9 @@ detect_all() {
   for ((i = 1; i <= NSTEPS; i++)); do
     case ${KIND[i]} in
       checked | recorded | waived) ;;
-      *) if [ $i -lt "$LAST_DONE" ] && [ "${FORCED[i]}" = 0 ]; then KIND[i]=implied; elif [ "$NEXT" = 0 ]; then NEXT=$i; else KIND[i]=pending; fi ;;
+      # verify-published is never implied: a release whose published files did not verify (or whose
+      # record was lost) verifies again, whatever reached crates.io or the tap meanwhile
+      *) if [ $i -lt "$LAST_DONE" ] && [ "${FORCED[i]}" = 0 ] && [ "$(step_name $i)" != verify-published ]; then KIND[i]=implied; elif [ "$NEXT" = 0 ]; then NEXT=$i; else KIND[i]=pending; fi ;;
     esac
   done
 }
@@ -946,7 +1056,7 @@ print_status() {
   "$KEYS" status --need ssh,gpg < /dev/null 2>&1 | sed 's/^/  /' || true
 }
 
-# ---- the actions of steps 1-12. Each runs with its step's log open and returns once its action is
+# ---- the actions, from step 1. Each runs with its step's log open and returns once its action is
 # done (the loop then detects every step again); any failure stops the run through step_fail.
 utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 STEP_LOG='' STEP_LOG_START=0
@@ -989,6 +1099,15 @@ known_fix() {
         echo "GitHub or the network failed for a moment: run it again (it re-attaches to the runs it started)"
       fi
       ;;
+    verify-published)
+      # the transient and missing-tool failures first: verify.sh says STOP for them too, and the step
+      # only verifies, so running it again is always safe
+      if log_has 'HTTP 5[0-9][0-9]|bad gateway|timed? ?out|connection (reset|refused)|could not resolve|could not fetch|rpmkeys is needed|not found'; then
+        echo "a network, GitHub or tool failure, not necessarily the release: run it again; if it fails the same way, treat it as a STOP (do NOT approve crates.io or touch the tap) and send the log to the coordinator"
+      elif log_has 'FAILED|released [0-9a-f]*, rebuilt|STOP: |does not verify|not a valid'; then
+        echo "STOP: the PUBLISHED release did not verify: do NOT approve crates.io or touch the tap. Keep the log and send it to the coordinator; a published release cannot change, so the fix is a new patch version"
+      fi
+      ;;
     dry-verify | verify-presign | verify-signed)
       if log_has "Lima instance .* is not running"; then
         echo "limactl start $m"
@@ -1017,8 +1136,10 @@ known_fix() {
         echo "the release key is not in the agent: just release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
       fi
       ;;
-    tag-run | upload)
-      if log_has 'HTTP 401|gh auth login|authentication'; then
+    tag-run | upload | publish | crates)
+      if [ "$1" = crates ] && log_has 'HTTP 422'; then
+        echo "GitHub refused the approval (the deployment was approved or rejected meanwhile, or is no longer waiting): run it again (it looks at the job again)"
+      elif log_has 'HTTP 401|gh auth login|authentication'; then
         echo "gh auth status; gh auth refresh -h github.com -s repo,workflow (as $PF_OWNER)"
       elif log_has 'rate limit|HTTP 429'; then
         echo "GitHub's API limit: wait (gh api rate_limit says until when)"
@@ -1047,6 +1168,20 @@ known_fix() {
     sign-sums)
       if log_has 'agent refused|couldn.t find key|no such identity|signing failed|incorrect passphrase|load key|no private key'; then
         echo "the release key is not in the agent: just release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
+      fi
+      ;;
+    brew)
+      if log_has 'non-fast-forward|fetch first|\[rejected\]|stale info'; then
+        echo "the tap's main moved since the fetch: run it again (it fetches the tap and makes the commit on its new main)"
+      elif log_has 'permission denied \(publickey\)|could not read from remote'; then
+        echo "ssh-add your GitHub key (ssh -T git@github.com must say Hi $PF_OWNER)"
+      elif log_has 'failed to sign|no private key found|agent refused|could not sign|signing failed|incorrect passphrase|ssh-keygen.*(error|failed)'; then
+        echo "git cannot sign the tap commit: ssh-add the key that git config user.signingkey names, then run it again"
+      fi
+      ;;
+    finish)
+      if log_has 'release-keys'; then
+        echo "forget the keys yourself: just release-keys forget --need ssh,gpg (then run it again for the summary)"
       fi
       ;;
   esac
@@ -1440,7 +1575,7 @@ tr_delete() {
   done
 }
 act_tag_run() {
-  local n=0 rerun=0 rels drafts x a0 keep names missing t0 el stuck=0 failed_seen=0
+  local n=0 rerun=0 rels drafts x a0 keep names missing f t0 el stuck=0 failed_seen=0
   step_log tag-run
   while :; do
     tr_find
@@ -1598,23 +1733,331 @@ act_verify_signed() {
   run_step_cmd "release-verify $V --reuse-rebuild" "$VERIFIER" "$V" --repo "$repo" --reuse-rebuild ${vm:+--vm "$vm"}
 }
 
-# do_hint STEP: what to do by hand at a step after verify-signed, until the command does it (PR 6).
-do_hint() {
+# ---- the actions of steps 13-17.
+# The publish confirmation: by default one answer, `publish`, covers publish, crates and brew; a run
+# that did not get it (a resume) asks at the first of them it acts on, under that step's name, and
+# the answer covers the steps after it. --confirm-each asks at each. Never stored, as the tag's.
+pub_covered() {
+  case " $CONFIRMED " in *" $1 "*) return 0 ;; esac
+  [ "$confirm_each" = 0 ] || return 1
   case $1 in
-    tag) echo "git -c gpg.format=ssh -c user.signingkey=\$HOME/.ssh/fil-release.pub tag -s -m 'fil $V' $TAG-gh ${G:-G} && git push $github $TAG-gh:refs/tags/$TAG  (irreversible)" ;;
-    tag-run) echo "wait for the tag's release.yml run to publish the draft${TAG_RUN:+ ($(run_url "$TAG_RUN"))}; gh run list --repo $repo --workflow release.yml --event push" ;;
-    verify-presign) echo "just release-verify $V --pre-sign" ;;
-    sign-macos) echo "FIL_RELEASE_KEY=\$HOME/.ssh/fil-release.pub just release-sign-macos $V" ;;
-    sign-packages) echo "just release-sign-packages $V" ;;
-    sign-sums) echo "rm -f $FILES/SHA256SUMS.sig && ssh-keygen -Y sign -f \$HOME/.ssh/fil-release.pub -n fil-release $FILES/SHA256SUMS" ;;
-    upload) echo "(cd $FILES && gh release upload $TAG --repo $repo --clobber $RPMS SHA256SUMS SHA256SUMS.asc SHA256SUMS.sig)" ;;
-    verify-signed) echo "just release-verify $V" ;;
-    publish) echo "gh release edit $TAG --repo $repo --draft=false  (irreversible)" ;;
-    verify-published) echo "just release-verify $V --no-rebuild  (by hand it leaves no record: this step reads done once the crates are out; PR 6 records it)" ;;
-    crates) echo "approve the crates-io deployment of the tag's run${TAG_RUN:+ ($(run_url "$TAG_RUN"))} and wait for its crates-io job" ;;
-    brew) echo "just brew-formula $V; copy target/packaging/homebrew/fil.rb to $tap/Formula/fil.rb; commit (signed) and push the tap" ;;
-    finish) echo "nothing: the summary and key forgetting arrive in PR 6" ;;
+    crates) case " $CONFIRMED " in *" publish "*) return 0 ;; esac ;;
+    brew) case " $CONFIRMED " in *" publish "* | *" crates "*) return 0 ;; esac ;;
   esac
+  return 1
+}
+pub_line() {
+  local d
+  case $1 in
+    publish)
+      d=$(asset_digest SHA256SUMS)
+      echo "step 13 publish: the draft $TAG on github.com/$repo becomes the public release, with the files step 12 verified (SHA256SUMS $(short "$d")); immutable releases: they can never be changed or deleted"
+      ;;
+    crates) echo "step 15 crates: the approval of the crates-io deployment of the tag's run ${TAG_RUN:+$(run_url "$TAG_RUN")}, which publishes the crates at $V to crates.io, where a version can only be yanked, never replaced" ;;
+    brew) echo "step 16 brew: $V's formula, committed (signed by you) on the main branch of the tap clone $tap and pushed to its origin; whoever runs brew upgrade gets it" ;;
+  esac
+}
+# pub_confirm STEP: asks for STEP's confirmation unless this run's answers cover it.
+pub_confirm() {
+  local s on=0
+  local -a lines=()
+  if pub_covered "$1"; then
+    echo "the confirmation for $1 was given in this run" >> "$STEP_LOG"
+    return 0
+  fi
+  for s in publish crates brew; do
+    [ "$s" != "$1" ] || on=1
+    [ "$on" = 1 ] || continue
+    if [ "$s" = "$1" ]; then
+      lines+=("$(pub_line "$s")")
+    elif [ "$confirm_each" = 0 ]; then
+      lines+=("$(pub_line "$s") (this answer covers it too)")
+    fi
+  done
+  if [ "$confirm_each" = 1 ]; then
+    [ "$1" = brew ] || lines+=("(--confirm-each: the steps after it are asked for on their own)")
+  elif [ "$1" = publish ]; then
+    lines+=("between them: verify-published (release-verify of what is published), which stops the release on its own")
+  fi
+  confirm "$1" "${lines[@]}"
+}
+
+act_publish() {
+  local p=$NEXT want names diff h n
+  step_log publish
+  [ "$REL" = draft ] || step_fail "$TAG is not a draft on GitHub ($REL): nothing is published" "send the log to the coordinator"
+  # nothing from here on signs with the release key or the package key: forget them now, not after
+  # the crates wait or a failure (a failure to forget is reported, and does not stop the release)
+  echo "release-keys.sh forget --need ssh,gpg" >> "$STEP_LOG"
+  "$KEYS" forget --need ssh,gpg < /dev/null >> "$STEP_LOG" 2>&1 \
+    || log "WARNING: release-keys.sh forget failed (the log says why): forget them yourself, just release-keys forget --need ssh,gpg"
+  pub_confirm publish
+  # The answer may have taken hours: the draft is read again, every step must still hold, and the
+  # draft must hold exactly the release's files, each the one step 12 verified (any writer can
+  # replace a draft's assets).
+  detect_all
+  if [ "$NEXT" != "$p" ] || [ "$REL" != draft ]; then
+    NOTE="step $(step_name "$NEXT") reads: ${NOTES[NEXT]}"
+    NEXT=$p
+    step_fail "the release changed while the confirmation waited ($NOTE): nothing is published" "run it again: it checks everything again; if it says the same, send the log to the coordinator"
+  fi
+  want=$({ release_files; printf '%s\n' SHA256SUMS SHA256SUMS.asc SHA256SUMS.sig; } | LC_ALL=C sort)
+  names=$(cut -d' ' -f1 "$scratch/assets" | LC_ALL=C sort)
+  if [ "$names" != "$want" ]; then
+    diff=$(printf '%s\n' "$names" | LC_ALL=C comm -3 - <(printf '%s\n' "$want") | tr -d '\t' | tr '\n' ' ')
+    step_fail "the draft's files are not exactly the release's (extra or missing: $diff): nothing is published" "look at the draft (gh release view $TAG --repo $repo); send the log to the coordinator"
+  fi
+  while read -r h n; do
+    [ -n "$n" ] || continue
+    [ "$(asset_digest "$n")" = "$h" ] || step_fail "the draft's $n is not the file SHA256SUMS lists ($(short "$h")): nothing is published" "send the log to the coordinator (the draft was changed after step 12 verified it)"
+  done < "$FILES/SHA256SUMS"
+  for n in SHA256SUMS SHA256SUMS.asc SHA256SUMS.sig; do
+    [ "$(asset_digest "$n")" = "$(local_sha "$n")" ] || step_fail "the draft's $n is not the one in $FILES: nothing is published" "send the log to the coordinator"
+  done
+  echo "the draft holds exactly the verified files" >> "$STEP_LOG"
+  log "publishing the release $TAG"
+  echo "gh release edit $TAG --repo $repo --draft=false" >> "$STEP_LOG"
+  LC_ALL=C "$GH" release edit "$TAG" --repo "$repo" --draft=false < /dev/null >> "$STEP_LOG" 2>&1 || step_fail "gh release edit $TAG --draft=false failed"
+}
+
+act_verify_published() {
+  local d
+  step_log verify-published
+  d=$(asset_digest SHA256SUMS)
+  [ -n "$d" ] || step_fail "cannot read the digest of the published SHA256SUMS: $(gh_err)"
+  log "verifying the published release: release-verify --no-rebuild (the tag, the signatures, the attestations, release-check)"
+  run_step_cmd "release-verify $V --no-rebuild" "$VERIFIER" "$V" --repo "$repo" --no-rebuild
+  [ "$(local_sha SHA256SUMS)" = "$d" ] || step_fail "release-verify passed, but $FILES/SHA256SUMS is not the published one ($(short "$d"))" "send the log to the coordinator"
+  st_set verify_published "ok $d $(utc)"
+}
+
+# crates_job ID: the conclusion of the run's crates-io job ("-" while it has none).
+crates_job() { sed -n 's/^job \([^ ]*\) crates-io$/\1/p' "$scratch/run-$1" | head -n 1; }
+# pending_crates ID: "ENVIRONMENT-ID CAN-APPROVE" of the run's pending crates-io deployment, nothing
+# if there is none (not created yet, or already reviewed); 1 if GitHub could not be asked.
+pending_crates() {
+  local out
+  out=$(gh_read api "repos/$repo/actions/runs/$1/pending_deployments" --jq '.[] | [.environment.id, .environment.name, .current_user_can_approve] | @tsv') || return 1
+  printf '%s\n' "$out" | awk -F'\t' '$2 == "crates-io" && $1 ~ /^[0-9]+$/ { print $1, $3; exit }'
+}
+act_crates() {
+  local id=$TAG_RUN n=0 t0 el x a a0 rerun=0 approved='' p env
+  step_log crates
+  [ "$REL" = published ] || step_fail "$TAG is not published ($REL): no crates-io deployment is approved" "send the log to the coordinator"
+  [ -n "$id" ] || step_fail "no release.yml run of the tag push whose publish job succeeded: the crates-io job is that run's" "send the log to the coordinator"
+  pub_confirm crates
+  log "the crates-io job of the tag's run $(run_url "$id"): approving its deployment and waiting for it (Ctrl-C is safe: run the same command again to re-attach)"
+  t0=$(date +%s)
+  while :; do
+    rm -f "$scratch/run-$id"
+    run_view "$id" || step_fail "cannot ask GitHub for run $id: $(gh_err)"
+    pred_tag_run "$id" || step_fail "run $id is no longer the tag push's release.yml run on $(short "$G") with a successful publish job" "send the log to the coordinator"
+    x=$(crates_job "$id")
+    [ "$x" != success ] || break
+    if rv_has "$id" "status completed"; then
+      # the crates-io job failed (the gate, crates.io, the network) or was rejected
+      echo "== the failed jobs of the tag's run $id (gh run view --log-failed, the end):" >> "$STEP_LOG"
+      "$GH" run view "$id" --repo "$repo" --log-failed < /dev/null 2>&1 | tail -n 30 >> "$STEP_LOG" || true
+      if [ "$rerun" = 1 ] || ! is_tty; then
+        step_fail "the crates-io job of $(run_url "$id") ended ${x:--} (the end of its log is above)" \
+          "if it is transient (crates.io or the network): run it again at a terminal and answer y to the rerun (publish-crates.sh skips the crates already on crates.io); a gate refusal: send the log to the coordinator"
+      fi
+      echo "release: the crates-io job of $(run_url "$id") ended ${x:--} (the end of its log is in $STEP_LOG)" >&2
+      printf 'release: re-run it (publish-crates.sh skips the crates already on crates.io; its deployment is approved again)? [y/N] ' >&2
+      x=''
+      IFS= read -r x || x=''
+      case $x in
+        y | Y | yes) ;;
+        *) step_fail "the crates-io job of $(run_url "$id") failed; not re-run" "a transient failure: run it again and answer y; anything else: send the log to the coordinator" ;;
+      esac
+      a0=$(rv_attempt "$id")
+      echo "gh run rerun $id --failed (attempt ${a0:-?})" >> "$STEP_LOG"
+      "$GH" run rerun "$id" --repo "$repo" --failed >> "$STEP_LOG" 2>&1 < /dev/null || step_fail "gh run rerun $id --failed failed"
+      dr_rerun_started "$id" "${a0:-0}"
+      rerun=1
+      continue
+    fi
+    # the run goes on: its crates-io job waits for the review, or runs
+    p=$(pending_crates "$id") || step_fail "cannot ask GitHub for the pending deployments of run $id: $(gh_err)"
+    a=$(rv_attempt "$id")
+    if [ -n "$p" ] && [ "$approved" != "${a:-0}" ]; then
+      env=${p%% *}
+      if [ "${p#* }" != true ]; then
+        LAST_DONE=$((NEXT - 1))
+        report PAUSED "$NEXT" "the crates-io deployment of $(run_url "$id") waits for a review the gh user may not give (GitHub: current_user_can_approve is false; \"Prevent self-review\" is on, or the user is not a required reviewer): nothing was approved" \
+          "approve it on the run's page (Review deployments), or fix the crates-io environment's reviewers; then run it again: it waits for the job"
+      fi
+      echo "gh api -X POST repos/$repo/actions/runs/$id/pending_deployments -F environment_ids[]=$env -f state=approved (attempt ${a:-?})" >> "$STEP_LOG"
+      LC_ALL=C "$GH" api -X POST "repos/$repo/actions/runs/$id/pending_deployments" -F "environment_ids[]=$env" -f state=approved \
+        -f "comment=approved by just release $V, after its typed confirmation" < /dev/null >> "$STEP_LOG" 2>&1 \
+        || step_fail "gh could not approve the crates-io deployment of run $id"
+      approved=${a:-0}
+      log "approved the crates-io deployment of $(run_url "$id")"
+    fi
+    n=$((n + 1))
+    if [ $((n % 10)) = 0 ]; then
+      el=$(( ($(date +%s) - t0) / 60 ))
+      x="still waiting for the crates-io job of $(run_url "$id") ($(sed -n 's/^status //p' "$scratch/run-$id"), ${el} min)"
+      echo "$(utc) $x" >> "$STEP_LOG"
+      log "$x"
+    fi
+    sleep "$POLL"
+  done
+  echo "$(utc) the crates-io job of run $id succeeded" >> "$STEP_LOG"
+  # crates.io's API can lag behind the job for a few minutes
+  n=0
+  while :; do
+    NOTE='' UNKNOWN=0
+    det_crates && break
+    n=$((n + 1))
+    [ $n -le 20 ] || step_fail "the crates-io job of $(run_url "$id") succeeded, but: $NOTE" "crates.io can lag a few minutes: run it again later; if a crate stays missing, send the log to the coordinator"
+    [ $((n % 5)) != 1 ] || log "the crates-io job succeeded; waiting for crates.io ($NOTE)"
+    sleep "$POLL"
+  done
+  echo "$NOTE" >> "$STEP_LOG"
+}
+
+tg() { LC_ALL=C git -C "$tap" "$@"; }
+# tap_ours FORMULA BASE: the tap clone's HEAD is the commit an earlier run made for this release and
+# did not push: "fil V", one parent, committed by you (git var GIT_COMMITTER_IDENT) and signed,
+# changing only Formula/fil.rb to FORMULA, on a commit that BASE has.
+tap_ours() {
+  local me
+  [ "$(tg log -1 --format=%s HEAD 2> /dev/null)" = "fil $V" ] || return 1
+  [ "$(tg rev-list --parents -n 1 HEAD 2> /dev/null | wc -w | tr -d ' ')" = 2 ] || return 1
+  me=$(tg var GIT_COMMITTER_IDENT 2> /dev/null | sed -n 's/.*<\(.*\)>.*/\1/p')
+  [ -n "$me" ] && [ "$(tg log -1 --format=%ce HEAD)" = "$me" ] || return 1
+  tg cat-file commit HEAD | grep -q '^gpgsig ' || return 1
+  tg show HEAD:Formula/fil.rb 2> /dev/null | cmp -s - "$1" || return 1
+  [ "$(tg diff --name-only HEAD^ HEAD 2> /dev/null)" = Formula/fil.rb ] || return 1
+  tg merge-base --is-ancestor HEAD^ "$2" 2> /dev/null
+}
+# tap_formula_sha: the sha256 of Formula/fil.rb on the tap's origin main (nothing if none).
+tap_formula_sha() {
+  local main
+  main=$(tg ls-remote origin refs/heads/main 2> /dev/null | awk '{ print $1 }') || return 0
+  [ -n "$main" ] && tg show "$main:Formula/fil.rb" > "$scratch/tap-now.rb" 2> /dev/null || return 0
+  sha256 "$scratch/tap-now.rb"
+}
+act_brew() {
+  local f=$scratch/brew-act/fil.rb tmain head out bin x formula=${repo%%/*}/tap/fil reuse=0 remake=0
+  step_log brew
+  draft_sums || step_fail "cannot read the published SHA256SUMS: $(gh_err)"
+  "$REPO_ROOT/packaging/render.sh" brew "$V" "$DRAFT_SUMS" "$scratch/brew-act" >> "$STEP_LOG" 2>&1 || step_fail "packaging/render.sh could not make the formula from the published SHA256SUMS"
+  tg rev-parse --git-dir > /dev/null 2>&1 || step_fail "no tap clone at $tap" "clone the tap there, or name your clone with --tap DIR; then run it again"
+  tg fetch -q --no-tags origin 2>> "$STEP_LOG" || step_fail "git -C $tap fetch origin failed"
+  tmain=$(tg ls-remote origin refs/heads/main 2>> "$STEP_LOG" | awk '{ print $1 }') || tmain=''
+  [ -n "$tmain" ] && tg cat-file -e "$tmain^{commit}" 2> /dev/null || step_fail "cannot read main of the tap's origin ($tap)" "git -C $tap fetch origin, then run it again"
+  tap_formula_state "$tmain"
+  if in_redo brew; then
+    # --redo brew never commits or pushes: the install test again, on whatever the tap has
+    echo "--redo brew: the install test only (the tap's formula is ${TAP_VER:-none}, $TAP_STATE); nothing is committed or pushed" >> "$STEP_LOG"
+  else
+    case $TAP_STATE in
+      none | older) ;;
+      done) step_fail "the tap's formula is $V's already, but the step did not detect as done" "run it again; if it says the same, send the log to the coordinator" ;;
+      other) step_fail "the tap's formula names $V, but not with the published SHA256SUMS's checksums: it is not changed" "look at it (git -C $tap log -p origin/main -- Formula/fil.rb); fix the tap by hand (a PR there), then run it again" ;;
+      newer) step_fail "the tap's formula is version $TAP_VER, newer than $V: it is not changed (no downgrade)" "nothing to do for the tap; $AGAIN --redo brew runs the install test of what it has" ;;
+      *) step_fail "the tap's formula names no version this command can read (${TAP_VER:--}): it is not changed" "look at it (git -C $tap show origin/main:Formula/fil.rb); fix the tap by hand, then run it again" ;;
+    esac
+    [ "$(tg symbolic-ref -q HEAD)" = refs/heads/main ] || step_fail "the tap clone $tap is not on its main branch" "git -C $tap checkout main, then run it again"
+    [ -z "$(tg status --porcelain --untracked-files=no)" ] || step_fail "the tap clone $tap has uncommitted changes" "commit or discard them, then run it again"
+    head=$(tg rev-parse HEAD)
+    if tap_ours "$f" "$tmain"; then
+      if [ "$(tg rev-parse HEAD^)" = "$tmain" ]; then reuse=1; else remake=1; fi
+    else
+      tg merge-base --is-ancestor "$head" "$tmain" || step_fail "the tap clone's main ($(short "$head")) has commits that are not on its origin's main" \
+        "push or drop them (git -C $tap log origin/main..main), then run it again"
+    fi
+    pub_confirm brew
+    if [ "$remake" = 1 ]; then
+      # an earlier run's commit, on a main that has moved since: dropped (only it: tap_ours), and
+      # made again on the new main
+      echo "the tap's HEAD $(short "$head") is an earlier run's formula commit on an older main: made again on $(short "$tmain")" >> "$STEP_LOG"
+      tg reset -q --hard HEAD^ >> "$STEP_LOG" 2>&1 || step_fail "git -C $tap reset HEAD^ failed"
+    fi
+    if [ "$reuse" = 1 ]; then
+      echo "the tap's HEAD $(short "$head") is this release's formula commit, made by an earlier run and not pushed: it is pushed" >> "$STEP_LOG"
+    else
+      tg merge -q --ff-only "$tmain" >> "$STEP_LOG" 2>&1 || step_fail "git -C $tap merge --ff-only of the tap's main failed"
+      mkdir -p "$tap/Formula"
+      cp "$f" "$tap/Formula/fil.rb"
+      tg add Formula/fil.rb
+      tg commit -q -S -m "fil $V" -- Formula/fil.rb >> "$STEP_LOG" 2>&1 || step_fail "git commit -S in the tap could not make or sign the formula commit"
+      tg cat-file commit HEAD | grep -q '^gpgsig ' || step_fail "git commit -S made an unsigned commit in the tap" "git -C $tap reset --hard $tmain; check git config gpg.format and user.signingkey; then run it again"
+      echo "the formula commit: $(tg rev-parse HEAD) on $tmain" >> "$STEP_LOG"
+    fi
+    log "pushing $V's formula to the tap"
+    tg push origin HEAD:refs/heads/main >> "$STEP_LOG" 2>&1 || step_fail "git push of the tap ($tap) failed"
+  fi
+  # the install test, on the owner's Homebrew
+  log "the install test: brew update, then brew upgrade (or install) $formula, then fil --version"
+  echo "brew update" >> "$STEP_LOG"
+  "$BREW" update < /dev/null >> "$STEP_LOG" 2>&1 || step_fail "brew update failed" "the tap has $V's formula (the release is out); fix Homebrew, then $AGAIN --redo brew runs the install test again"
+  if "$BREW" list --versions "$formula" > /dev/null 2>&1; then x=upgrade; else x=install; fi
+  echo "brew $x $formula" >> "$STEP_LOG"
+  "$BREW" "$x" "$formula" < /dev/null >> "$STEP_LOG" 2>&1 || step_fail "brew $x $formula failed" "the tap has $V's formula (the release is out): fix the formula (a PR to the tap), then $AGAIN --redo brew runs the install test again"
+  bin=$("$BREW" --prefix 2>> "$STEP_LOG")/bin/fil
+  out=$("$bin" --version 2>&1 < /dev/null | head -n 1) || out=''
+  echo "$bin --version: $out" >> "$STEP_LOG"
+  case $out in
+    "fil $V (wire "*) log "Homebrew's fil says: $out" ;;
+    *) step_fail "Homebrew's fil --version says '$out', not fil $V" "the tap has $V's formula (the release is out): look at brew info $formula; fix the formula (a PR to the tap), then $AGAIN --redo brew" ;;
+  esac
+  # the result, for finish's summary: bound to the formula that was tested
+  x=$(tap_formula_sha)
+  [ -z "$x" ] || st_set brew_tested "ok $x $(utc)"
+}
+
+act_finish() {
+  local x d t aur=$ROOT/target/packaging/aur
+  step_log finish
+  # first: the keys are forgotten now, whatever fails below
+  "$KEYS" forget --need ssh,gpg < /dev/null >> "$STEP_LOG" 2>&1 || step_fail "release-keys.sh forget failed"
+  draft_sums || step_fail "cannot read the published SHA256SUMS: $(gh_err)"
+  "$REPO_ROOT/packaging/render.sh" aur "$V" "$DRAFT_SUMS" "$aur" >> "$STEP_LOG" 2>&1 || step_fail "packaging/render.sh could not make the AUR PKGBUILD"
+  # the copy for the coordinator: the published SHA256SUMS and its signature
+  for x in SHA256SUMS SHA256SUMS.sig; do
+    [ "$(local_sha "$x")" = "$(asset_digest "$x")" ] || step_fail "$FILES/$x is not the published one" "$AGAIN --redo verify-published (it downloads the published files again)"
+  done
+  if [ -d "$(dirname "$SHARED")" ]; then
+    # /Users/Shared is writable by every local user and the name is predictable: the directory must
+    # be ours (not a symlink, not another user's), and links planted in it are removed, not followed
+    if [ -L "$SHARED" ] || { [ -e "$SHARED" ] && ! { [ -d "$SHARED" ] && [ -O "$SHARED" ]; }; }; then
+      step_fail "$SHARED exists and is not a directory of yours (a symlink, or another user's): nothing is copied" "remove it (sudo if needed), then run it again"
+    fi
+    [ -d "$SHARED" ] || mkdir -m 755 "$SHARED" 2>> "$STEP_LOG" || step_fail "cannot make $SHARED"
+    { [ -O "$SHARED" ] && [ ! -L "$SHARED" ]; } || step_fail "$SHARED is not a directory of yours" "remove it (sudo if needed), then run it again"
+    rm -f "$SHARED/SHA256SUMS" "$SHARED/SHA256SUMS.sig"
+    cp "$FILES/SHA256SUMS" "$FILES/SHA256SUMS.sig" "$SHARED/" 2>> "$STEP_LOG" && chmod 644 "$SHARED/SHA256SUMS" "$SHARED/SHA256SUMS.sig" \
+      || step_fail "cannot copy SHA256SUMS and SHA256SUMS.sig to $SHARED"
+  else
+    log "note: no $(dirname "$SHARED") on this machine: the copy for the coordinator is skipped (the files are in $FILES)"
+  fi
+  d=$(asset_digest SHA256SUMS)
+  t=$(st_get brew_tested)
+  x=$(tap_formula_sha)
+  case $t in
+    "ok $x "*) [ -n "$x" ] && t="passed (${t##* })" || t='' ;;
+    *) t='' ;;
+  esac
+  [ -n "$t" ] || t="NOT passed for the tap's formula: $AGAIN --redo brew"
+  {
+    echo "release: fil $V is released"
+    echo "  release commit   $R"
+    echo "  mirror commit    $G"
+    echo "  tag              $TAG (tag object $(st_get tag_object))"
+    [ -z "$(st_num dry_run)" ] || echo "  dry run          $(run_url "$(st_num dry_run)")"
+    [ -z "$(st_num tag_run)" ] || echo "  tag's run        $(run_url "$(st_num tag_run)")"
+    echo "  release          https://github.com/$repo/releases/tag/$TAG"
+    echo "  SHA256SUMS       sha256 $d"
+    echo "  crates.io        ${NOTES[$(step_no crates)]}"
+    echo "  Homebrew         ${NOTES[$(step_no brew)]}"
+    echo "  install test     $t"
+    echo "  AUR              $aur/PKGBUILD (rendered, not published)"
+    [ ! -d "$SHARED" ] || echo "  for the coordinator: $SHARED/SHA256SUMS and SHA256SUMS.sig"
+    echo "  keys             forgotten (just release-keys status)"
+  } | tee -a "$STEP_LOG"
 }
 
 # ---- run
@@ -1702,7 +2145,7 @@ if [ -n "$from" ]; then
       checked | recorded | waived | implied) ;;
       *)
         LAST_DONE=$((i - 1))
-        report FAILED "$i" "--from $from: step $i $(step_name $i) is not done (${NOTES[i]})" "do it first: run the command without --from (it does steps 1-12), or do it by hand, then run it again"
+        report FAILED "$i" "--from $from: step $i $(step_name $i) is not done (${NOTES[i]})" "do it first: run the command without --from (it does every step), or do it by hand, then run it again"
         ;;
     esac
   done
@@ -1719,6 +2162,7 @@ if [ -n "$redo" ]; then
   fi
   case $redo in
     dry-run | dry-verify) [ "$TAG_OK" = 0 ] || report FAILED "$rn" "--redo $redo: $TAG is on GitHub; the dry run decides nothing any more" "nothing to do: the steps after the tag check the release itself" ;;
+    verify-published | brew) [ "$REL" = published ] || report FAILED "$rn" "--redo $redo: $TAG is not published ($REL)" "run it without --redo" ;;
     *) [ "$REL" = draft ] || report FAILED "$rn" "--redo $redo: $TAG is not a draft ($REL); a published release is not changed" "nothing to do" ;;
   esac
   # a pre-sign verification judges the unsigned rpms CI built: once the draft carries the package
@@ -1727,10 +2171,6 @@ if [ -n "$redo" ]; then
     report FAILED "$rn" "--redo verify-presign: the draft is signed already (it has the signed rpms and SHA256SUMS.asc); a pre-sign verification is only meaningful before the upload" \
       "$AGAIN --redo verify-signed re-verifies the signed draft"
   fi
-fi
-if [ "$NEXT" = "$NSTEPS" ]; then
-  log "steps 1-$LAST_DONE of $NSTEPS are done for $V; step $NSTEPS finish is not automated yet (PR 6): nothing to do"
-  exit 0
 fi
 name=$(step_name "$NEXT")
 pf_init "$V"
@@ -1747,17 +2187,16 @@ fi
 # each step that needs a key pauses there if it is locked); each step checks again before it signs.
 if is_tty && [ "$NEXT" -le "$(step_no verify-signed)" ]; then keys_ready "$(keys_needed)"; fi
 
-# The actions, step by step through verify-signed; after each, every step is detected again.
+# The actions, step by step through finish; after each, every step is detected again.
 while :; do
   if [ "$NEXT" = "$NSTEPS" ]; then
-    log "steps 1-$LAST_DONE of $NSTEPS are done for $V; step $NSTEPS finish is not automated yet (PR 6): nothing to do"
+    act_finish
     exit 0
   fi
   name=$(step_name "$NEXT")
   if [ "${KIND[NEXT]}" = unknown ]; then
     report FAILED "$NEXT" "cannot tell whether $name is done: ${NOTES[NEXT]}" "fix that, then run it again"
   fi
-  case $name in candidate | mirror | dry-run | dry-verify | tag | tag-run | verify-presign | sign-macos | sign-packages | sign-sums | upload | verify-signed) ;; *) break ;; esac
   prev=$NEXT
   "act_$(printf '%s' "$name" | tr - _)"
   # this step is redone: it reads as it really is from now on
@@ -1770,4 +2209,6 @@ while :; do
     step_fail "the action of $name finished, but the step does not detect as done: ${NOTES[prev]}" "send the log to the coordinator (a bug in the command or a change in GitHub's answers)"
   fi
 done
-report PAUSED "$NEXT" "$name is next (${NOTES[NEXT]}); this version of the command does steps 1-12 (candidate to verify-signed): $name and the steps after it arrive in PR 6" "by hand for now: $(do_hint "$name")"
+# (never reached: the loop exits. This `exit` keeps bash from reading past the group.)
+exit
+}

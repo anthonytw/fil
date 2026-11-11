@@ -6,6 +6,11 @@
 #
 # Every "mutation" below changes ONE thing in a scratch copy and requires the matching check to
 # fail, so a check that quietly stopped checking is a test failure.
+#
+# The whole script is one { ... } group that ends in `exit`: bash reads all of it before it runs any
+# of it, so rewriting this file in place while it runs (an editor that writes in place) cannot derail
+# the run. The scripts it starts are read when they start.
+{
 set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -2058,10 +2063,37 @@ def new_draft(tag, partial):
     for f in (names[: len(names) // 2] if partial else names):
         shutil.copy(os.path.join(src, f), os.path.join(d, str(n), "assets"))
     calls("draft create %d%s" % (n, " (partial)" if partial else ""))
+CRATES = ["fil-proto", "fil-shell"]
+def crates_published():
+    p = os.path.join(w, "crates")
+    return open(p).read().split() if os.path.exists(p) else []
+CRATES_PENDING = dict(status="waiting", conclusion="", pending=[7], jobs=[["prepare", "success"], ["publish", "success"], ["crates-io", "-"]])
 def advance(r):
     # a tag push's run, one stage per look: prepare, then publish (FAKE_TAG_RUN_FAIL=publish: the
-    # first attempt's publish fails after making half a draft; =build: a build job fails)
-    if not r.get("auto") or r["status"] in ("completed", "waiting") or "next" in r:
+    # first attempt's publish fails after making half a draft; =build: a build job fails), then the
+    # crates-io job waits for its deployment's review (pending environment 7)
+    if not r.get("auto") or "next" in r:
+        return
+    if r.get("phase") == "crates":
+        # approved (in progress; "crates_lag" more looks first): publish-crates.sh uploads the crates
+        # crates.io does not have yet ($FAKE_WORLD/crates); FAKE_CRATES_FAIL: the first time, the job
+        # fails after one upload
+        if r["status"] != "in_progress":
+            return
+        if r.get("crates_lag", 0) > 0:
+            r["crates_lag"] -= 1
+            return
+        missing = [c for c in CRATES if c not in crates_published()]
+        fail = bool(os.environ.get("FAKE_CRATES_FAIL")) and not r.get("crates_failed")
+        for c in missing[:1] if fail else missing:
+            open(os.path.join(w, "crates"), "a").write(c + "\n")
+            calls("crate upload %s" % c)
+        if fail:
+            r["crates_failed"] = True
+        res = "failure" if fail else "success"
+        r.update(status="completed", conclusion=res, jobs=[["prepare", "success"], ["publish", "success"], ["crates-io", res]])
+        return
+    if r["status"] in ("completed", "waiting"):
         return
     fail = os.environ.get("FAKE_TAG_RUN_FAIL", "") if r.get("attempt", 1) == 1 else ""
     if r["status"] == "queued":
@@ -2076,7 +2108,7 @@ def advance(r):
         r.update(status="completed", conclusion="failure", jobs=[["prepare", "success"], ["publish", "failure"], ["crates-io", "skipped"]])
     else:
         new_draft(r["branch"], False)
-        r.update(status="waiting", jobs=[["prepare", "success"], ["publish", "success"], ["crates-io", "-"]])
+        r.update(phase="crates", **CRATES_PENDING)
 if a[:2] == ["run", "list"]:
     down()
     out = [dict(databaseId=r["id"], status=r["status"], conclusion=r["conclusion"], createdAt=created(r))
@@ -2106,7 +2138,12 @@ elif a[:2] in (["run", "watch"], ["run", "rerun"]):
         if r["status"] != "completed":
             print("run %s cannot be rerun; its workflow run is still in progress (HTTP 403)" % r["id"], file=sys.stderr); sys.exit(1)
         r.pop("leg", None)
-        r.update(next=dict(status="queued", conclusion="", jobs=[], attempt=r.get("attempt", 1) + 1), lag=1)
+        r.pop("lag_left", None)
+        if r.get("phase") == "crates":
+            # rerun --failed of the crates-io job: it waits for a review again
+            r.update(next=dict(CRATES_PENDING, attempt=r.get("attempt", 1) + 1), lag=1)
+        else:
+            r.update(next=dict(status="queued", conclusion="", jobs=[], attempt=r.get("attempt", 1) + 1), lag=1)
     else:
         if os.environ.get("FAKE_WATCH_FAIL"):
             print("HTTP 502: Bad Gateway", file=sys.stderr); sys.exit(1)
@@ -2150,6 +2187,43 @@ elif a[:2] == ["release", "download"]:
     n, m, d = rels(a[2])[0]
     os.makedirs(opt("-D"), exist_ok=True)
     shutil.copy(os.path.join(d, opt("-p")), opt("-D"))
+elif a[:1] == ["api"] and re.match(r"repos/o/r/actions/runs/[0-9]+/pending_deployments$", a[1]):
+    # what the --jq of pending_crates prints; a deployment shows after FAKE_PENDING_LAG looks (not
+    # created yet); FAKE_CANNOT_APPROVE: current_user_can_approve is false
+    down()
+    i = a[1].split("/")[5]
+    r = load_run(i)
+    if "lag_left" not in r:
+        r["lag_left"] = int(os.environ.get("FAKE_PENDING_LAG") or 0)
+    if r["status"] == "waiting" and r.get("pending"):
+        if r["lag_left"] > 0:
+            r["lag_left"] -= 1
+        else:
+            for e in r["pending"]:
+                print("%d\tcrates-io\t%s" % (e, "false" if os.environ.get("FAKE_CANNOT_APPROVE") else "true"))
+    json.dump(r, open(run_file(i), "w"))
+elif a[:3] == ["api", "-X", "POST"] and re.match(r"repos/o/r/actions/runs/[0-9]+/pending_deployments$", a[3]):
+    i = a[3].split("/")[5]
+    r = load_run(i)
+    if r["status"] != "waiting" or not r.get("pending"):
+        print("HTTP 422: No pending deployment requests to approve or reject", file=sys.stderr); sys.exit(1)
+    if [x for x in a if x.startswith("environment_ids[]=")] != ["environment_ids[]=%d" % r["pending"][0]] or "state=approved" not in a:
+        print("fake gh: a wrong approval: %s" % a, file=sys.stderr); sys.exit(1)
+    r.update(status="in_progress", pending=[])
+    r.pop("lag_left", None)
+    json.dump(r, open(run_file(i), "w"))
+    calls("approve %s attempt %d" % (i, r.get("attempt", 1)))
+elif a[:2] == ["release", "edit"]:
+    # publish (FAKE_PUBLISH_FAIL: GitHub fails first)
+    down()
+    if os.environ.get("FAKE_PUBLISH_FAIL"):
+        print("HTTP 502: Bad Gateway", file=sys.stderr); sys.exit(1)
+    if "--draft=false" not in a:
+        print("fake gh: release edit without --draft=false: %s" % a, file=sys.stderr); sys.exit(1)
+    n, m, d = rels(a[2])[0]
+    m["draft"] = False
+    json.dump(m, open(os.path.join(w, "releases", n, "meta.json"), "w"))
+    calls("release publish %s" % n)
 elif a[:1] == ["api"] and re.match(r"repos/o/r/actions/runs/[0-9]+$", a[1]):
     # what the --jq of run_ours prints: the triggering actor and the creation time
     r = load_run(a[1].rsplit("/", 1)[1])
@@ -2193,7 +2267,7 @@ cat > "$rs/curl" << 'EOF2'
 [ "$1" = --version ] && { echo "curl stub"; exit 0; }
 for u; do :; done
 c=${u#https://crates.io/api/v1/crates/}; c=${c%%/*}
-case " ${FAKE_CRATES_PUBLISHED:-} " in *" $c "*) printf 200 ;; *) printf '%s' "${FAKE_CRATES_CODE:-404}" ;; esac
+case " ${FAKE_CRATES_PUBLISHED:-} $(cat "$FAKE_WORLD/crates" 2> /dev/null | tr '\n' ' ') " in *" $c "*) printf 200 ;; *) printf '%s' "${FAKE_CRATES_CODE:-404}" ;; esac
 EOF2
 # gpg: a detached "signature" is the line "gpgsig <sha256 of the data>"; the rest is the preflight's stub.
 cat > "$rs/gpg" << EOF2
@@ -2216,6 +2290,34 @@ git -C "$rs/tap" add -A && git -C "$rs/tap" commit -q --no-gpg-sign -m tap
 git -C "$rs/tap" remote add origin "$rs/tap.git"
 git -C "$rs/tap" push -q origin main
 git -C "$rs/tap" fetch -q origin
+TAP0=$(git -C "$rs/tap" rev-parse HEAD)
+# each push to the tap is logged; refused while $rs/reject-tap exists
+cat > "$rs/tap.git/hooks/pre-receive" << EOF2
+#!/bin/sh
+while read -r old new ref; do
+  if [ -e "$rs/reject-tap" ]; then echo "remote: error: refused (selftest)" >&2; exit 1; fi
+  echo "tap push \$ref \$new" >> "$rs/calls.log"
+done
+EOF2
+chmod +x "$rs/tap.git/hooks/pre-receive"
+# Homebrew: brew logs its calls; install and upgrade put a fil that prints the version line into
+# FAKE_BREW_PREFIX/bin (FAKE_BREW_FAIL: they fail)
+cat > "$rs/brew-stub" << 'EOF2'
+#!/bin/sh
+echo "brew $*" >> "$FAKE_CALLS"
+case $1 in
+  --prefix) echo "$FAKE_BREW_PREFIX" ;;
+  update) : ;;
+  list) [ -x "$FAKE_BREW_PREFIX/bin/fil" ] ;;
+  install | upgrade)
+    [ -z "${FAKE_BREW_FAIL:-}" ] || { echo "Error: fil: SHA256 mismatch (stub)" >&2; exit 1; }
+    mkdir -p "$FAKE_BREW_PREFIX/bin"
+    printf '#!/bin/sh\necho "fil 0.9.0 (wire 9.9)"\n' > "$FAKE_BREW_PREFIX/bin/fil"
+    chmod +x "$FAKE_BREW_PREFIX/bin/fil"
+    ;;
+esac
+EOF2
+chmod +x "$rs/brew-stub"
 : > "$pf/gh.log"
 # The step scripts' stubs (fake.py): release-verify logs its arguments (FAKE_VERIFY_FAIL makes it fail
 # as verify.sh does) and, for the draft, "downloads" it into the work directory and records the
@@ -2309,7 +2411,7 @@ echo "keys $*" >> "$FAKE_CALLS"
 case $1 in
   status) if [ -e "$FAKE_KEYS_LOCKED" ]; then echo "ssh    locked     (stub)"; exit 1; fi; echo "ssh    ready      (stub)" ;;
   unlock) [ -z "${FAKE_KEYS_UNLOCK_FAIL:-}" ] || { echo "release-keys: ssh: ssh-add failed (stub)" >&2; exit 1; }; rm -f "$FAKE_KEYS_LOCKED" ;;
-  forget) : > "$FAKE_KEYS_LOCKED" ;;
+  forget) [ -z "${FAKE_KEYS_FORGET_FAIL:-}" ] || { echo "release-keys: forget failed (stub)" >&2; exit 1; }; : > "$FAKE_KEYS_LOCKED" ;;
 esac
 EOF2
 chmod +x "$rs/verify" "$rs/sign-macos" "$rs/sign-packages" "$rs/keys"
@@ -2320,6 +2422,7 @@ rlx() {
     FIL_RELEASE_VERIFY="$rs/verify" FAKE_CALLS="$rs/calls.log" FAKE_GITHUB_GIT="$pf/github.git" \
     FIL_SIGN_MACOS="$rs/sign-macos" FIL_SIGN_PACKAGES="$rs/sign-packages" FIL_RELEASE_KEYS="$rs/keys" FIL_RELEASE_POLL=0 \
     FAKE_RW="$RW" FAKE_RELEASE_FILES="$rs/files0" FAKE_RELEASE_DIR="$RELEASE_DIR" FAKE_KEYS_LOCKED="$rs/keys-locked" \
+    FIL_BREW="$rs/brew-stub" FAKE_BREW_PREFIX="$rs/brewprefix" FIL_RELEASE_SHARED="$rs/shared/fil-0.9.0" \
     SSH_AUTH_SOCK="$RL_SOCK" GNUPGHOME="$rs/gnupg" "$@"
 }
 # rl [ENV=VALUE ...] [-- ARGS ...]: a run of the command in this world
@@ -2356,10 +2459,19 @@ rl_refs() { pg for-each-ref --format='%(refname) %(objectname)' | grep -v '^refs
 expect_fail "release: a test-only override outside the self-test is refused" rl FIL_RELEASE_SELFTEST=
 last
 expect_pass "release: ...saying so" grep -q 'a release that asks a fake proves nothing' "$rs/last.log"
+# each override alone, with no other set, is refused by name
+ov_unset=$(for o in $TEST_OVERRIDES; do printf -- '-u %s ' "$o"; done)
+ov_bad=''
+for v in $TEST_OVERRIDES; do
+  [ "$v" != FIL_RELEASE_SELFTEST ] || continue
+  # shellcheck disable=SC2086 # the -u words
+  if env $ov_unset "$v=x" "$RL" 0.9.0 --status > "$rs/ov.out" 2>&1 || ! grep -q "STOP: $v is set" "$rs/ov.out"; then ov_bad="$ov_bad $v"; fi
+done
+if [ -z "$ov_bad" ]; then pass "release: every test-only override, set alone, is refused by name"; else flunk "release: every test-only override, set alone, is refused by name (not:$ov_bad)"; fi
 expect_fail "release: --redo tag is refused" rlx "$RL" 0.9.0 --redo tag
 last
 expect_pass "release: ...it cannot be redone" grep -q 'it cannot be redone' "$rs/last.log"
-for x in mirror tag-run publish crates candidate nosuch; do expect_fail "release: --redo $x is refused" rlx "$RL" 0.9.0 --redo "$x"; done
+for x in mirror tag-run publish crates finish candidate nosuch; do expect_fail "release: --redo $x is refused" rlx "$RL" 0.9.0 --redo "$x"; done
 expect_fail "release: --redo does not go with --from" rlx "$RL" 0.9.0 --redo upload --from tag
 expect_fail "release: --redo does not go with --status" rlx "$RL" 0.9.0 --redo upload --status
 expect_fail "release: --from names a step" rlx "$RL" 0.9.0 --from nosuch
@@ -2418,6 +2530,42 @@ expect_fail "release run: a reap mutex left by a killed run is reported (after 1
 last
 expect_pass "release run: ...saying how to remove it" grep -q "rmdir '.*/.lock.reap'" "$rs/last.log"
 rmdir "$RW/.lock.reap"
+# release.sh is one { ... } group ending in `exit`, so bash has read all of it before it runs any of
+# it: a copy rewritten IN PLACE (same inode, as an editor does) while it waits in the lock hook goes
+# on unaffected and pauses at mirror. The new text would exit 97, or fail on a fragment of a line,
+# wherever bash resumed reading: the control, the same copy without the group, is derailed by it.
+ri=$tmp/rel-immune
+for kind in wrapped unwrapped; do
+  rm -rf "$ri" "$RW/.lock" "$rs/immune.$kind.st"
+  mkdir -p "$ri/tests"
+  cp -R "$RELEASE_DIR" "$ri/tests/release"
+  cp -R "$REPO_ROOT/packaging" "$ri/packaging"
+  if [ $kind = unwrapped ]; then
+    python3 -I -c 'import sys
+p = sys.argv[1]
+s = open(p).read()
+i = s.index("\n{\nset -euo pipefail\n")
+s = s[:i + 1] + s[i + 3:]
+assert s.endswith("exit\n}\n")
+open(p, "w").write(s[: -len("exit\n}\n")])' "$ri/tests/release/release.sh"
+  fi
+  touch "$rs/lock-hold"
+  (st=0; rlx FIL_RELEASE_LOCK_HOLD="$rs/lock-hold" "$ri/tests/release/release.sh" 0.9.0 --repo o/r --tap "$rs/tap" > "$rs/immune.$kind" 2>&1 || st=$?; echo $st > "$rs/immune.$kind.st") &
+  n=0
+  until [ -s "$RW/.lock/pid" ] || [ $n -ge 200 ]; do n=$((n + 1)); sleep 0.1; done
+  python3 -I -c 'import sys
+f = open(sys.argv[1], "r+b")
+n = len(f.read())
+f.seek(0)
+f.write(b"exit 97\n" * (n // 8 + 64))
+f.truncate()
+f.close()' "$ri/tests/release/release.sh"
+  rm -f "$rs/lock-hold"
+  wait
+done
+expect_pass "release run: a copy of release.sh rewritten in place while it runs: unaffected, paused at mirror" sh -c 'test "$(cat "$1.st")" = 2 && grep -q "PAUSED at step 2/17 mirror" "$1" && ! grep -q "command not found" "$1"' sh "$rs/immune.wrapped"
+expect_pass "release run: ...the control, the copy without the { ... } group, is derailed by the same rewrite" sh -c 'st=$(cat "$1.st"); test "$st" = 97 || test "$st" = 127' sh "$rs/immune.unwrapped"
+rm -rf "$ri"
 
 # ---- the actions of steps 1-4 (PR 4), on a test ssh-agent's commit-signing key (git config names
 # the .pub, whose private half is only in the agent), with a pre-receive hook on the github bare repo
@@ -2840,8 +2988,10 @@ echo "dry_verify=ok 101 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
 # 13: publish
 echo '{"tag": "v0.9.0", "draft": false}' > "$rs/world/releases/1/meta.json"
 rl_kind 13 publish "done (checked)"
-rl_paused 14 verify-published
-echo "verify_published=ok $(sha256 "$DA/SHA256SUMS") 2026-11-09T13:00:00Z" >> "$RSTATE"
+rl_kind 14 verify-published next
+# a run without a terminal does verify-published (no prompt) and pauses at the crates confirmation
+rl_paused 15 crates
+expect_pass "release run: ...verify-published ran first and recorded the published SHA256SUMS" grep -q "^verify_published=ok $(sha256 "$DA/SHA256SUMS") " "$RSTATE"
 rl_kind 14 verify-published "done (recorded)"
 # 15: crates
 rl_kind 15 crates next "nothing on crates.io"
@@ -2859,7 +3009,7 @@ rl_kind 16 brew next "committed, not pushed" FAKE_CRATES_PUBLISHED="fil-shell fi
 git -C "$rs/tap" push -q origin main
 rl_kind 16 brew "done (checked)" "" FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
 rl FAKE_CRATES_PUBLISHED="fil-shell fil-proto" > "$rs/run.out" 2>&1 && st=0 || st=$?
-if [ $st = 0 ] && grep -q 'steps 1-16 of 17 are done' "$rs/run.out"; then pass "release run: everything through brew done: exit 0"; else flunk "release run: everything through brew done: exit 0 (exit $st)"; tail -8 "$rs/run.out" | sed 's/^/       | /'; fi
+if [ $st = 0 ] && grep -q 'release: fil 0.9.0 is released' "$rs/run.out"; then pass "release run: everything through brew done: finish, exit 0"; else flunk "release run: everything through brew done: finish, exit 0 (exit $st)"; tail -8 "$rs/run.out" | sed 's/^/       | /'; fi
 # the whole status, against its golden (the notes after the label are not compared)
 rls FAKE_CRATES_PUBLISHED="fil-shell fil-proto" 2>&1 | awk '$1 ~ /^[0-9]+\/17$/ { k = $3; if (k == "done") k = k " " $4; print $1, $2, k }' > "$rs/golden.out"
 cat > "$rs/golden" << 'EOF2'
@@ -2945,7 +3095,7 @@ pg tag -a -m marker v0.9.0 "$RR"
 r5 "release draft: the happy path, one invocation from the start through verify-signed, paused at 13 publish" 2 'PAUSED at step 13/17 publish' <<< "0.9.0"
 calls_are 1 3 0 3
 calls5_are 1 1 0 1 3 1 1
-expect_pass "release draft: ...one confirmation (the tag's covers the mirror and the tag)" test "$(grep -c 'release: CONFIRM ' "$rs/ra.out")" = 1
+expect_pass "release draft: ...one tag confirmation (it covers the mirror and the tag), then the publish one, unanswered" sh -c 'test "$(grep -c "release: CONFIRM " "$1")" = 2 && test "$(grep -c "release: CONFIRM tag" "$1")" = 1 && grep -q "release: CONFIRM publish" "$1"' sh "$rs/ra.out"
 expect_pass "release draft: ...the keys unlocked once, up front, all three" sh -c 'test "$(grep -c "^keys unlock " "$1")" = 1 && grep -qx "keys unlock --need ssh,gpg,apple --ttl 8h" "$1" && test "$(grep -n "^keys unlock" "$1" | cut -d: -f1)" -lt "$(grep -n "^push refs/heads/main" "$1" | cut -d: -f1)"' sh "$rs/calls.log"
 RG5=$(git --git-dir="$pf/github.git" rev-parse refs/heads/main)
 git init -q --bare "$rs/tagchk"
@@ -3136,14 +3286,250 @@ r5 "release waiver: a red release.yml dry run: failed at 3, no waiver offered" 1
 expect_pass "release waiver: ...no prompt shown, nothing recorded" sh -c '! grep -q "waive them" "$1" && ! grep -q "^checks_waived=" "$2"' sh "$rs/ra.out" "$RSTATE"
 rm -f "$rs/tag-run-on-push"
 
+# ---- the actions of steps 13-17 (PR 6): publish (the second confirmation, asked again on a resume),
+# verify-published, the crates-io deployment approved through pending_deployments and its job (the
+# fake job uploads the crates crates.io lacks, $rs/world/crates), the tap (its bare remote logs each
+# push and refuses it while $rs/reject-tap exists; the clone commits with the test agent's key),
+# Homebrew's install test (the brew stub) and finish. Each case starts from nothing done.
+git -C "$rs/tap" config gpg.format ssh
+git -C "$rs/tap" config user.signingkey "$rs/agentpub/key.pub"
+: > "$rs/gh6.log"
+r6_reset() {
+  cat "$pf/gh.log" >> "$rs/gh6.log"
+  ra5_reset
+  rm -rf "$rs/world/crates" "$rs/brewprefix" "$rs/shared" "$rs/reject-tap" "$pf/clone/target/packaging"
+  mkdir -p "$rs/shared"
+  git --git-dir="$rs/tap.git" update-ref refs/heads/main "$TAP0"
+  git -C "$rs/tap" checkout -q main
+  git -C "$rs/tap" reset -q --hard "$TAP0"
+  git -C "$rs/tap" fetch -q origin
+}
+# calls6_are PUBLISHES APPROVALS CRATE-UPLOADS TAP-PUSHES
+calls6_are() {
+  local got
+  got="$(n5 '^release publish ' "$rs/calls.log") $(n5 '^approve ' "$rs/calls.log") $(n5 '^crate upload ' "$rs/calls.log") $(n5 '^tap push ' "$rs/calls.log")"
+  if [ "$got" = "$*" ]; then pass "release publish: ...calls: $1 publish, $2 approvals, $3 crate uploads, $4 tap pushes"; else
+    flunk "release publish: ...calls: wanted $*; got $got (publishes, approvals, crate uploads, tap pushes)"
+  fi
+}
+n_confirm() { grep -c "release: CONFIRM $1, for 0.9.0" "$rs/ra.out" || true; }
+TR6() { sed -n 's/^tag_run=//p' "$RSTATE"; }
+set_run() { # ID KEY=JSON...: change the fake run ID
+  python3 -I -c 'import json, sys
+p = sys.argv[1]
+r = json.load(open(p))
+for kv in sys.argv[2:]:
+    k, v = kv.split("=", 1)
+    r[k] = json.loads(v)
+json.dump(r, open(p, "w"))' "$rs/world/runs/$1.json" "${@:2}"
+}
+
+# the happy path, all seventeen steps in one invocation from the start: two confirmations
+r6_reset
+: > "$rs/keys-locked"
+r5 "release publish: the happy path, one invocation from the start through finish: exit 0" 0 '^release: fil 0.9.0 is released$' <<< "$(printf '0.9.0\n0.9.0')"
+calls_are 1 3 0 4
+calls5_are 1 1 0 1 4 1 1
+calls6_are 1 1 2 1
+cp "$rs/ra.out" "$rs/happy6.out"
+expect_pass "release publish: ...two confirmations: tag, then publish, which covers crates and brew" sh -c 'test "$(grep -c "release: CONFIRM " "$1")" = 2 && grep -q "release: CONFIRM tag, for 0.9.0" "$1" && grep -q "release: CONFIRM publish, for 0.9.0" "$1" && grep -q "step 15 crates: .*(this answer covers it too)" "$1" && grep -q "step 16 brew: .*(this answer covers it too)" "$1"' sh "$rs/ra.out"
+expect_pass "release publish: ...the release is published" grep -q '"draft": false' "$rs/world/releases/1/meta.json"
+expect_pass "release publish: ...verify-published ran on what is published and is recorded with its SHA256SUMS" sh -c 'grep -qx "verify 0.9.0 --repo o/r --no-rebuild" "$1" && grep -q "^verify_published=ok $3 " "$2"' sh "$rs/calls.log" "$RSTATE" "$(sha256 "$rs/world/releases/1/assets/SHA256SUMS")"
+expect_pass "release publish: ...approved the crates-io environment of the tag's run, once" sh -c 'test "$(grep -c "^api -X POST " "$1")" = 1 && grep -qx "api -X POST repos/o/r/actions/runs/$2/pending_deployments -F environment_ids\[\]=7 -f state=approved -f comment=approved by just release 0.9.0, after its typed confirmation" "$1"' sh "$pf/gh.log" "$(TR6)"
+expect_pass "release publish: ...the tap's main has the formula of the published SHA256SUMS, in a commit signed by you" sh -c 'packaging=$1/packaging; "$packaging/render.sh" brew 0.9.0 "$2/SHA256SUMS" "$3/brew6" > /dev/null 2>&1 && git --git-dir="$4" show main:Formula/fil.rb | cmp -s - "$3/brew6/fil.rb" && git --git-dir="$4" -c gpg.ssh.allowedSignersFile="$3/allowed" verify-commit main 2> /dev/null && test "$(git --git-dir="$4" log -1 --format=%s main)" = "fil 0.9.0"' sh "$REPO_ROOT" "$rs/world/releases/1/assets" "$rs" "$rs/tap.git"
+expect_pass "release publish: ...the install test: brew update, then install (not installed yet), and fil --version" sh -c 'grep -qx "brew update" "$1" && grep -qx "brew install o/tap/fil" "$1" && grep -q "fil 0.9.0 (wire" "$2"' sh "$rs/calls.log" "$RW/logs/16-brew.log"
+expect_pass "release publish: ...finish: the AUR PKGBUILD, and the coordinator's copy (directory 755, files 644)" sh -c 'test -s "$1/target/packaging/aur/PKGBUILD" && cmp -s "$2/SHA256SUMS" "$3/SHA256SUMS" && cmp -s "$2/SHA256SUMS.sig" "$3/SHA256SUMS.sig" && test "$(python3 -I -c "import os, sys; print(\" \".join(oct(os.stat(p).st_mode & 0o777) for p in sys.argv[1:]))" "$2" "$2/SHA256SUMS" "$2/SHA256SUMS.sig")" = "0o755 0o644 0o644"' sh "$pf/clone" "$rs/shared/fil-0.9.0" "$rs/world/releases/1/assets"
+expect_pass "release publish: ...the keys forgotten before the publish, and again by finish, last" sh -c 'f=$(grep -n "^keys forget " "$1" | head -n 1 | cut -d: -f1); p=$(grep -n "^release publish " "$1" | cut -d: -f1); test -n "$f" && test -n "$p" && test "$f" -lt "$p" && test "$(grep "^keys " "$1" | tail -n 1)" = "keys forget --need ssh,gpg" && test "$(grep -c "^keys forget " "$1")" = 2' sh "$rs/calls.log"
+expect_pass "release publish: ...the install test recorded with the tested formula, and in the summary" sh -c 'grep -q "^brew_tested=ok $(git --git-dir="$2" show main:Formula/fil.rb | (sha256sum 2> /dev/null || shasum -a 256) | cut -d" " -f1) " "$1" && grep -q "install test *passed" "$3"' sh "$RSTATE" "$rs/tap.git" "$rs/ra.out"
+expect_pass "release publish: ...the summary names the release" grep -q 'release *https://github.com/o/r/releases/tag/v0.9.0' "$rs/ra.out"
+expect_pass "release publish: ...one log per step that acted" sh -c 'for n in 13-publish 14-verify-published 15-crates 16-brew 17-finish; do test -s "$1/$n.log" || exit 1; done' sh "$RW/logs"
+st5 > "$rs/golden6.out"
+sed 's/^13\/17 publish next$/13\/17 publish done (checked)/; s/^14\/17 verify-published pending$/14\/17 verify-published done (recorded)/; s/^15\/17 crates pending$/15\/17 crates done (checked)/; s/^16\/17 brew pending$/16\/17 brew done (checked)/; s/^17\/17 finish pending$/17\/17 finish next/' "$rs/golden5" > "$rs/golden6"
+expect_pass "release status: the listing after finish matches its golden" diff "$rs/golden6" "$rs/golden6.out"
+r5 "release publish: the same command again: only finish again (nothing public), exit 0" 0 'fil 0.9.0 is released' < /dev/null
+expect_pass "release publish: ...with no confirmation" sh -c '! grep -q "release: CONFIRM" "$1"' sh "$rs/ra.out"
+calls5_are 1 1 0 1 4 1 1
+calls6_are 1 1 2 1
+# --redo: verify-published and brew again, each only itself; publish, crates and finish refused
+r5 "release redo: --redo verify-published verifies the published release again" 0 'is released' -- --redo verify-published < /dev/null
+calls5_are 1 1 0 1 5 1 1
+r5 "release redo: --redo brew: the tap has the formula, so no confirmation and no push: the install test again" 0 'is released' -- --redo brew < /dev/null
+expect_pass "release redo: ...no confirmation, and brew upgraded (installed already)" sh -c '! grep -q "release: CONFIRM" "$1" && grep -qx "brew upgrade o/tap/fil" "$2"' sh "$rs/ra.out" "$rs/calls.log"
+calls6_are 1 1 2 1
+# F1: the tap's formula is judged by its version and checksums, and never overwritten by a release
+# of the same or an older version. tap_put PATH FILE: a commit on the tap's main (not a push: the hook
+# does not log it) that sets PATH to FILE's content
+tap_put() {
+  local b t c
+  b=$(git --git-dir="$rs/tap.git" hash-object -w "$2")
+  GIT_INDEX_FILE=$rs/tap.idx git --git-dir="$rs/tap.git" read-tree main
+  GIT_INDEX_FILE=$rs/tap.idx git --git-dir="$rs/tap.git" update-index --add --cacheinfo "100644,$b,$1"
+  t=$(GIT_INDEX_FILE=$rs/tap.idx git --git-dir="$rs/tap.git" write-tree)
+  rm -f "$rs/tap.idx"
+  c=$(git --git-dir="$rs/tap.git" commit-tree "$t" -p main -m "edit $1")
+  git --git-dir="$rs/tap.git" update-ref refs/heads/main "$c"
+  git -C "$rs/tap" fetch -q origin
+  echo "$c"
+}
+git --git-dir="$rs/tap.git" show main:Formula/fil.rb > "$rs/tap-v.rb"
+sed 's/^  desc ".*"$/  desc "fixed in the tap"/' "$rs/tap-v.rb" > "$rs/tap-fixed.rb"
+tap_put Formula/fil.rb "$rs/tap-fixed.rb" > /dev/null
+rl_kind 16 brew "done (checked)" "the tap's formula fixed by hand: still 0.9.0 with the published checksums" FIL_RELEASE_KEY="$rs/agentpub/key"
+r5 "release brew: ...a plain run: nothing pushed over the fix" 0 'fil 0.9.0 is released' < /dev/null
+r5 "release brew: ...--redo brew: the install test only, nothing pushed over the fix" 0 'fil 0.9.0 is released' -- --redo brew < /dev/null
+expect_pass "release brew: ...no confirmation, and the fix is still the tap's formula" sh -c '! grep -q "release: CONFIRM" "$1" && git --git-dir="$2" show main:Formula/fil.rb | cmp -s - "$3"' sh "$rs/ra.out" "$rs/tap.git" "$rs/tap-fixed.rb"
+calls6_are 1 1 2 1
+expect_pass "release brew: ...the summary says the fixed formula's install test passed" grep -q 'install test *passed' "$rs/ra.out"
+sed 's/0\.9\.0/0.9.1/g' "$rs/world/releases/1/assets/SHA256SUMS" > "$rs/sums091"
+"$REPO_ROOT/packaging/render.sh" brew 0.9.1 "$rs/sums091" "$rs/brew091" > /dev/null 2>&1
+tap_put Formula/fil.rb "$rs/brew091/fil.rb" > /dev/null
+r5 "release brew: the tap at a newer version (0.9.1): fails at 16, no downgrade" 1 'version 0\.9\.1, newer than 0\.9\.0: it is not changed' < /dev/null
+python3 -I -c 'import re, sys
+t = open(sys.argv[1]).read()
+open(sys.argv[2], "w").write(re.sub(r"sha256 \"[0-9a-f]{64}\"", "sha256 \"" + "0" * 64 + "\"", t, count=1))' "$rs/tap-v.rb" "$rs/tap-badsum.rb"
+tap_put Formula/fil.rb "$rs/tap-badsum.rb" > /dev/null
+r5 "release brew: the tap at 0.9.0 with other checksums: fails at 16, not overwritten" 1 'names 0\.9\.0, but not with the published SHA256SUMS.s checksums: it is not changed' < /dev/null
+calls6_are 1 1 2 1
+tap_put Formula/fil.rb "$rs/tap-v.rb" > /dev/null
+# F2: the coordinator's directory is a symlink: refused at 17, its target untouched; a symlink planted
+# in a directory of ours is removed, not followed
+rm -rf "$rs/shared/fil-0.9.0" "$rs/elsewhere"
+mkdir -p "$rs/elsewhere"
+ln -s "$rs/elsewhere" "$rs/shared/fil-0.9.0"
+r5 "release finish: the coordinator's directory is a symlink: fails at 17" 1 'fil-0\.9\.0 exists and is not a directory of yours' < /dev/null
+expect_pass "release finish: ...nothing written through it" sh -c 'test -z "$(ls -A "$1")"' sh "$rs/elsewhere"
+rm -f "$rs/shared/fil-0.9.0"
+mkdir -p "$rs/shared/fil-0.9.0"
+echo "the owner's file" > "$rs/victim"
+ln -s "$rs/victim" "$rs/shared/fil-0.9.0/SHA256SUMS"
+r5 "release finish: a symlink planted in the coordinator's directory: replaced, exit 0" 0 'fil 0.9.0 is released' < /dev/null
+expect_pass "release finish: ...its target untouched, the copy a regular file" sh -c 'test "$(cat "$1")" = "the owner'"'"'s file" && test ! -L "$2/SHA256SUMS" && cmp -s "$2/SHA256SUMS" "$3/SHA256SUMS"' sh "$rs/victim" "$rs/shared/fil-0.9.0" "$rs/world/releases/1/assets"
+
+# a failure injected at each of steps 13-17, then the same command again: each resumes at its step,
+# asks for the confirmation again (never kept), and the counts show no action done twice
+r6_reset
+r5 "release publish: GitHub fails the publish: fails at 13" 1 'FAILED at step 13/17 publish' FAKE_PUBLISH_FAIL=1 <<< "$(printf '0.9.0\n0.9.0')"
+expect_pass "release publish: ...with the known fix" grep -q 'GitHub or the network failed for a moment' "$rs/ra.out"
+calls6_are 0 0 0 0
+r5 "release publish: ...the same command again asks for publish again (the answer is not kept), EOF: paused at 13" 2 'PAUSED at step 13/17 publish' < /dev/null
+expect_pass "release publish: ...it showed the publish confirmation, covering crates and brew" sh -c 'grep -q "release: CONFIRM publish, for 0.9.0" "$1" && grep -q "step 13 publish: the draft v0.9.0" "$1" && grep -q "step 15 crates: .*covers it too" "$1" && ! grep -q "CONFIRM tag" "$1"' sh "$rs/ra.out"
+expect_pass "release publish: ...and nothing in the state says it was confirmed" sh -c '! grep -qi "confirm" "$1"' sh "$RSTATE"
+calls6_are 0 0 0 0
+r5 "release publish: ...confirmed: published; then the published release does not verify: a loud stop at 14" 1 'FAILED at step 14/17 verify-published' FAKE_VERIFY_FAIL=mismatch <<< "0.9.0"
+expect_pass "release publish: ...saying not to go on to crates.io or the tap" grep -q 'STOP: the PUBLISHED release did not verify' "$rs/ra.out"
+expect_pass "release publish: ...recording nothing for it" sh -c '! grep -q "^verify_published=" "$1"' sh "$RSTATE"
+calls6_are 1 0 0 0
+r5 "release crates: ...again: verified; the crates-io job fails after one crate, the rerun declined: fails at 15" 1 'FAILED at step 15/17 crates' FAKE_CRATES_FAIL=1 <<< "$(printf '0.9.0\nn')"
+expect_pass "release crates: ...a resume asks for crates (covering brew), not publish" sh -c 'grep -q "release: CONFIRM crates, for 0.9.0" "$1" && ! grep -q "CONFIRM publish" "$1" && grep -q "step 16 brew: .*covers it too" "$1"' sh "$rs/ra.out"
+expect_pass "release crates: ...verify-published was recorded first" grep -q '^verify_published=ok ' "$RSTATE"
+calls6_are 1 1 1 0
+touch "$rs/reject-tap"
+r5 "release crates: ...again: the rerun accepted and approved again, only the crate crates.io lacks is uploaded; the tap push refused: fails at 16" 1 'FAILED at step 16/17 brew' FAKE_CRATES_FAIL=1 <<< "$(printf '0.9.0\ny')"
+expect_pass "release crates: ...each crate uploaded once (fil-proto was on crates.io already)" sh -c 'test "$(grep -c "^crate upload fil-proto$" "$1")" = 1 && test "$(grep -c "^crate upload fil-shell$" "$1")" = 1' sh "$rs/calls.log"
+expect_pass "release crates: ...one approval per attempt of the run" sh -c 'test "$(grep "^approve " "$1" | cut -d" " -f4 | sort -u | wc -l | tr -d " ")" = 2' sh "$rs/calls.log"
+calls6_are 1 2 2 0
+rm -f "$rs/reject-tap"
+r5 "release brew: ...again: the formula commit the refused push left is pushed (not made again); the install test fails at 16" 1 'FAILED at step 16/17 brew' FAKE_BREW_FAIL=1 <<< "0.9.0"
+expect_pass "release brew: ...it asked for brew on its own" sh -c 'grep -q "release: CONFIRM brew, for 0.9.0" "$1" && ! grep -q "CONFIRM crates" "$1"' sh "$rs/ra.out"
+expect_pass "release brew: ...one formula commit, reused" sh -c 'test "$(git --git-dir="$1" log --format=%s main | grep -c "^fil 0.9.0$")" = 1 && grep -q "made by an earlier run and not pushed: it is pushed" "$2"' sh "$rs/tap.git" "$RW/logs/16-brew.log"
+expect_pass "release brew: ...saying the release is out, and how to run the install test again" sh -c 'grep -q "the release is out" "$1" && grep -q -- "--redo brew" "$1"' sh "$rs/ra.out"
+calls6_are 1 2 2 1
+r5 "release finish: ...again: brew detects as done (the tap has it); forgetting the keys fails at 17" 1 'FAILED at step 17/17 finish' FAKE_KEYS_FORGET_FAIL=1 < /dev/null
+expect_pass "release finish: ...with the known fix" grep -q 'just release-keys forget --need ssh,gpg' "$rs/ra.out"
+r5 "release finish: ...again: exit 0" 0 'fil 0.9.0 is released' < /dev/null
+r5 "release brew: --redo brew after the failed install test: installs, pushes nothing, asks nothing" 0 'is released' -- --redo brew < /dev/null
+expect_pass "release brew: ...installed this time" sh -c 'test "$(grep -c "^brew install o/tap/fil$" "$1")" = 2 && ! grep -q "release: CONFIRM" "$2"' sh "$rs/calls.log" "$rs/ra.out"
+calls_are 1 3 1 5
+calls6_are 1 2 2 1
+st5 > "$rs/golden6.out"
+expect_pass "release status: ...the same listing as the happy path's" diff "$rs/golden6" "$rs/golden6.out"
+
+# F3: verify-published fails, then the crates reach crates.io by another route (approved in the
+# browser): the next run verifies again instead of taking the step as implied, and touches no tap
+r6_reset
+r5 "release publish: to 13" 2 'PAUSED at step 13/17 publish' <<< "0.9.0"
+r5 "release publish: the published release does not verify: fails at 14" 1 'FAILED at step 14/17 verify-published' FAKE_VERIFY_FAIL=mismatch <<< "0.9.0"
+printf 'fil-proto\nfil-shell\n' > "$rs/world/crates"
+set_run "$(TR6)" status='"completed"' conclusion='"success"' pending='[]' jobs='[["prepare", "success"], ["publish", "success"], ["crates-io", "success"]]'
+rl_kind 14 verify-published next "not implied by the crates" FIL_RELEASE_KEY="$rs/agentpub/key"
+r5 "release publish: ...the crates out meanwhile: the next run verifies again (and fails again), the tap untouched" 1 'FAILED at step 14/17 verify-published' FAKE_VERIFY_FAIL=mismatch < /dev/null
+calls6_are 1 0 0 0
+r5 "release publish: ...verified: on to the end" 0 'fil 0.9.0 is released' <<< "0.9.0"
+calls6_are 1 0 0 1
+
+# F7: the tap clone's own commits: a foreign commit stops the run; an unsigned commit is never pushed;
+# this release's commit left by a refused push on a main that moved since is made again on the new main
+r6_reset
+r5 "release publish: to 13" 2 'PAUSED at step 13/17 publish' <<< "0.9.0"
+git -C "$rs/tap" commit -q --allow-empty --no-gpg-sign -m 'local work'
+r5 "release brew: a commit in the tap clone its origin lacks: fails at 16, nothing pushed" 1 'has commits that are not on its origin.s main' <<< "0.9.0"
+calls6_are 1 1 2 0
+git -C "$rs/tap" reset -q --hard origin/main
+git -C "$rs/tap" config gpg.ssh.program "$rs/emptysig"
+r5 "release brew: a tap commit that is not signed: fails at 16, nothing pushed" 1 'FAILED at step 16/17 brew' <<< "0.9.0"
+expect_pass "release brew: ...saying it could not sign (or made an unsigned commit)" grep -Eq 'made an unsigned commit in the tap|could not make or sign the formula commit' "$rs/ra.out"
+git -C "$rs/tap" config --unset gpg.ssh.program
+git -C "$rs/tap" reset -q --hard origin/main
+calls6_are 1 1 2 0
+touch "$rs/reject-tap"
+r5 "release brew: the tap push refused: fails at 16" 1 'FAILED at step 16/17 brew' <<< "0.9.0"
+rm -f "$rs/reject-tap"
+echo moved > "$rs/readme2"
+TMOVED=$(tap_put README2 "$rs/readme2")
+r5 "release brew: ...the tap's main moved meanwhile: the commit made again on it, pushed once" 0 'fil 0.9.0 is released' <<< "0.9.0"
+expect_pass "release brew: ...on the moved main, one formula commit there, and the log says so" sh -c 'test "$(git --git-dir="$1" rev-parse main^)" = "$2" && test "$(git --git-dir="$1" log --format=%s main | grep -c "^fil 0.9.0$")" = 1 && grep -q "made again on" "$3"' sh "$rs/tap.git" "$TMOVED" "$RW/logs/16-brew.log"
+calls6_are 1 1 2 1
+
+# --confirm-each: one confirmation each for publish, crates and brew; the crates-io deployment not
+# created yet for two looks (polled for, then approved once)
+r6_reset
+r5 "release publish: to 13" 2 'PAUSED at step 13/17 publish' <<< "0.9.0"
+r5 "release crates: --confirm-each and a deployment not created yet: three confirmations, one approval, exit 0" 0 'fil 0.9.0 is released' FAKE_PENDING_LAG=2 -- --confirm-each <<< "$(printf '0.9.0\n0.9.0\n0.9.0')"
+expect_pass "release crates: ...publish, crates and brew asked once each" sh -c 'for p in publish crates brew; do test "$(grep -c "release: CONFIRM $p, for 0.9.0" "$1")" = 1 || exit 1; done; ! grep -q "covers it too" "$1"' sh "$rs/ra.out"
+expect_pass "release crates: ...the pending deployments asked for until one appeared" sh -c 'test "$(grep -c "pending_deployments --jq" "$1")" -ge 3' sh "$pf/gh.log"
+calls6_are 1 1 2 1
+
+# a deployment the gh user may not approve: paused (exit 2) with the run's URL; then approved in the
+# browser meanwhile: the job is waited for, and the command approves nothing
+r6_reset
+r5 "release publish: to 13" 2 'PAUSED at step 13/17 publish' <<< "0.9.0"
+r5 "release crates: a deployment the gh user may not approve: paused at 15, nothing approved" 2 'PAUSED at step 15/17 crates' FAKE_CANNOT_APPROVE=1 <<< "0.9.0"
+expect_pass "release crates: ...saying why, with the run's URL" sh -c 'grep -q "current_user_can_approve is false" "$1" && grep -q "https://github.com/o/r/actions/runs/$2" "$1"' sh "$rs/ra.out" "$(TR6)"
+calls6_are 1 0 0 0
+set_run "$(TR6)" status='"in_progress"' pending='[]' crates_lag=2
+r5 "release crates: ...approved in the browser meanwhile: the job waited for, no approval from the command; exit 0" 0 'fil 0.9.0 is released' <<< "0.9.0"
+expect_pass "release crates: ...it asked for crates (a new run)" grep -q 'release: CONFIRM crates, for 0.9.0' "$rs/ra.out"
+calls6_are 1 0 2 1
+
+# the draft changed while the publish confirmation waited: an asset replaced, or one added: nothing
+# is published; restored: published
+r6_reset
+r5 "release publish: to 13" 2 'PAUSED at step 13/17 publish' <<< "0.9.0"
+DA6=$(ls -d "$rs/world/releases"/* | tail -n 1)/assets
+cp "$DA6/fil_0.9.0_amd64.deb" "$rs/deb.saved"
+ra_midprompt 'echo tampered > "$DA6/fil_0.9.0_amd64.deb"' FIL_RELEASE_KEY="$rs/agentpub/key"
+ra_check "release publish: a draft asset replaced during the confirmation: fails at 13" 1 "the draft's fil_0.9.0_amd64.deb is not the file SHA256SUMS lists"
+calls6_are 0 0 0 0
+cp "$rs/deb.saved" "$DA6/fil_0.9.0_amd64.deb"
+ra_midprompt 'echo extra > "$DA6/notes.txt"' FIL_RELEASE_KEY="$rs/agentpub/key"
+ra_check "release publish: an asset added during the confirmation: fails at 13" 1 "not exactly the release's \(extra or missing: notes.txt"
+calls6_are 0 0 0 0
+rm -f "$DA6/notes.txt"
+r5 "release publish: ...restored: published, and on to the end" 0 'fil 0.9.0 is released' <<< "0.9.0"
+calls6_are 1 1 2 1
+cat "$pf/gh.log" >> "$rs/gh6.log"
+rm -f "$rs/tag-run-on-push"
+
 # the state: identifiers and results only
-expect_pass "release: the state holds only its keys (no reaper pid, no confirmation, nothing else)" sh -c '! grep -Ev "^(version|release_commit|github_commit|dry_run|checks_linux|checks_macos|checks_waived|dry_verify|tag_object|tag_run|verify_published)=" "$1"' sh "$RSTATE"
+expect_pass "release: the state holds only its keys (no reaper pid, no confirmation, nothing else)" sh -c '! grep -Ev "^(version|release_commit|github_commit|dry_run|checks_linux|checks_macos|checks_waived|dry_verify|tag_object|tag_run|verify_published|brew_tested)=" "$1"' sh "$RSTATE"
 # gh's writes are the dispatches of the three workflows on main and reruns of failed jobs (the
 # actions); everything else is a read
-expect_pass "release: gh wrote only dispatches (the three workflows, on main), reruns --failed, deletions of a release by id and uploads of the five signed files to v0.9.0" sh -c 'cat "$2" "$3" > "$1"; test -s "$1" && ! grep -Ev "^workflow run (release\.yml --repo o/r --ref main|(linux|macos)-check\.yml --repo o/r --ref main -f suite=all -f ref=[0-9a-f]{40})$|^run rerun [0-9]+ --repo o/r --failed$|^api -X DELETE repos/o/r/releases/[0-9]+$|^release upload v0\.9\.0 --repo o/r --clobber( (fil-0\.9\.0-1\.(x86_64|aarch64)\.rpm|SHA256SUMS(\.asc|\.sig)?))+$" "$1" | grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)|^workflow |^run (rerun|cancel)"' sh "$rs/gh-all.log" "$rs/gh5.log" "$pf/gh.log"
-expect_pass "release: ...and it did upload and delete (the log covers the later actions)" sh -c 'grep -q "^release upload " "$1" && grep -q "^api -X DELETE " "$1"' sh "$rs/gh-all.log"
+expect_pass "release: gh wrote only dispatches (the three workflows, on main), reruns --failed, deletions of a release by id, uploads of the five signed files to v0.9.0, its publish and approvals of a run's crates-io deployment" sh -c 'cat "$2" "$3" "$4" > "$1"; test -s "$1" && ! grep -Ev "^workflow run (release\.yml --repo o/r --ref main|(linux|macos)-check\.yml --repo o/r --ref main -f suite=all -f ref=[0-9a-f]{40})$|^run rerun [0-9]+ --repo o/r --failed$|^api -X DELETE repos/o/r/releases/[0-9]+$|^release upload v0\.9\.0 --repo o/r --clobber( (fil-0\.9\.0-1\.(x86_64|aarch64)\.rpm|SHA256SUMS(\.asc|\.sig)?))+$|^release edit v0\.9\.0 --repo o/r --draft=false$|^api -X POST repos/o/r/actions/runs/[0-9]+/pending_deployments -F environment_ids\[\]=[0-9]+ -f state=approved -f comment=approved by just release 0\.9\.0, after its typed confirmation$" "$1" | grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)|^workflow |^run (rerun|cancel)"' sh "$rs/gh-all.log" "$rs/gh5.log" "$rs/gh6.log" "$pf/gh.log"
+expect_pass "release: ...and it did upload, delete, publish and approve (the log covers the later actions)" sh -c 'grep -q "^release upload " "$1" && grep -q "^api -X DELETE " "$1" && grep -q "^release edit " "$1" && grep -q "^api -X POST .*/pending_deployments " "$1"' sh "$rs/gh-all.log"
 expect_pass "release: ...and it did dispatch (the log covers the actions)" grep -q '^workflow run release.yml' "$pf/gh.log"
 
 echo
 echo "release-test: $passed passed, $failed failed"
 [ "$failed" = 0 ]
+exit
+}

@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use fil_predict::sim::FixedPredictor;
 use fil_predict::{
-    Bracket, Config, Flush, Guards, InputKind, LinkView, MoshPredictor, Overlay, Predictor,
-    PtyMode, Status, WithdrawReason,
+    Bracket, Config, Ctx, Flush, Guards, InputKind, InputPos, KeyEvent, LinkView, MoshPredictor,
+    Overlay, OverlayEdit, Predictor, PtyMode, Settled, Show, Status, Time, WithdrawReason,
 };
 use fil_term::{DEFAULT_BACKEND, Size, backends};
 
@@ -66,6 +66,12 @@ impl T {
         let at = self.at;
         self.at += b.len() as u64;
         self.o.on_input(b, at, kind, ms(t))
+    }
+
+    /// An answer to the client's own question, as the engine gives it: at the next session
+    /// offset, which it does not advance (the session never sees it).
+    fn answer(&mut self, b: &[u8], t: u64) -> Flush {
+        self.o.on_input(b, self.at, InputKind::Answer, ms(t))
     }
 
     fn server(&mut self, b: &[u8], t: u64) -> Flush {
@@ -532,6 +538,386 @@ fn released_offline_input_and_answers_are_not_predicted() {
             t.key(b"d", 210).paint.is_empty(),
             "{kind:?}: the next key is tentative"
         );
+    }
+}
+
+/// Reads `reads` as typed input, 10 ms apart (past the 5 ms tail window), and checks that no key
+/// in them reached the predictor; then echoes and acknowledges the paste.
+fn paste_reads(t: &mut T, reads: &[Vec<u8>], echo: &[u8], from: u64) -> u64 {
+    let guessed = t.o.stats().guessed;
+    let written = t.o.stats().written;
+    let mut now = from;
+    for r in reads {
+        let f = t.key(r, now);
+        assert!(
+            f.paint.is_empty(),
+            "a pasted read painted {:?} ({reads:?})",
+            String::from_utf8_lossy(&f.paint)
+        );
+        assert_eq!(
+            t.o.stats().guessed,
+            guessed,
+            "a pasted key was guessed ({reads:?})"
+        );
+        now += 10;
+    }
+    assert_eq!(t.o.stats().written, written);
+    t.server(echo, now + 50);
+    t.ack(now + 60);
+    now + 100
+}
+
+/// Types `b`, `c`, `d`, each echoed and acknowledged: whether any of them was written (the
+/// first is tentative after a paste, its echo confirms the epoch).
+fn types_again(t: &mut T, from: u64) -> bool {
+    let written = t.o.stats().written;
+    for (i, c) in [b"b", b"c", b"d"].into_iter().enumerate() {
+        let at = from + 300 * i as u64;
+        t.key(c, at);
+        t.server(c, at + 110);
+        t.ack(at + 120);
+    }
+    t.o.stats().written > written
+}
+
+/// The paste as Alacritty writes it to the PTY: the start marker, the text and the end marker,
+/// three writes.
+fn alacritty_paste(body: &[u8]) -> Vec<u8> {
+    let mut v = b"\x1b[200~".to_vec();
+    v.extend_from_slice(body);
+    v.extend_from_slice(b"\x1b[201~");
+    v
+}
+
+/// `stream` cut into reads before each of `cuts` (increasing offsets; 0 and repeats are ignored).
+fn cut(stream: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
+    let mut reads = vec![Vec::new()];
+    for (i, &b) in stream.iter().enumerate() {
+        if i > 0 && cuts.contains(&i) {
+            reads.push(Vec::new());
+        }
+        reads.last_mut().unwrap().push(b);
+    }
+    reads
+}
+
+/// BUGS-1 (M3 sweep): the start marker read on its own and the rest, with the end marker, in a
+/// paste-sized read (not decoded): the paste still ends, and typing is predicted again.
+#[test]
+fn a_paste_whose_end_marker_comes_in_a_large_read_still_ends() {
+    let mut t = T::trusted();
+    let mut rest = vec![b'x'; 70];
+    rest.extend_from_slice(b"\x1b[201~");
+    let next = paste_reads(&mut t, &[b"\x1b[200~".to_vec(), rest], &[b'x'; 70], 200);
+    assert!(types_again(&mut t, next), "prediction never came back");
+    // The same with the rest released as offline input.
+    let mut t = T::trusted();
+    t.key(b"\x1b[200~", 200);
+    let mut rest = vec![b'x'; 10];
+    rest.extend_from_slice(b"\x1b[201~");
+    t.input(&rest, InputKind::Offline, 210);
+    t.server(&[b'x'; 10], 260);
+    t.ack(270);
+    assert!(types_again(&mut t, 400), "prediction never came back");
+}
+
+/// BUGS-2 (M3 sweep): a paste-sized first read holding the start marker, and the paste's tail
+/// long after it: the tail is pasted, not typed, and is never guessed or written.
+#[test]
+fn the_late_tail_of_a_paste_is_never_guessed() {
+    use fil_predict::sim::{HostileCfg, HostilePredictor};
+    for seed in 0..8 {
+        for hostile in [false, true] {
+            let p: Box<dyn Predictor> = if hostile {
+                Box::new(HostilePredictor::new(HostileCfg::noisy(seed)))
+            } else {
+                Box::new(MoshPredictor::default())
+            };
+            let mut t = T::with(p, Guards::ALL, Size { cols: 40, rows: 10 });
+            t.confirm();
+            let mut head = b"\x1b[200~".to_vec();
+            head.extend_from_slice(&[b'x'; 60]);
+            t.key(&head, 300);
+            t.server(&[b'x'; 60], 400);
+            t.ack(450);
+            let guessed = t.o.stats().guessed;
+            // Keys inside the paste, then its tail 1.4 s later: none of it is a typed key.
+            for (i, c) in [b"c", b"d"].into_iter().enumerate() {
+                let at = 1000 + 400 * i as u64;
+                assert!(t.key(c, at).paint.is_empty(), "hostile {hostile}");
+                t.server(c, at + 110);
+                t.ack(at + 160);
+            }
+            let f = t.key(b"yz\x1b[201~", 1700);
+            assert!(
+                f.paint.is_empty(),
+                "hostile {hostile} seed {seed}: the tail painted {:?}",
+                String::from_utf8_lossy(&f.paint)
+            );
+            assert_eq!(t.o.stats().guessed, guessed, "hostile {hostile}");
+            if !hostile {
+                t.server(b"yz", 1800);
+                t.ack(1810);
+                assert!(types_again(&mut t, 2000), "prediction never came back");
+            }
+        }
+    }
+}
+
+/// SEC-2 (M3 sweep), the auditor's trace: a paste-sized first read holding the start marker, the
+/// keys in between confirming an epoch, and the rest of the paste, with the end marker, typed in
+/// that confirmed epoch. The pasted `ØÑ` is never guessed or written.
+#[test]
+fn sec2_a_paste_split_across_reads_is_not_predicted_in_a_confirmed_epoch() {
+    use fil_predict::MoshConfig;
+    use fil_predict::sim::{HostileCfg, HostilePredictor};
+    let predictors: [fn() -> Box<dyn Predictor>; 2] = [
+        || Box::new(MoshPredictor::new(MoshConfig::always())),
+        || Box::new(HostilePredictor::new(HostileCfg::noisy(3))),
+    ];
+    for p in predictors {
+        let mut t = T::with(p(), Guards::ALL, Size { cols: 40, rows: 10 });
+        t.server(b"\x1b[?2004h$ ", 0);
+        let mut head = b"\x1b[200~".to_vec();
+        head.extend_from_slice(&[b'a'; 70]);
+        t.key(&head, 10);
+        t.server(&[b'a'; 70], 60);
+        t.o.on_echo_ack(76, ms(65));
+        t.key(b"bcd", 80);
+        t.server(b"bcd", 130);
+        t.o.on_echo_ack(79, ms(135));
+        let guessed = t.o.stats().guessed;
+        let f = t.key("ØÑ\x1b[201~".as_bytes(), 150);
+        assert!(
+            f.paint.is_empty() && !t.painted(),
+            "the paste's rest painted {:?}",
+            String::from_utf8_lossy(&f.paint)
+        );
+        assert_eq!(t.o.stats().guessed, guessed);
+    }
+}
+
+/// A stray end marker outside a paste is not a key: it ends the epoch.
+#[test]
+fn a_stray_paste_marker_is_a_boundary() {
+    let mut t = T::trusted();
+    assert!(!t.key(b"b", 200).paint.is_empty());
+    t.key(b"\x1b[201~", 210);
+    assert!(
+        t.key(b"c", 220).paint.is_empty(),
+        "the next key was written"
+    );
+}
+
+/// Markers cut across reads of any kinds still start and end the paste.
+#[test]
+fn a_paste_marker_cut_across_reads_is_seen() {
+    let cases: [&[(&[u8], InputKind)]; 4] = [
+        &[
+            (b"\x1b[2", InputKind::Typed),
+            (b"00~xy", InputKind::Typed),
+            (b"z\x1b[20", InputKind::Typed),
+            (b"1~", InputKind::Typed),
+        ],
+        &[
+            (b"\x1b[20", InputKind::Pasted),
+            (b"0~xyz\x1b", InputKind::Typed),
+            (b"[201~", InputKind::Pasted),
+        ],
+        &[
+            (b"\x1b", InputKind::Typed),
+            (b"[200~xyz\x1b[2", InputKind::Offline),
+            (b"01~", InputKind::Typed),
+        ],
+        // An answer is at the next session offset and does not advance it, so the read after
+        // it overlaps it: the marker cut across them is still a marker (review F1).
+        &[
+            (b"\x1b[200", InputKind::Typed),
+            (b"~xyz\x1b[201", InputKind::Answer),
+            (b"~", InputKind::Typed),
+        ],
+    ];
+    for reads in cases {
+        let mut t = T::trusted();
+        let guessed = t.o.stats().guessed;
+        for (i, &(b, kind)) in reads.iter().enumerate() {
+            let now = 200 + 10 * i as u64;
+            let f = if kind == InputKind::Answer {
+                t.answer(b, now)
+            } else {
+                t.input(b, kind, now)
+            };
+            assert!(f.paint.is_empty(), "{reads:?}");
+        }
+        assert_eq!(t.o.stats().guessed, guessed, "{reads:?}");
+        t.server(b"xyz", 300);
+        t.ack(310);
+        assert!(
+            types_again(&mut t, 400),
+            "{reads:?}: prediction never came back"
+        );
+    }
+}
+
+/// Review F1: a start marker cut across an answer and the typed read after it (which overlaps
+/// the answer's offset): the pasted rest is never guessed or written, with the default
+/// predictor or a hostile one.
+#[test]
+fn a_start_marker_cut_after_an_answer_still_starts_the_paste() {
+    use fil_predict::MoshConfig;
+    use fil_predict::sim::{HostileCfg, HostilePredictor};
+    let predictors: [fn() -> Box<dyn Predictor>; 2] = [
+        || Box::new(MoshPredictor::new(MoshConfig::always())),
+        || Box::new(HostilePredictor::new(HostileCfg::noisy(3))),
+    ];
+    for p in predictors {
+        let mut t = T::with(p(), Guards::ALL, Size { cols: 40, rows: 10 });
+        t.confirm();
+        t.ack(130);
+        let guessed = t.o.stats().guessed;
+        assert!(t.answer(b"y\x1b[20", 200).paint.is_empty());
+        assert!(t.key(b"0~sec", 210).paint.is_empty());
+        for (i, c) in b"0~sec".iter().enumerate() {
+            let now = 300 + 20 * i as u64;
+            t.server(&[*c], now);
+            t.ack(now + 10);
+        }
+        let f = t.key(b"ret", 500);
+        assert!(
+            f.paint.is_empty() && !t.painted(),
+            "the paste painted {:?}",
+            String::from_utf8_lossy(&f.paint)
+        );
+        assert_eq!(t.o.stats().guessed, guessed);
+    }
+}
+
+/// Review F1: an end marker cut across an answer and the typed read after it still ends the
+/// paste: typing is predicted again.
+#[test]
+fn an_end_marker_cut_after_an_answer_still_ends_the_paste() {
+    let mut t = T::trusted();
+    t.key(b"\x1b[200~xyz", 200);
+    t.answer(b"\x1b[20", 210);
+    t.key(b"1~", 220);
+    t.server(b"xyz", 300);
+    t.ack(310);
+    assert!(types_again(&mut t, 400), "prediction never came back");
+}
+
+/// A marker cut across a forward gap (bytes the overlay never saw) is not a marker: what
+/// follows is typed, not pasted.
+#[test]
+fn a_marker_cut_across_a_gap_is_not_a_marker() {
+    let mut t = T::trusted();
+    t.key(b"b\x1b[20", 200);
+    t.at += 3; // bytes the overlay never saw
+    t.key(b"0~cd", 210);
+    t.server(b"b0~cd", 300);
+    t.ack(310);
+    assert!(types_again(&mut t, 400), "prediction never came back");
+}
+
+/// The key right after an end marker, in the same read, is typed.
+#[test]
+fn a_key_after_an_end_marker_in_the_same_read_is_typed() {
+    let mut t = T::trusted();
+    t.key(b"\x1b[200~xy", 200);
+    let guessed = t.o.stats().guessed;
+    t.key(b"z\x1b[201~c", 210);
+    assert_eq!(t.o.stats().guessed, guessed + 1, "c was not guessed");
+}
+
+/// A recording of the keys the predictor was given, around the default predictor.
+struct Recorder {
+    inner: MoshPredictor,
+    keys: std::sync::Arc<std::sync::Mutex<Vec<KeyEvent>>>,
+}
+
+impl Predictor for Recorder {
+    fn on_key(&mut self, key: &KeyEvent, at: InputPos, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        self.keys.lock().unwrap().push(key.clone());
+        self.inner.on_key(key, at, ctx)
+    }
+    fn on_output(&mut self, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        self.inner.on_output(ctx)
+    }
+    fn on_settled(&mut self, settled: &[Settled], ctx: &Ctx<'_>) {
+        self.inner.on_settled(settled, ctx);
+    }
+    fn on_echo_ack(&mut self, input_upto: InputPos, ctx: &Ctx<'_>) {
+        self.inner.on_echo_ack(input_upto, ctx);
+    }
+    fn on_tick(&mut self, ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        self.inner.on_tick(ctx)
+    }
+    fn next_deadline(&self) -> Option<Time> {
+        self.inner.next_deadline()
+    }
+    fn show(&self, ctx: &Ctx<'_>) -> Show {
+        self.inner.show(ctx)
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn has_outstanding(&self) -> bool {
+        self.inner.has_outstanding()
+    }
+}
+
+/// A bare Esc that ends a read (vi mode) is a key the predictor sees, as it was before the
+/// paste scan held it as a possible marker; a marker it does start is still the paste's.
+#[test]
+fn a_bare_esc_at_the_end_of_a_read_is_a_key() {
+    let keys = std::sync::Arc::default();
+    let p = Recorder {
+        inner: MoshPredictor::default(),
+        keys: std::sync::Arc::clone(&keys),
+    };
+    let mut t = T::with(Box::new(p), Guards::ALL, Size { cols: 40, rows: 10 });
+    t.confirm();
+    t.key(b"b\x1b", 200);
+    assert_eq!(
+        keys.lock().unwrap().last(),
+        Some(&KeyEvent::Escape),
+        "the Esc was not a key"
+    );
+    // The Esc started a paste after all: none of the rest is a key.
+    let seen = keys.lock().unwrap().len();
+    let guessed = t.o.stats().guessed;
+    assert!(t.key(b"[200~xyz", 210).paint.is_empty());
+    assert_eq!(keys.lock().unwrap().len(), seen, "a pasted byte was a key");
+    assert_eq!(t.o.stats().guessed, guessed);
+}
+
+/// Every cut of Alacritty's three writes into reads, for a short paste (every composition) and a
+/// paste-sized one (every cut into up to three reads): nothing pasted is guessed, and typing is
+/// predicted again after it.
+#[test]
+fn every_chunking_of_a_bracketed_paste_is_pasted() {
+    let short = alacritty_paste(b"x");
+    for mask in 0..1u32 << (short.len() - 1) {
+        let cuts: Vec<usize> = (1..short.len())
+            .filter(|i| mask & 1 << (i - 1) != 0)
+            .collect();
+        let mut t = T::trusted();
+        let next = paste_reads(&mut t, &cut(&short, &cuts), b"x", 200);
+        assert!(
+            types_again(&mut t, next),
+            "mask {mask:b}: prediction never came back"
+        );
+    }
+    let body = [b'x'; 70];
+    let long = alacritty_paste(&body);
+    for i in 1..long.len() {
+        for j in i..long.len() {
+            let mut t = T::trusted();
+            let next = paste_reads(&mut t, &cut(&long, &[i, j]), &body, 200);
+            assert!(
+                types_again(&mut t, next),
+                "cuts {i} {j}: prediction never came back"
+            );
+        }
     }
 }
 

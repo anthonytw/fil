@@ -224,9 +224,106 @@ fn csi_end(rest: &[u8]) -> Option<usize> {
         .map(|p| p + 1)
 }
 
+/// The bracketed-paste markers, `CSI 200 ~` and `CSI 201 ~`.
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Tracks whether the input is inside a bracketed paste, from the raw bytes of every read,
+/// whatever its kind and size (`docs/m3/plan.md` §2.4 rule 6). It is separate from
+/// [`KeyDecoder`] because a read that is not decoded (pasted, offline or an answer) still moves
+/// the paste state, and a marker can be cut across reads of any kinds.
+#[derive(Clone, Default)]
+pub struct PasteScan {
+    /// Inside a paste: `CSI 200 ~` seen, `CSI 201 ~` not yet.
+    in_paste: bool,
+    /// How many bytes of a marker the bytes so far end with.
+    held: usize,
+    /// Once `held` is past the markers' shared prefix: whether it is the start marker.
+    start: bool,
+}
+
+/// A marker found by [`PasteScan::scan`]: the offset just past its last byte, and whether it
+/// starts a paste.
+pub type PasteMark = (u64, bool);
+
+impl PasteScan {
+    /// Inside a paste after the bytes scanned so far.
+    pub fn in_paste(&self) -> bool {
+        self.in_paste
+    }
+
+    /// How many bytes at the end of the input so far may be the start of a marker.
+    pub fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Forgets a cut marker (a gap in the input offsets). The paste state is kept.
+    pub fn clear_partial(&mut self) {
+        self.held = 0;
+    }
+
+    /// Forgets everything: a fresh attach's input.
+    pub fn clear(&mut self) {
+        *self = PasteScan::default();
+    }
+
+    /// Scans `bytes`, the input at offset `at`, and pushes each complete marker onto `marks`.
+    pub fn scan(&mut self, bytes: &[u8], at: u64, marks: &mut Vec<PasteMark>) {
+        for (i, &b) in bytes.iter().enumerate() {
+            // The markers share all but their fifth byte: `0` starts a paste, `1` ends it.
+            let n = self.held;
+            self.held = match n {
+                0..=3 if b == PASTE_START[n] => n + 1,
+                4 if b == PASTE_START[4] || b == PASTE_END[4] => {
+                    self.start = b == PASTE_START[4];
+                    5
+                }
+                5 if b == PASTE_START[5] => {
+                    self.in_paste = self.start;
+                    marks.push((at + i as u64 + 1, self.start));
+                    0
+                }
+                // Only a marker's first byte is ESC, so a mismatch can only restart at an ESC.
+                _ => usize::from(b == PASTE_START[0]),
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_scan_finds_markers_whatever_the_cuts() {
+        let stream = b"a\x1b\x1b[200~x\x1b[20\x1b[201~\x1b[2001~b\x1b[201~";
+        let whole = {
+            let mut s = PasteScan::default();
+            let mut m = Vec::new();
+            s.scan(stream, 0, &mut m);
+            assert!(!s.in_paste());
+            m
+        };
+        assert_eq!(whole, vec![(8, true), (19, false), (33, false)]);
+        for i in 0..=stream.len() {
+            for j in i..=stream.len() {
+                let mut s = PasteScan::default();
+                let mut m = Vec::new();
+                s.scan(&stream[..i], 0, &mut m);
+                s.scan(&stream[i..j], i as u64, &mut m);
+                s.scan(&stream[j..], j as u64, &mut m);
+                assert_eq!(m, whole, "cuts {i} {j}");
+            }
+        }
+        let mut s = PasteScan::default();
+        s.scan(b"\x1b[200~", 0, &mut Vec::new());
+        assert!(s.in_paste());
+        s.scan(b"\x1b[20", 6, &mut Vec::new());
+        assert_eq!(s.held(), 4);
+        s.clear_partial();
+        s.scan(b"1~", 10, &mut Vec::new());
+        assert!(s.in_paste(), "a cut marker across a gap is not a marker");
+    }
 
     #[test]
     fn decodes_typical_input() {

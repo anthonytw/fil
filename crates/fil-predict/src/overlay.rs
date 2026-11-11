@@ -49,7 +49,7 @@ pub use epochs::{
     EXPIRY, IDLE, LATE_ECHO_GRACE, MAX_OUTSTANDING, Mispredicted, PredictStats, Withdrawn,
 };
 
-use crate::keys::{KeyClass, KeyDecoder, classify};
+use crate::keys::{KeyClass, KeyDecoder, PasteMark, PasteScan, classify};
 use crate::predictor::{
     CellRef, CellStyle, CoreView, Ctx, InputPos, KeyEvent, LinkView, Predictor, ScreenView, Show,
     Time, WithdrawReason,
@@ -60,6 +60,8 @@ use crate::tracker::{Blocker, Link, Tracker};
 pub const PASTE_READ: usize = 64;
 /// Reads this soon after a paste read are its tail (the short last chunk of a split paste).
 pub const PASTE_FOLLOW: Duration = Duration::from_millis(5);
+/// The length of a bracketed-paste marker (`CSI 200 ~`, `CSI 201 ~`).
+const MARKER_LEN: u64 = 6;
 
 /// Where input came from (`docs/m3/plan.md` §2.4 rule 6). Only typed, live input is predicted;
 /// the rest is a boundary, with its offsets still counted so `EchoAck` stays aligned.
@@ -638,8 +640,10 @@ struct Inner {
     on_screen: Option<OnScreen>,
     /// The end of the input seen so far (the next byte's offset).
     input_end: InputPos,
-    /// Inside a bracketed paste (`CSI 200 ~` seen, `CSI 201 ~` not yet).
-    in_paste: bool,
+    /// Inside a bracketed paste (`CSI 200 ~` seen, `CSI 201 ~` not yet), from every read's bytes.
+    paste: PasteScan,
+    /// The markers in the current read (kept to reuse its allocation).
+    marks: Vec<PasteMark>,
     /// Reads up to this time are the tail of an unmarked paste.
     paste_until: Option<Time>,
     /// A resize made the shadow untrusted (rule 9); a snapshot at the current size restores it.
@@ -675,7 +679,8 @@ impl Overlay {
                 status: None,
                 on_screen: None,
                 input_end: 0,
-                in_paste: false,
+                paste: PasteScan::default(),
+                marks: Vec::new(),
                 paste_until: None,
                 trusted: true,
                 repaint_wanted: false,
@@ -866,9 +871,21 @@ impl Overlay {
         if at != o.input_end {
             // A gap or an overlap in the offsets: no key can be placed across it.
             o.decoder.clear();
+            if at > o.input_end {
+                // Bytes the overlay never saw: a cut marker is not one. An overlap is only ever
+                // an answer (given at the next session offset, which it does not advance), and
+                // stdin is one stream across answers and session bytes, so a marker cut across
+                // it is still a marker.
+                o.paste.clear_partial();
+            }
             o.core.boundary(Why::Unpredicted, Some(&st), now);
         }
         o.input_end = end;
+        // The paste state follows every read's bytes, decoded or not, so a marker in a pasted,
+        // offline or answer read, or cut across reads, still starts or ends the paste (rule 6).
+        let paste_before = o.paste.in_paste();
+        o.marks.clear();
+        o.paste.scan(bytes, at, &mut o.marks);
         let mut kind = kind;
         if g.paste && kind == InputKind::Typed {
             let tail = o.paste_until.is_some_and(|t| now <= t);
@@ -889,23 +906,40 @@ impl Overlay {
         let allowed = o.prediction_allowed(&st);
         let held = o.decoder.pending() as u64;
         let mut pos = at.saturating_sub(held);
+        // Whether the input is in a paste before the next key, and the next marker to apply.
+        let (mut in_paste, mut mark) = (paste_before, 0);
+        // The bytes from here on may be a marker that the next read completes: not keys. A bare
+        // Esc that ends the read is still the key it was (a boundary): if it does start a marker,
+        // the scan of the next read marks that read's bytes as the marker's.
+        let maybe_marker = end - o.paste.held() as u64;
+        let mut skipping = false;
         for (key, len) in o.decoder.decode_sized(bytes) {
             let (kat, kend) = (pos, pos + len as u64);
             pos = kend;
             let class = classify(&key);
             if g.paste {
-                if o.in_paste {
-                    if class == KeyClass::PasteEnd {
-                        o.in_paste = false;
+                // A key is pasted if it starts inside a paste or any byte of a marker is in it
+                // (the scan, not the decoder, decides: a marker cut across reads may decode as
+                // other keys). Markers themselves are never keys: the decoder's bytes are always
+                // a suffix of what the scan has seen, so every marker it decodes whole has a mark.
+                while let Some(&(m_end, start)) = o.marks.get(mark) {
+                    if m_end > kat {
+                        break;
+                    }
+                    in_paste = start;
+                    mark += 1;
+                }
+                let overlaps = |&(m_end, _): &PasteMark| m_end.saturating_sub(MARKER_LEN) < kend;
+                let cut = kend > maybe_marker && !matches!(key, KeyEvent::Escape);
+                let pasted = in_paste || cut || o.marks.get(mark).is_some_and(overlaps);
+                if pasted {
+                    if !skipping {
                         o.core.end(Why::Unpredicted, Some(&st), now);
                     }
+                    skipping = true;
                     continue;
                 }
-                if class == KeyClass::PasteStart {
-                    o.in_paste = true;
-                    o.core.end(Why::Unpredicted, Some(&st), now);
-                    continue;
-                }
+                skipping = false;
             } else if matches!(class, KeyClass::PasteStart | KeyClass::PasteEnd) {
                 continue; // the mutation: the markers are dropped and the paste is "typed"
             }
@@ -1027,7 +1061,7 @@ impl Overlay {
     /// attach's acknowledgement would satisfy the prior-ack rule for the new one's keys.
     pub fn rebase_input(&mut self) {
         self.o.input_end = 0;
-        self.o.in_paste = false;
+        self.o.paste.clear();
         self.o.paste_until = None;
         self.o.decoder.clear();
         self.o.core.rebase_input();

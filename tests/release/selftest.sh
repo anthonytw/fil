@@ -3384,6 +3384,7 @@ sed 's/0\.9\.0/0.9.1/g' "$rs/world/releases/1/assets/SHA256SUMS" > "$rs/sums091"
 "$REPO_ROOT/packaging/render.sh" brew 0.9.1 "$rs/sums091" "$rs/brew091" > /dev/null 2>&1
 tap_put Formula/fil.rb "$rs/brew091/fil.rb" > /dev/null
 r5 "release brew: the tap at a newer version (0.9.1): fails at 16, no downgrade" 1 'version 0\.9\.1, newer than 0\.9\.0: it is not changed' < /dev/null
+expect_pass "release brew: ...saying the tap has moved past it, not to --redo brew (refused there)" sh -c 'grep -q "it has moved past 0.9.0" "$1" && ! grep -q -- "--redo brew" "$1"' sh "$rs/ra.out"
 python3 -I -c 'import re, sys
 t = open(sys.argv[1]).read()
 open(sys.argv[2], "w").write(re.sub(r"sha256 \"[0-9a-f]{64}\"", "sha256 \"" + "0" * 64 + "\"", t, count=1))' "$rs/tap-v.rb" "$rs/tap-badsum.rb"
@@ -3463,6 +3464,16 @@ r6_reset
 r5 "release publish: to 13" 2 'PAUSED at step 13/17 publish' <<< "0.9.0"
 git -C "$rs/tap" commit -q --allow-empty --no-gpg-sign -m 'local work'
 r5 "release brew: a commit in the tap clone its origin lacks: fails at 16, nothing pushed" 1 'has commits that are not on its origin.s main' <<< "0.9.0"
+calls6_are 1 1 2 0
+git -C "$rs/tap" reset -q --hard origin/main
+# an unsigned "fil 0.9.0" commit of this release's formula, left in the clone: not taken for an
+# earlier run's (tap_ours wants a signature), so it stops the run like any foreign commit
+mkdir -p "$rs/tap/Formula"
+cp "$rs/tap-v.rb" "$rs/tap/Formula/fil.rb"
+git -C "$rs/tap" add Formula/fil.rb
+git -C "$rs/tap" commit -q --no-gpg-sign -m 'fil 0.9.0' -- Formula/fil.rb
+r5 "release brew: an unsigned 'fil 0.9.0' commit left in the tap clone: not reused, fails at 16, nothing pushed" 1 'has commits that are not on its origin.s main' <<< "0.9.0"
+expect_pass "release brew: ...the log never says it is pushed" sh -c '! grep -q "made by an earlier run and not pushed" "$1"' sh "$RW/logs/16-brew.log"
 calls6_are 1 1 2 0
 git -C "$rs/tap" reset -q --hard origin/main
 git -C "$rs/tap" config gpg.ssh.program "$rs/emptysig"

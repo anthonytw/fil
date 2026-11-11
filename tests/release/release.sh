@@ -1957,7 +1957,7 @@ act_brew() {
       none | older) ;;
       done) step_fail "the tap's formula is $V's already, but the step did not detect as done" "run it again; if it says the same, send the log to the coordinator" ;;
       other) step_fail "the tap's formula names $V, but not with the published SHA256SUMS's checksums: it is not changed" "look at it (git -C $tap log -p origin/main -- Formula/fil.rb); fix the tap by hand (a PR there), then run it again" ;;
-      newer) step_fail "the tap's formula is version $TAP_VER, newer than $V: it is not changed (no downgrade)" "nothing to do for the tap; $AGAIN --redo brew runs the install test of what it has" ;;
+      newer) step_fail "the tap's formula is version $TAP_VER, newer than $V: it is not changed (no downgrade)" "nothing to do for the tap: it has moved past $V, and running it again stops here again. The release is out, but finish does not run without brew: no summary, no AUR PKGBUILD, no copy for the coordinator (the published SHA256SUMS and .sig are in $FILES)" ;;
       *) step_fail "the tap's formula names no version this command can read (${TAP_VER:--}): it is not changed" "look at it (git -C $tap show origin/main:Formula/fil.rb); fix the tap by hand, then run it again" ;;
     esac
     [ "$(tg symbolic-ref -q HEAD)" = refs/heads/main ] || step_fail "the tap clone $tap is not on its main branch" "git -C $tap checkout main, then run it again"

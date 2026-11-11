@@ -114,6 +114,13 @@ impl Cut {
         Self::start_to(SocketAddr::new(up_ip, 22), udp)
     }
 
+    /// A relay for the pipe only, to a TCP listener on this machine (`--local`: the listener
+    /// runs the private daemon's relay for each connection, `predict.rs`). No UDP port is bound,
+    /// so nothing of QUIC goes through it: `--local` runs the delayed scenarios on the pipe.
+    pub fn start_local(tcp_up: SocketAddr) -> Result<Cut, String> {
+        Self::start_to(tcp_up, Vec::new())
+    }
+
     /// The relay: TCP on an ephemeral port of 127.0.0.1 to `tcp_up`, and UDP on each local port of
     /// `udp` (0 for any) to its address. A local port another process holds is left out.
     fn start_to(tcp_up: SocketAddr, udp: Vec<(u16, SocketAddr)>) -> Result<Cut, String> {

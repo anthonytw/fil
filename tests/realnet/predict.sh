@@ -10,8 +10,10 @@
 #
 #   p_keys    fil on the pipe and on QUIC, each prediction mode, and `ssh -tt -o
 #             ObscureKeystrokeTiming=no`; 25, 75 and 200 ms each way, +-5 ms
-#   p_fast    fil on the pipe and on QUIC, adaptive, 2.5 ms each way: nothing written (done-when 4)
-#   p_loss    fil on QUIC, adaptive, 75 ms each way, 2 % and 5 % loss
+#   p_fast    fil on the pipe and on QUIC (a raw `cat`) and at a bash prompt, adaptive, 2.5 ms
+#             each way: nothing written (done-when 4)
+#   p_loss    fil on QUIC, adaptive, 75 ms each way, 2 % and 5 % loss; keys later than one round
+#             trip plus 250 ms (the glitch bound, PC-1) are noted
 #   p_roam    fil on QUIC, adaptive, 75 ms each way, three NAT moves while the keys are typed
 #   p_shells  fil, adaptive, 75 ms each way: typing at the prompt of bash, zsh and fish (those
 #             installed; bash is required)
@@ -35,6 +37,9 @@
 # cells) nothing written and no `fast` key, which also checks that half the round trip still
 # separates a guess from an echo (raise PR_JITTER_MS to half the delay and it would not).
 #
+# **Prediction helps** (done-when 3): in p_keys, every adaptive cell at 75 ms each way and more must
+# have written guesses, with keys shown by one (`fast`), and their p50 (`fast_p50_ms`) under 5 ms.
+#
 # **Measured**, per cell, in $OUT/results-predict-cells.tsv (and the job summary): key-to-glyph p50
 # and p99 over all measured keys, and over the `fast` ones (shown within half the round trip: the
 # keys a guess showed, as no echo comes back that soon); `vanished`, the keys whose glyph went away
@@ -45,9 +50,9 @@
 #   PR_RATE=20 PR_COUNT=200   keys per second and measured keys per cell (10 more are a warm-up)
 #   PR_JITTER_MS=5            netem jitter each way (not in p_fast)
 #
-# For V1 (docs/m3/plan.md §5.5, §5.6): fish, when it is added, must run as `fish --no-config
-# --private`: the `\r~.` that ends a cell runs the typed line at the prompt, and a fish that keeps
-# history would offer it back as an autosuggestion on the next run (every key lost). The client
+# fish runs as `fish --no-config --private`: the `\r~.` that ends a cell runs the typed line at the
+# prompt, and a fish that keeps history would offer it back as an autosuggestion on the next run
+# (every key lost). docs/m3/latency.md is where the numbers are recorded (V1). The client
 # logs here are debug logs, kept in the run's artifact: fine for the throwaway runner, but debug
 # logs from the Pis must never be uploaded anywhere public.
 set -uo pipefail
@@ -91,7 +96,7 @@ pr_setup() {
   else
     log "fil has no --predict yet (M3's E1b): only the cells with prediction off run"
   fi
-  printf 'cell\ttransport\tpredict\tdelay_ms\tloss\tsent\tshown\tlost\tp50_ms\tp99_ms\tfast\tfast_p50_ms\tvanished\tbytes_p50_ms\twritten\tmispredicted\n' > "$PR_CELLS"
+  printf 'cell\ttransport\tpredict\tdelay_ms\tloss\tsent\tshown\tlost\tp50_ms\tp99_ms\tmax_ms\tfast\tfast_p50_ms\tvanished\tbytes_p50_ms\twritten\tmispredicted\n' > "$PR_CELLS"
 }
 
 pr_teardown() {
@@ -106,8 +111,8 @@ pr_cells_summary() {
     echo
     echo 'bytes p50 is the byte-echo time, with prediction off only (with it on, the bytes line times the guess).'
     echo
-    echo '| cell | transport | predict | delay | loss | sent | shown | lost | p50 | p99 | fast | fast p50 | vanished | bytes p50 | written | mispredicted |'
-    echo '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
+    echo '| cell | transport | predict | delay | loss | sent | shown | lost | p50 | p99 | max | fast | fast p50 | vanished | bytes p50 | written | mispredicted |'
+    echo '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
     tail -n +2 "$PR_CELLS" | awk -F'\t' '{ printf "|"; for (i = 1; i <= NF; i++) printf " %s |", $i; printf "\n" }'
   } >> "$GITHUB_STEP_SUMMARY"
 }
@@ -188,7 +193,7 @@ pr_record() {
     pr_stats "$tag"
     cx_fk "$tag"
   fi
-  local sent shown lost p50 p99 fast vanished bytes_p50=-
+  local sent shown lost p50 p99 max fast vanished bytes_p50=-
   fast=$(kv "$line" fast)
   vanished=$(kv "$line" vanished)
   # With prediction on, the bytes line times the guess's byte, not the echo.
@@ -198,10 +203,12 @@ pr_record() {
   lost=$(kv "$line" lost)
   p50=$(kv "$line" p50_ms)
   p99=$(kv "$line" p99_ms)
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$kind" "$mode" "$delay" "$loss" \
-    "$sent" "$shown" "$lost" "$p50" "$p99" "$fast" "$(kv "$line" fast_p50_ms)" "$vanished" \
+  max=$(kv "$line" max_ms)
+  PR_FAST=$fast PR_FAST_P50=$(kv "$line" fast_p50_ms) PR_MAX=$max
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$kind" "$mode" "$delay" "$loss" \
+    "$sent" "$shown" "$lost" "$p50" "$p99" "$max" "$fast" "$PR_FAST_P50" "$vanished" \
     "$bytes_p50" "$PR_WRITTEN" "$PR_MISS" >> "$PR_CELLS"
-  note "$tag.p50_ms=$p50 $tag.p99_ms=$p99 $tag.fast=$fast $tag.vanished=$vanished $tag.lost=$lost $tag.bytes_p50_ms=$bytes_p50 $tag.written=$PR_WRITTEN $tag.mispredicted=$PR_MISS"
+  note "$tag.p50_ms=$p50 $tag.p99_ms=$p99 $tag.max_ms=$max $tag.fast=$fast $tag.vanished=$vanished $tag.lost=$lost $tag.bytes_p50_ms=$bytes_p50 $tag.written=$PR_WRITTEN $tag.mispredicted=$PR_MISS"
 
   case $kind in
     pipe | quic) lat_check_path "$tag" "$kind" "$(kv "$line" first_key_ms)" ;;
@@ -240,6 +247,18 @@ pr_cell() {
   pr_record "$tag" "$kind" "$mode" "$delay" "$loss" ${expect:+"$expect"}
 }
 
+# pr_helps TAG DELAY_MS: done-when 3, on the cell pr_record just recorded (an adaptive cell at 75 ms
+# each way or more): guesses written, keys shown by one, and those shown under 5 ms at the p50.
+pr_helps() {
+  local tag=$1 delay=$2
+  [[ $delay -ge 75 ]] || return 0
+  [[ $PR_WRITTEN =~ ^[0-9]+$ && $PR_WRITTEN -gt 0 && $PR_FAST =~ ^[0-9]+$ && $PR_FAST -gt 0 ]] \
+    || fail "$tag: prediction did not help at ${delay} ms each way: written=$PR_WRITTEN fast=$PR_FAST"
+  awk -v p="$PR_FAST_P50" 'BEGIN { exit !(p + 0 < 5) }' \
+    || fail "$tag: the keys a guess showed took $PR_FAST_P50 ms at the p50 (done-when 3: under 5 ms)"
+  ok "$tag: $PR_FAST keys shown by a guess, p50 $PR_FAST_P50 ms (done-when 3)"
+}
+
 # ---------------------------------------------------------------------------------------------
 # The cells
 
@@ -252,6 +271,7 @@ p_keys() {
     for kind in pipe quic; do
       for mode in $(pr_modes); do
         pr_cell "k_${kind}_${mode}_$d" "$kind" "$mode" "$d" 0 -- --shell
+        if [[ $mode == adaptive ]]; then pr_helps "k_${kind}_${mode}_$d" "$d"; fi
       done
     done
   done
@@ -264,6 +284,10 @@ p_fast() {
   for kind in pipe quic; do
     pr_cell "f_${kind}_$mode" "$kind" "$mode" 2.5 0 quiet -- --shell
   done
+  # Done-when 4 is about shells: typing at a bash prompt, too.
+  pr_cell "f_bash_$mode" auto "$mode" 2.5 0 quiet -- \
+    --setup "PS1='\$ '; printf 'KP-READY-%s\\n' \$((6*7))" --ready KP-READY-42 \
+    --rate 10 --count 55 --warmup 5
 }
 
 p_loss() {
@@ -272,6 +296,9 @@ p_loss() {
   for loss in 2 5; do
     pr_net 75 "$PR_JITTER_MS" "$loss"
     pr_cell "l_quic_${mode}_$loss" quic "$mode" 75 "$loss" -- --shell
+    # Glitches (PC-1: an echo more than 250 ms late): the slowest key against one round trip plus
+    # 250 ms. Recorded, not a bar.
+    note "l_quic_${mode}_$loss.glitch=$(awk -v m="$PR_MAX" 'BEGIN { if (m !~ /^[0-9]+(\.[0-9]+)?$/) print "unknown"; else print (m + 0 > 150 + 250) ? "yes" : "no" }') (max $PR_MAX ms against 400 ms)"
   done
 }
 
@@ -325,7 +352,7 @@ p_shells() {
     case $sh in
       bash) setup="PS1='\$ '; printf 'KP-READY-%s\\n' \$((6*7))" ;;
       zsh) setup="printf 'KP-READY-%s\\n' \$((6*7)); exec zsh -f" ;;
-      fish) setup="printf 'KP-READY-%s\\n' \$((6*7)); exec fish --no-config" ;;
+      fish) setup="printf 'KP-READY-%s\\n' \$((6*7)); exec fish --no-config --private" ;;
     esac
     pr_cell "s_${sh}_$mode" auto "$mode" 75 0 -- --setup "$setup" --ready KP-READY-42 \
       --rate 10 --count 55 --warmup 5

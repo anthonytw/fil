@@ -19,7 +19,12 @@
 //! ```text
 //! dropin [--hosts pi1,pi2 | --local] [--only NAME[,NAME]] [--fil PATH] [--fwdprobe PATH]
 //!        [--verbose] [--list] [--require vim,less,...] [--allow-missing] [--allow-skip] [--strict]
+//!        [--predict off|adaptive|always]
 //! ```
+//!
+//! `--predict MODE` gives every client `--predict MODE` (M3's V1: the M1 and M2 scenarios again
+//! with `always`, `docs/m3/dropin.md`); a client whose scenario sets its own mode keeps it. The
+//! M3 prediction scenarios (`predict.rs`) set theirs and go through the delaying relay.
 //!
 //! The M2 forward scenarios (`forward.rs`, docs/m2/dropin.md) also need `fwdprobe`: this machine's
 //! build (`--fwdprobe`, default next to `--fil`) and the host's, installed through the gate.
@@ -39,6 +44,7 @@ mod forward;
 mod manage;
 mod netcut;
 mod output;
+mod predict;
 mod session;
 mod tools;
 
@@ -78,6 +84,8 @@ pub struct Ctx {
     pub verbose: bool,
     pub local: Option<Local>,
     pub require: Vec<String>,
+    /// `--predict MODE` for every client that does not set its own (`--predict` on the driver).
+    pub predict: Option<String>,
 }
 
 /// A private daemon for `--local`: `fil-daemon-dev --dir DIR relay` is the pipe command, so the
@@ -163,6 +171,15 @@ impl Ctx {
             "auto"
         };
         let (pipe, address) = match &self.local {
+            // The cut relay on this machine (predict.rs): the pipe is a TCP connection through
+            // it to a listener that runs the private daemon's relay per connection.
+            Some(_) if Self::is_local(host) && via.is_some() => (
+                format!(
+                    "[\"nc\", \"127.0.0.1\", \"{}\"]",
+                    via.map_or(0, |c| c.tcp_port)
+                ),
+                Some("127.0.0.1".to_string()),
+            ),
             Some(l) if Self::is_local(host) => (
                 format!(
                     "[{}, \"--dir\", {}, \"relay\"]",
@@ -235,6 +252,16 @@ impl Ctx {
             *s += 1;
             *s
         };
+        let mut args = Vec::new();
+        if let Some(p) = &self.predict
+            && !x
+                .args
+                .iter()
+                .any(|a| a == "--predict" || a.starts_with("--predict="))
+        {
+            args.extend(["--predict".to_string(), p.clone()]);
+        }
+        args.extend(x.args.iter().cloned());
         let mut c = Client::start_with(
             Spawn {
                 fil: &self.fil,
@@ -255,7 +282,7 @@ impl Ctx {
                     .join(format!("{n}-{host}-{session}")),
                 env: x.env.clone(),
             },
-            x.args,
+            &args,
         );
         c.set_scrub(self.targets.clone());
         c
@@ -480,12 +507,20 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
         ("agent_detached", agent::agent_detached),
         ("agent_filter", agent::agent_filter),
         ("agent_confirm", agent::agent_confirm),
+        // M3: prediction on, through the delaying relay (V1, docs/m3/dropin.md).
+        ("predict_shell", predict::predict_shell),
+        ("predict_secret", predict::predict_secret),
+        ("predict_alt", predict::predict_alt),
+        ("predict_paste", predict::predict_paste),
+        ("predict_reconnect", predict::predict_reconnect),
+        ("predict_resize", predict::predict_resize),
+        ("predict_takeover", predict::predict_takeover),
     ]
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... dropin [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--fwdprobe PATH] [--verbose] [--list]\n       dropin --local [--only NAME,..] [--fil PATH] [--verbose]   (a private daemon on this machine)\n       [--require vim,less,..] [--allow-missing] [--allow-skip] [--strict]\n       [--dump DIR]   (a client whose output sequence fails the check: its transcript goes to DIR)"
+        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... dropin [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--fwdprobe PATH] [--verbose] [--list]\n       dropin --local [--only NAME,..] [--fil PATH] [--verbose]   (a private daemon on this machine)\n       [--require vim,less,..] [--allow-missing] [--allow-skip] [--strict]\n       [--dump DIR]   (a client whose output sequence fails the check: its transcript goes to DIR)\n       [--predict off|adaptive|always]   (every client that sets no mode of its own)"
     );
     std::process::exit(2);
 }
@@ -515,6 +550,7 @@ fn main() {
     let mut local = false;
     let mut allow_missing = false;
     let mut allow_skip = false;
+    let mut predict: Option<String> = None;
     let mut require: Vec<String> = REQUIRED_TOOLS.iter().map(|s| s.to_string()).collect();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -529,6 +565,13 @@ fn main() {
             "--allow-missing" => allow_missing = true,
             "--allow-skip" => allow_skip = true,
             "--verbose" => verbose = true,
+            "--predict" => {
+                let m = args.next().unwrap_or_else(|| usage());
+                if !["off", "adaptive", "always"].contains(&m.as_str()) {
+                    usage();
+                }
+                predict = Some(m);
+            }
             "--dump" => {
                 let dir = PathBuf::from(args.next().unwrap_or_else(|| usage()));
                 let _ = common::DUMP_DIR.set(dir);
@@ -600,6 +643,7 @@ fn main() {
         verbose,
         local: local_daemon,
         require,
+        predict,
     };
 
     let mut failures = 0;

@@ -410,9 +410,13 @@ impl Driver {
     }
 
     /// The adversarial bar, checked after every event: at most one written run per misprediction.
+    /// A gate retraction (`hidden`) is not a wrong glyph: it starts no run. (A guess held as a
+    /// possible one counts as the misprediction it would be from when it is held; the count never
+    /// goes down, so a held guess settled as `hidden` cannot hide a new misprediction in the same
+    /// event.)
     fn one_run_per_misprediction(&mut self) {
         let s = self.overlay.stats();
-        let (mis, written) = (s.mispredicted.total(), s.written);
+        let (mis, written) = (self.overlay.ending_seen(), s.written);
         let confirmed = self.overlay.epoch_confirmed();
         if mis > self.last_mispredicted {
             self.after_mispredict = true;

@@ -1381,6 +1381,138 @@ fn a_kept_guess_does_not_explain_a_cursor_after_it() {
     assert!(!t.o.epoch_confirmed(), "a kept guess explained the cursor");
 }
 
+// ---- gate retractions: `mispredicted.hidden` (F1, decided, owner 2026-11-11) -----------------
+
+/// The M0 adversary's four gates, each before the echo of a written guess: the guess is taken
+/// off and its echo brings it back. Every one is a gate retraction, in `mispredicted.hidden`,
+/// whether the core kept the guess pending (a character set, a synchronized-output batch) or its
+/// epoch ended in that chunk (insert mode, a glyph drawn elsewhere).
+#[test]
+fn every_gate_retraction_is_hidden() {
+    for (name, gate, echo) in [
+        ("insert mode", &b"\x1b[4h"[..], &b"\x1b[4lb"[..]),
+        (
+            "a glyph elsewhere",
+            b"\x1b7\x1b[3;30H\x1b[1m#\x1b[0m\x1b8",
+            b"b",
+        ),
+        ("a character set", b"\x1b(0", b"\x1b(Bb"),
+        ("a synchronized batch", b"\x1b[?2026h", b"\x1b[?2026lb"),
+    ] {
+        let mut t = T::trusted();
+        assert!(!t.key(b"b", 200).paint.is_empty(), "{name}: not written");
+        t.server(gate, 300);
+        assert!(!t.painted(), "{name}: not taken off");
+        t.server(echo, 320);
+        let s = t.o.stats();
+        assert_eq!(s.mispredicted.hidden, 1, "{name}: {s:?}");
+        assert_eq!(s.mispredicted.total(), 1, "{name}: {s:?}");
+        assert_eq!(s.confirmed + s.restyled, 0, "{name}: {s:?}");
+    }
+}
+
+/// A guess taken off the same way whose cell then shows another glyph is the misprediction it
+/// would have been (`ended` for an ended epoch), and so it counts until its echo comes (a
+/// lifecycle event: `a_lifecycle_event_keeps_a_held_guess_mispredicted`).
+#[test]
+fn a_held_guess_settles_by_its_cell() {
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    t.server(b"\x1b[4h", 300);
+    let s = t.o.stats();
+    assert_eq!(
+        (s.mispredicted.ended, s.mispredicted.hidden),
+        (1, 0),
+        "held: counted as ended until its echo comes"
+    );
+    t.server(b"\x1b[4lB", 320);
+    let s = t.o.stats();
+    assert_eq!(
+        (s.mispredicted.ended, s.mispredicted.hidden),
+        (1, 0),
+        "{s:?}"
+    );
+}
+
+/// A held guess was off the screen before a lifecycle event: the event settles it in the bucket
+/// it was already counted in, not as a withdrawal (§2.5's fault bar: `withdrawn` only removes
+/// guesses written when the fault happened). The same for a pending gated guess.
+#[test]
+fn a_lifecycle_event_keeps_a_held_guess_mispredicted() {
+    // Held (its epoch ended in the gate's chunk), then a resize: the review's probe.
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    t.server(b"\x1b[4h", 300);
+    assert_eq!(t.o.stats().mispredicted.ended, 1);
+    t.o.resize(Size { cols: 40, rows: 10 });
+    let s = t.o.stats();
+    assert_eq!(
+        (
+            s.mispredicted.total(),
+            s.mispredicted.ended,
+            s.withdrawn.total()
+        ),
+        (1, 1, 0),
+        "resize: {s:?}"
+    );
+    t.server(b"\x1b[4lb", 320);
+    assert_eq!(
+        t.o.stats().mispredicted.hidden,
+        0,
+        "settled: the echo decides nothing"
+    );
+
+    // Held, then a takeover.
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    t.server(b"\x1b[4h", 300);
+    t.o.withdraw(WithdrawReason::Takeover);
+    let s = t.o.stats();
+    assert_eq!(
+        (s.mispredicted.ended, s.withdrawn.takeover),
+        (1, 0),
+        "takeover: {s:?}"
+    );
+
+    // Pending and gated (a character set), then a takeover: off since the gate, `ended`.
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    t.server(b"\x1b(0", 300);
+    assert!(!t.painted());
+    t.o.withdraw(WithdrawReason::Takeover);
+    let s = t.o.stats();
+    assert_eq!(
+        (s.mispredicted.ended, s.withdrawn.takeover),
+        (1, 0),
+        "gated, then takeover: {s:?}"
+    );
+}
+
+/// A new guess drawn in a held guess's cell settles the held one in its bucket (`Core::unhold`):
+/// the echo that then comes is the new guess's, so the old one is `ended`, not `hidden`, even
+/// when it is the same glyph.
+#[test]
+fn a_new_guess_in_its_cell_settles_a_held_guess() {
+    let mut t = T::trusted(); // `$ a`, cursor (0, 3)
+    for (i, k) in [b"b", b"c", b"d"].iter().enumerate() {
+        t.key(*k, 200 + 10 * i as u64); // written at (0, 3), (0, 4), (0, 5)
+    }
+    t.server(b"\x1b[4h", 300); // insert mode: all three taken off, the epoch ended, held
+    t.server(b"\x1b[4lb", 310); // `b`'s echo: hidden
+    t.ack(320);
+    t.key(b"q", 330); // tentative, at (0, 4)
+    t.server(b"q", 400); // confirms the epoch; `c`'s cell shows `q`: ended
+    t.ack(410);
+    t.key(b"d", 420); // written at (0, 5), where `d` is held
+    t.server(b"d", 500);
+    let s = t.o.stats();
+    assert_eq!(
+        (s.mispredicted.ended, s.mispredicted.hidden, s.confirmed),
+        (2, 1, 1),
+        "{s:?}"
+    );
+}
+
 // ---- the soak with cuts at sequence boundaries ----------------------------------------------
 
 /// vi mode's echo in two pieces after an Esc (`k ` then `CSI 1 D`: the key, the rest of the line,

@@ -2190,20 +2190,19 @@ pub async fn secret_trial(spec: Spec, ahead: bool) -> Report {
 /// - **superseded**: another guess's glyph takes the cell in the same write (a Backspace over it);
 /// - **withdrawn**: it goes in a lifecycle write (`Display::withdraw` for a lifecycle reason, a
 ///   resize, the first write after a snapshot's reset) or while the link is down (the backstop);
-/// - **gated**: it goes, in a server-output write (`TapKind::Server`) that prints no *foreign*
-///   glyph, while the reference shows nothing in its cell, and, with no foreign glyph printed in
-///   between, the reference's next glyph in that cell is the same one. A write's foreign glyphs
-///   are the glyphs its server bytes print (counted by a parser of its own, across writes, so a
-///   sequence cut between two writes is one sequence) beyond the guesses whose cells it fills
-///   with their own glyph (the echoes); a glyph printed over the same glyph counts, though the
-///   screen does not change. The overlay took such a guess off before its echo came (a gate:
-///   insert mode, a character set, a synchronized-output batch) and the echo brought it back
-///   (finding F1, `docs/m3/harness.md` §9). The user saw the glyph go and come back, but
-///   never a wrong one. Such a guess is *held* from the write that removed it until the
-///   reference shows a glyph there (or a foreign glyph is drawn anywhere, a lifecycle write
-///   comes, or the run ends);
+/// - **gated**: it goes, in a server-output write (`TapKind::Server`), while the reference shows
+///   nothing in its cell, and the reference's next glyph in that cell is the same one. The
+///   overlay took such a guess off before its echo came (a gate: insert mode, a character set, a
+///   synchronized-output batch, or its epoch ended in that write, as for a glyph drawn
+///   elsewhere) and the echo brought it back (finding F1, `docs/m3/harness.md` §9). The user saw
+///   the glyph go and come back, but never a wrong one; §2.5 counts it as a visible
+///   misprediction all the same (decided, owner 2026-11-11), and the core files it in
+///   `mispredicted.hidden`. Such a guess is *held* from the write that removed it until the
+///   reference shows a glyph there (or a new guess is drawn in its cell, a lifecycle write comes,
+///   or the run ends);
 /// - **mispredicted**: any other way: a visible misprediction (a held guess whose cell then
-///   shows another glyph, that a foreign glyph ends, or that is still held at the end, too).
+///   shows another glyph, whose cell takes a new guess, that a lifecycle write ends, or that is
+///   still held at the end, too).
 ///
 /// Nothing here reads the core's state: only the tap's bytes, which call made them, and the link
 /// state the core was told. Two things are shared with the core all the same
@@ -2214,8 +2213,8 @@ pub struct Classified {
     pub written: u64,
     pub confirmed: u64,
     pub mispredicted: u64,
-    /// Taken off before the echo, then echoed in the same cell (F1): the core counts each as
-    /// confirmed or as mispredicted, depending on the gate (see [`Agreement`]).
+    /// Taken off before the echo, then echoed in the same cell (F1): the core's
+    /// `mispredicted.hidden` (see [`Agreement`]). Not in `mispredicted`.
     pub gated: u64,
     /// Lifecycle withdrawals and supersessions (`superseded` is a part of it).
     pub withdrawn: u64,
@@ -2249,8 +2248,6 @@ pub struct Classifier {
     /// Guesses a keystroke wrote while some guess was held: `written_unconfirmed` if the held
     /// guess turns out mispredicted.
     written_while_held: u64,
-    /// Counts the glyphs the server's bytes print (state kept across writes).
-    scan: vte::Parser,
     pub counts: Classified,
     /// The core's counts carried by the last write.
     pub stats: PredictStats,
@@ -2266,15 +2263,6 @@ fn new_emulator(size: fil_term::Size) -> Box<dyn Emulator> {
         .find(|b| b.name == fil_term::DEFAULT_BACKEND)
         .expect("default backend");
     (backend.create)(size, 0)
-}
-
-/// Counts `print`s: the glyphs a stream draws.
-struct Prints(u64);
-
-impl vte::Perform for Prints {
-    fn print(&mut self, _: char) {
-        self.0 += 1;
-    }
 }
 
 fn norm(text: &str) -> &str {
@@ -2294,8 +2282,6 @@ impl Classifier {
             TapEvent::Reset { size } => {
                 self.user = Some(new_emulator(*size));
                 self.reference = Some(new_emulator(*size));
-                // A sequence cut off before the snapshot must not swallow its first print.
-                self.scan = vte::Parser::new();
                 self.after_reset = true;
             }
             TapEvent::Link { down } => self.link_down = *down,
@@ -2322,7 +2308,6 @@ impl Classifier {
             user.resize(size);
             reference.resize(size);
         }
-        let before = reference.state(0);
         user.feed(&f.server);
         reference.feed(&f.server);
         user.feed(&f.paint);
@@ -2365,37 +2350,21 @@ impl Classifier {
                 .and_then(|l| l.cells.get(usize::from(pos.1)))
                 .map_or(String::new(), |c| norm(&c.text).to_string())
         };
-        // The foreign glyphs (see `gated` in [`Classified`]): what the server's bytes print
-        // beyond the echoes of the guesses that go or are held.
-        let mut prints = Prints(0);
-        self.scan.advance(&mut prints, &f.server);
-        let was = |pos: (u16, u16)| -> &str {
-            before
-                .screen
-                .get(usize::from(pos.0))
-                .and_then(|l| l.cells.get(usize::from(pos.1)))
-                .map_or("", |c| norm(&c.text))
-        };
-        // An echo is a guess's cell the bytes changed to its glyph (a blank echoed over a blank
-        // is not seen, and counts as foreign: a hold ends early, never late).
-        let echoes = self
-            .layer
-            .iter()
-            .map(|(pos, (text, _))| (pos, text))
-            .chain(self.held.iter())
-            .filter(|(pos, text)| shown(**pos) == **text && was(**pos) != text.as_str())
-            .count();
-        let foreign = prints.0 > echoes as u64;
         let mut mispredicted = 0;
-        // The held guesses first: the reference's glyph in the cell decides, or a lifecycle
-        // write withdraws them (the core still had them pending), or a new guess in the cell
-        // ends the hold as a misprediction.
+        // The held guesses first: the reference's glyph in the cell decides, or a new guess in
+        // the cell or a lifecycle write ends the hold as a misprediction (the guess was off the
+        // screen before the event, so the event did not withdraw it: §2.5's fault bar).
         let held = std::mem::take(&mut self.held);
         for (pos, text) in held {
             let s = shown(pos);
             if lifecycle {
-                self.counts.withdrawn += 1;
-            } else if s.is_empty() && !now.contains_key(&pos) && !foreign {
+                mispredicted += 1;
+                if self.notes.len() < 20 {
+                    self.notes.push(format!(
+                        "{kind:?}: {text:?} at {pos:?} (held) ended by a lifecycle write"
+                    ));
+                }
+            } else if s.is_empty() && !now.contains_key(&pos) {
                 self.held.insert(pos, text);
             } else if s == text {
                 self.counts.gated += 1;
@@ -2420,7 +2389,7 @@ impl Classifier {
                 // Gates come from output: only a server write can hold a guess. Any other
                 // removal (a predictor's own withdrawal, a `Tick` expiry, an `EchoAck` past its
                 // grace) is a misprediction even if a late echo brings the glyph back (§2.5).
-                None if shown(*pos).is_empty() && !foreign && kind == TapKind::Server => {
+                None if shown(*pos).is_empty() && kind == TapKind::Server => {
                     self.held.insert(*pos, text.clone());
                 }
                 None => {
@@ -2491,22 +2460,12 @@ impl Classifier {
     }
 }
 
-/// The classifier's counts against the core's. Written and withdrawn must be equal. Every guess
-/// the classifier confirmed the core must count confirmed (or restyled), every one it
-/// mispredicted the core must count mispredicted, and the core's remaining confirmations and
-/// mispredictions must be exactly the gated guesses, each in one of the two:
-///
-/// `core confirmed - classifier confirmed` + `core mispredicted - classifier mispredicted`
-/// = `gated`, with both differences at least 0.
-///
-/// The gated guesses are the one place the mapping is not one bucket to one bucket, because the
-/// core files byte-for-byte alike gates differently: on the M0 adversary it counts a guess taken
-/// off for insert mode, or for a glyph drawn elsewhere, as `mispredicted.ended` at once, and one
-/// taken off for a character set or a synchronized-output batch as pending, confirmed by its
-/// echo (F1, `docs/m3/harness.md` §9). The user sees the same thing in each: the glyph goes and
-/// comes back. So the slack is at most the gated count, which the classifier finds from bytes,
-/// and is 0 on any cell without a gate: there a core that files a contradiction as a
-/// confirmation fails (`an_upper_case_echo_is_counted_the_same_and_bounded`).
+/// The classifier's counts against the core's, bucket for bucket: written, withdrawn,
+/// confirmed (the core's confirmed and restyled), gated (the core's `mispredicted.hidden`, F1 as
+/// decided by the owner on 2026-11-11) and mispredicted (the core's other mispredictions) must
+/// each be equal. A core that files a contradiction as a confirmation fails
+/// (`an_upper_case_echo_is_counted_the_same_and_bounded`), and so does one that files a gate
+/// retraction as a confirmation or as `ended`.
 ///
 /// They agree only when every written guess is visible from the bytes, which it is when the
 /// predictor underlines (the suites run `MoshAlways`, underlined at every RTT): an underlined
@@ -2520,15 +2479,6 @@ pub struct Agreement {
 }
 
 impl Agreement {
-    /// The gated guesses as the core filed them: (confirmed, mispredicted), or `None` when the
-    /// counts do not fit (see [`Agreement`]).
-    pub fn gated_split(&self) -> Option<(u64, u64)> {
-        let (c, s) = (&self.classified, &self.core);
-        let conf = (s.confirmed + s.restyled).checked_sub(c.confirmed)?;
-        let misp = s.mispredicted.total().checked_sub(c.mispredicted)?;
-        (conf + misp == c.gated).then_some((conf, misp))
-    }
-
     /// The counts that differ; empty when they agree.
     pub fn diffs(&self) -> Vec<String> {
         let (c, s) = (&self.classified, &self.core);
@@ -2540,17 +2490,13 @@ impl Agreement {
         };
         check("written", c.written, s.written);
         check("withdrawn", c.withdrawn, s.withdrawn.total());
-        if self.gated_split().is_none() {
-            d.push(format!(
-                "confirmed {}, mispredicted {} and gated {} (classifier) do not map onto confirmed \
-                 {} and mispredicted {} (core)",
-                c.confirmed,
-                c.mispredicted,
-                c.gated,
-                s.confirmed + s.restyled,
-                s.mispredicted.total()
-            ));
-        }
+        check("confirmed", c.confirmed, s.confirmed + s.restyled);
+        check("gated (core: hidden)", c.gated, s.mispredicted.hidden);
+        check(
+            "mispredicted (core: all but hidden)",
+            c.mispredicted,
+            s.mispredicted.total() - s.mispredicted.hidden,
+        );
         d
     }
 }

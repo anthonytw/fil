@@ -150,22 +150,59 @@ fn the_classifier_holds_a_guess_only_in_a_server_write() {
     }
 }
 
-/// A snapshot's reset also resets the classifier's own parser (#46's review R2): a sequence cut
-/// off before it does not swallow a later print, so a foreign glyph still ends a hold.
+/// A hold is decided by its own cell (F1 as decided, owner 2026-11-11, the core's
+/// `mispredicted.hidden`): a glyph drawn elsewhere in the write that takes the guess off, or in
+/// between, does not end it, and the echo then makes it gated. A new guess drawn in its cell ends
+/// it as a misprediction.
 #[test]
-fn the_classifier_resets_its_parser_with_a_snapshot() {
+fn the_classifier_decides_a_hold_by_its_cell() {
     let mut c = classifier();
-    c.on_event(&flush(TapKind::Server, "", "\x1b[", ""));
-    c.on_event(&TapEvent::Reset {
-        size: Size { cols: 20, rows: 5 },
-    });
-    c.on_event(&flush(TapKind::Server, "", "", ""));
-    c.on_event(&flush(TapKind::Input, "", "", "\x1b[1;2H\x1b[4mb\x1b[0m"));
-    // `Z` is a foreign print at the home cell (the session's cursor; the erase leaves the
-    // user's there too), not in the guess's; a stale `CSI` would read it as its final byte.
-    c.on_event(&flush(TapKind::Server, "\x1b[1;2H \x1b[1;1H", "Z", ""));
-    assert_eq!((c.counts.mispredicted, c.counts.gated), (1, 0));
+    c.on_event(&flush(TapKind::Input, "", "", "\x1b[1;3H\x1b[4ma\x1b[0m"));
+    // The M0 adversary's `#` elsewhere, in the write that takes the guess off.
+    c.on_event(&flush(
+        TapKind::Server,
+        "\x1b[1;3H \x1b[1;3H",
+        "\x1b7\x1b[3;9H#\x1b8",
+        "",
+    ));
+    c.on_event(&flush(TapKind::Server, "", "\x1b7\x1b[4;9HZ\x1b8", ""));
+    c.on_event(&flush(TapKind::Server, "", "a", ""));
+    assert_eq!((c.counts.gated, c.counts.mispredicted), (1, 0));
     assert_eq!(c.totals(), c.counts, "nothing held");
+
+    c.on_event(&flush(TapKind::Input, "", "", "\x1b[1;4H\x1b[4mb\x1b[0m"));
+    c.on_event(&flush(
+        TapKind::Server,
+        "\x1b[1;4H \x1b[1;4H",
+        "\x1b[4h",
+        "",
+    ));
+    c.on_event(&flush(TapKind::Input, "", "", "\x1b[1;4H\x1b[4mc\x1b[0m"));
+    assert_eq!((c.counts.gated, c.counts.mispredicted), (1, 1));
+}
+
+/// A held guess was off the screen before a lifecycle write: the write ends the hold as a
+/// misprediction, not a withdrawal (§2.5's fault bar: `withdrawn` only removes guesses written
+/// when the fault happened), whether a resize or a takeover.
+#[test]
+fn the_classifier_counts_a_held_guess_at_a_lifecycle_write_as_mispredicted() {
+    for kind in [TapKind::Resize, TapKind::Withdraw(WithdrawReason::Takeover)] {
+        let mut c = classifier();
+        c.on_event(&flush(TapKind::Input, "", "", "\x1b[1;3H\x1b[4ma\x1b[0m"));
+        c.on_event(&flush(
+            TapKind::Server,
+            "\x1b[1;3H \x1b[1;3H",
+            "\x1b[4h",
+            "",
+        ));
+        c.on_event(&flush(kind, "", "", ""));
+        assert_eq!(
+            (c.counts.mispredicted, c.counts.withdrawn, c.counts.gated),
+            (1, 0, 0),
+            "{kind:?}"
+        );
+        assert_eq!(c.totals(), c.counts, "{kind:?}: nothing held");
+    }
 }
 
 /// Withdrawn: a lifecycle write (a takeover), a resize, a snapshot's reset, the link down, and a
@@ -259,42 +296,39 @@ fn an_agreement_reports_every_count_that_differs() {
         ..Classified::default()
     };
     assert!(Agreement { classified, core }.diffs().is_empty());
-    // A gated guess the core filed either way: confirmed, or mispredicted.
-    for gated in [
-        Classified {
-            confirmed: 1,
-            gated: 1,
-            ..classified
+    // A gated guess is the core's `hidden`, and nothing else (F1, decided 2026-11-11).
+    let mut hidden = core;
+    hidden.mispredicted.hidden = 1;
+    let gated = Classified {
+        gated: 1,
+        ..classified
+    };
+    assert!(
+        Agreement {
+            classified: gated,
+            core: hidden
+        }
+        .diffs()
+        .is_empty()
+    );
+    // The core filing it as a confirmation, or as `ended`, is reported.
+    for wrong in [
+        PredictStats {
+            confirmed: core.confirmed + 1,
+            ..core
         },
-        Classified {
-            mispredicted: 0,
-            gated: 1,
-            ..classified
+        {
+            let mut w = core;
+            w.mispredicted.ended = 1;
+            w
         },
     ] {
         let a = Agreement {
             classified: gated,
-            core,
+            core: wrong,
         };
-        assert!(a.diffs().is_empty(), "{:?}", a.diffs());
+        assert_eq!(a.diffs().len(), 2, "{:?}", a.diffs());
     }
-    // Two gated, but the core has three confirmations and mispredictions beyond the
-    // classifier's: reported.
-    let two = Classified {
-        confirmed: 0,
-        mispredicted: 0,
-        gated: 2,
-        ..classified
-    };
-    assert_eq!(
-        Agreement {
-            classified: two,
-            core
-        }
-        .diffs()
-        .len(),
-        1
-    );
     // A core that files a contradiction as a confirmation is caught when nothing was gated
     // (the reviewer's mutation of #46, at `epochs.rs` `count`).
     let mut swapped = core;
@@ -304,8 +338,7 @@ fn an_agreement_reports_every_count_that_differs() {
         classified,
         core: swapped,
     };
-    assert_eq!(a.gated_split(), None);
-    assert_eq!(a.diffs().len(), 1);
+    assert_eq!(a.diffs().len(), 2);
     let mut off = core;
     off.mispredicted.contradicted = 0;
     off.withdrawn.takeover = 1;
@@ -503,8 +536,8 @@ impl CellResult {
         }
         match self.category {
             Category::Faithful | Category::Slow => {
-                // A gated guess went and came back (F1): until F1 is decided, §2.5 counts it
-                // as a visible misprediction, so the faithful bar counts it too.
+                // A gated guess went and came back (F1): §2.5 counts it as a visible
+                // misprediction (decided, owner 2026-11-11), so the faithful bar counts it too.
                 if r.classified.mispredicted + r.classified.gated > 0 {
                     f.push(format!(
                         "{} visible mispredictions and {} gated guesses on a faithful program: {:?}",
@@ -1105,18 +1138,7 @@ fn print_table(results: &[CellResult]) {
             c.withdrawn,
             c.written_unconfirmed,
             if r.agreement.is_empty() {
-                // The gated guesses as the core filed them (F1): shown, never hidden.
-                match (Agreement {
-                    classified: r.report.classified,
-                    core: r.report.core,
-                })
-                .gated_split()
-                {
-                    Some((0, 0)) | None => "yes".to_string(),
-                    Some((conf, misp)) => {
-                        format!("yes (gated: core {conf} confirmed, {misp} mispredicted)")
-                    }
-                }
+                "yes".to_string()
             } else {
                 "NO".to_string()
             },

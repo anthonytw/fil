@@ -739,7 +739,14 @@ impl Overlay {
 
     /// What the core has counted (`docs/m3/plan.md` §2.5).
     pub fn stats(&self) -> PredictStats {
-        self.o.core.stats
+        self.o.core.stats_now()
+    }
+
+    /// The visible mispredictions other than `hidden`, as each was first counted (held guesses
+    /// included): unlike `stats().mispredicted.ending()` it never goes down (the driver's run
+    /// check).
+    pub(crate) fn ending_seen(&self) -> u64 {
+        self.o.core.ending_seen()
     }
 
     /// **Test only:** whether the current epoch is confirmed.
@@ -810,6 +817,15 @@ impl Overlay {
     pub fn on_server(&mut self, bytes: &[u8], now: Time) -> Flush {
         let Overlay { shadow, o } = self;
         let mut f = o.new_flush();
+        // The guesses on the screen before this chunk: those still pending and off it after the
+        // repaint were taken off by a gate (`Mispredicted::hidden`).
+        let shown_before: Vec<(u16, u16)> = o.on_screen.as_ref().map_or(Vec::new(), |os| {
+            os.cells
+                .iter()
+                .filter(|(_, s)| s.style != CellStyle::Reverse)
+                .map(|(&p, _)| p)
+                .collect()
+        });
         // 1. Erase: put the terminal back to exactly the shadow's state.
         f.erase = o.apply(None);
         // 2. Server bytes, to the terminal (unchanged) and to everything that mirrors it.
@@ -827,8 +843,10 @@ impl Overlay {
         if !pending {
             o.core.note_output();
         }
-        if pending || o.status.is_some() || o.on_screen.is_some() {
+        if pending || o.core.has_held() || o.status.is_some() || o.on_screen.is_some() {
             let st = Shadow::new(&**shadow);
+            o.core.resolve_held(&st);
+            o.core.in_server = true;
             if pending {
                 o.core.expire(&st, now);
                 o.core.check_skipped(&st, now);
@@ -841,6 +859,15 @@ impl Overlay {
             o.core.classify_deferred(&st, now);
             o.report(&st, now);
             f.paint = o.paint(&st, now);
+            if !shown_before.is_empty() {
+                let now_shown = o.on_screen.as_ref().map(|os| &os.cells);
+                let gone: Vec<(u16, u16)> = shown_before
+                    .into_iter()
+                    .filter(|p| now_shown.is_none_or(|c| !c.contains_key(p)))
+                    .collect();
+                o.core.gated(&gone, &st);
+            }
+            o.core.in_server = false;
         } else {
             // A snapshot's classification needs the shadow it landed in.
             o.classify_deferred_now(&**shadow, now);

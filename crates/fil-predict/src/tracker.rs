@@ -139,6 +139,10 @@ struct Modes {
     lr_margins: bool,
     nrcs: bool,
     sync: bool,
+    /// Bracketed paste (`?2004`) as the program last set it; `None` after an `XTRESTORE` of it.
+    paste: Option<bool>,
+    /// `?2004` was set, reset or restored, or a RIS reset it, since [`Tracker::take_paste_change`].
+    paste_changed: bool,
     g: [Charset; 4],
     gl: usize,
     single_shift: bool,
@@ -187,6 +191,8 @@ impl Default for Modes {
             lr_margins: false,
             nrcs: false,
             sync: false,
+            paste: Some(false),
+            paste_changed: false,
             g: [Charset::Ascii; 4],
             gl: 0,
             single_shift: false,
@@ -297,6 +303,10 @@ impl Modes {
             (true, 42) => self.nrcs = on,
             (true, 69) => self.lr_margins = on,
             (true, 2026) => self.sync = on,
+            (true, 2004) => {
+                self.paste = Some(on);
+                self.paste_changed = true;
+            }
             // xterm, kitty and WezTerm save into the screen's slot; tmux and alacritty ignore it.
             (true, 1048) if on => {
                 let cur = self.current();
@@ -458,6 +468,11 @@ impl Perform for Modes {
             }
             ([], 'H' | 'f') => self.cursor_disputed = false,
             ([], 'r') => self.region_unknown = false,
+            ([b'?'], 'r') if params.iter().any(|p| p.first() == Some(&2004)) => {
+                // XTRESTORE: whatever was saved, which the tracker does not follow.
+                self.paste = None;
+                self.paste_changed = true;
+            }
             ([], 's') => self.save(),
             ([], 'u') => self.restore(),
             ([], 'J') => {
@@ -495,6 +510,7 @@ impl Perform for Modes {
                 let was_alt = self.alt != Some(false);
                 *self = Modes::default();
                 self.sync = sync;
+                self.paste_changed = true;
                 if was_alt {
                     self.alt = None;
                     self.tainted[0] = true;
@@ -701,6 +717,17 @@ impl Tracker {
     /// The program has synchronized output (`?2026`) on.
     pub fn sync_output(&self) -> bool {
         self.modes.sync
+    }
+
+    /// Bracketed paste (`?2004`) is known to be off.
+    pub fn paste_off(&self) -> bool {
+        self.modes.paste == Some(false)
+    }
+
+    /// Whether bracketed paste was set, reset or restored (or a RIS reset it) since the last
+    /// call. A program that turns it on and off within one chunk is seen here, not in the state.
+    pub fn take_paste_change(&mut self) -> bool {
+        std::mem::take(&mut self.modes.paste_changed)
     }
 
     /// The hyperlink the terminal will attach to the next printed character.
@@ -939,6 +966,23 @@ mod tests {
         // A reset does not end a synchronized-output batch the shadow is still holding.
         assert!(fed(b"\x1b[?2026h\x1bc").sync_output());
         assert!(!fed(b"\x1b[?2026h\x1bc\x1b[?2026l").sync_output());
+    }
+
+    #[test]
+    fn bracketed_paste_changes_are_seen() {
+        let mut t = fed(b"x");
+        assert!(t.paste_off() && !t.take_paste_change());
+        t.feed(b"\x1b[?2004h\x1b[?20");
+        assert!(!t.paste_off() && t.take_paste_change() && !t.take_paste_change());
+        t.feed(b"04l");
+        assert!(t.paste_off() && t.take_paste_change());
+        t.feed(b"\x1b[?1;2004h\x1bc");
+        assert!(t.paste_off() && t.take_paste_change(), "RIS");
+        t.feed(b"\x1b[?2004r");
+        assert!(
+            !t.paste_off() && t.take_paste_change(),
+            "XTRESTORE: unknown"
+        );
     }
 
     #[test]

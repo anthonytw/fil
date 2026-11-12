@@ -2915,7 +2915,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             return Ok(());
         }
         self.out.write_all(bytes).map_err(ClientError::Terminal)?;
-        if let Some(d) = &self.display {
+        if let Some(d) = &mut self.display {
+            d.written();
             self.repair
                 .drawn(self.size_gen, d.is_painted(), self.status_shown);
         }
@@ -3425,6 +3426,26 @@ mod tests {
         core.on_tick().unwrap();
         assert!(core.confirm.is_none());
         assert_eq!(core.pending, b"ls\r");
+    }
+
+    /// Review F3 of #86: the engine tells the display when bytes reached the terminal, which is
+    /// what the bracketed-paste count runs from (`docs/m3/plan.md` §2.4 rule 6).
+    #[tokio::test]
+    async fn a_write_to_the_terminal_is_reported_to_the_display() {
+        let (mut core, _keys) = core();
+        let later = Duration::from_secs(5);
+        let bytes = core.display_mut(80, 24).unwrap().server(b"\x1b[?2004l");
+        let d = core.display.as_ref().unwrap();
+        assert!(
+            !d.paste_marker_is_content_after(later),
+            "counted before the write"
+        );
+        core.write(&bytes).unwrap();
+        let d = core.display.as_ref().unwrap();
+        assert!(
+            d.paste_marker_is_content_after(later),
+            "the write was not reported"
+        );
     }
 
     #[test]

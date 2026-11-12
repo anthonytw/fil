@@ -242,8 +242,8 @@ pub struct PasteScan {
     start: bool,
 }
 
-/// A marker found by [`PasteScan::scan`]: the offset just past its last byte, and whether it
-/// starts a paste.
+/// A marker found by [`PasteScan::scan`]: the offset just past its last byte, and whether the
+/// input is in a paste after it (a start marker read as content leaves the state as it was).
 pub type PasteMark = (u64, bool);
 
 impl PasteScan {
@@ -262,13 +262,10 @@ impl PasteScan {
         self.held = 0;
     }
 
-    /// Forgets everything: a fresh attach's input.
-    pub fn clear(&mut self) {
-        *self = PasteScan::default();
-    }
-
     /// Scans `bytes`, the input at offset `at`, and pushes each complete marker onto `marks`.
-    pub fn scan(&mut self, bytes: &[u8], at: u64, marks: &mut Vec<PasteMark>) {
+    /// With `starts` false a start marker is content: the terminal was not bracketing pastes
+    /// (bracketed paste off for long enough), so it does not start one.
+    pub fn scan(&mut self, bytes: &[u8], at: u64, starts: bool, marks: &mut Vec<PasteMark>) {
         for (i, &b) in bytes.iter().enumerate() {
             // The markers share all but their fifth byte: `0` starts a paste, `1` ends it.
             let n = self.held;
@@ -279,8 +276,10 @@ impl PasteScan {
                     5
                 }
                 5 if b == PASTE_START[5] => {
-                    self.in_paste = self.start;
-                    marks.push((at + i as u64 + 1, self.start));
+                    if starts || !self.start {
+                        self.in_paste = self.start;
+                    }
+                    marks.push((at + i as u64 + 1, self.in_paste));
                     0
                 }
                 // Only a marker's first byte is ESC, so a mismatch can only restart at an ESC.
@@ -300,7 +299,7 @@ mod tests {
         let whole = {
             let mut s = PasteScan::default();
             let mut m = Vec::new();
-            s.scan(stream, 0, &mut m);
+            s.scan(stream, 0, true, &mut m);
             assert!(!s.in_paste());
             m
         };
@@ -309,20 +308,34 @@ mod tests {
             for j in i..=stream.len() {
                 let mut s = PasteScan::default();
                 let mut m = Vec::new();
-                s.scan(&stream[..i], 0, &mut m);
-                s.scan(&stream[i..j], i as u64, &mut m);
-                s.scan(&stream[j..], j as u64, &mut m);
+                s.scan(&stream[..i], 0, true, &mut m);
+                s.scan(&stream[i..j], i as u64, true, &mut m);
+                s.scan(&stream[j..], j as u64, true, &mut m);
                 assert_eq!(m, whole, "cuts {i} {j}");
             }
         }
         let mut s = PasteScan::default();
-        s.scan(b"\x1b[200~", 0, &mut Vec::new());
+        s.scan(b"\x1b[200~", 0, true, &mut Vec::new());
         assert!(s.in_paste());
-        s.scan(b"\x1b[20", 6, &mut Vec::new());
+        s.scan(b"\x1b[20", 6, true, &mut Vec::new());
         assert_eq!(s.held(), 4);
         s.clear_partial();
-        s.scan(b"1~", 10, &mut Vec::new());
+        s.scan(b"1~", 10, true, &mut Vec::new());
         assert!(s.in_paste(), "a cut marker across a gap is not a marker");
+    }
+
+    #[test]
+    fn a_start_marker_read_as_content_leaves_the_state() {
+        let mut s = PasteScan::default();
+        let mut m = Vec::new();
+        s.scan(b"a\x1b[200~b", 0, false, &mut m);
+        assert!(!s.in_paste());
+        assert_eq!(m, vec![(7, false)]);
+        // Inside a paste that did start, it does not end it; an end marker still does.
+        s.scan(b"\x1b[200~", 8, true, &mut m);
+        s.scan(b"\x1b[200~c\x1b[201~", 14, false, &mut m);
+        assert!(!s.in_paste());
+        assert_eq!(m, vec![(7, false), (14, true), (20, true), (27, false)]);
     }
 
     #[test]

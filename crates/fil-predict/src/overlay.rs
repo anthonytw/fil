@@ -62,6 +62,25 @@ pub const PASTE_READ: usize = 64;
 pub const PASTE_FOLLOW: Duration = Duration::from_millis(5);
 /// The length of a bracketed-paste marker (`CSI 200 ~`, `CSI 201 ~`).
 const MARKER_LEN: u64 = 6;
+/// A start marker read this long after the user's terminal was told to stop bracketing pastes
+/// (`?2004 l` written to it) is content, not a marker (rule 6). Within it, the terminal may not
+/// have applied the change yet, and a paste it began then is still bracketed.
+pub const PASTE_MODE_SETTLE: Duration = Duration::from_secs(1);
+
+/// Whether, and since when, the user's terminal is not bracketing pastes, as far as the overlay
+/// can tell: it starts counting only once the bytes that turned bracketed paste off have been
+/// written ([`Overlay::written`]), never from when they were parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PasteOff {
+    /// On, or unknown: also where a new overlay and a snapshot start, until the stream says
+    /// (fil's snapshot writer always sets `?2004` one way or the other).
+    No,
+    /// Off in the stream, but not yet known to be written (or inside the program's own
+    /// synchronized output, which a terminal may hold back).
+    Unwritten,
+    /// Off, and written at this time.
+    Since(Time),
+}
 
 /// Where input came from (`docs/m3/plan.md` §2.4 rule 6). Only typed, live input is predicted;
 /// the rest is a boundary, with its offsets still counted so `EchoAck` stays aligned.
@@ -646,6 +665,8 @@ struct Inner {
     marks: Vec<PasteMark>,
     /// Reads up to this time are the tail of an unmarked paste.
     paste_until: Option<Time>,
+    /// Since when the user's terminal has had bracketed paste off.
+    paste_off: PasteOff,
     /// A resize made the shadow untrusted (rule 9); a snapshot at the current size restores it.
     trusted: bool,
     /// The core would write on an untrusted screen, or something was drawn at the resize.
@@ -682,6 +703,7 @@ impl Overlay {
                 paste: PasteScan::default(),
                 marks: Vec::new(),
                 paste_until: None,
+                paste_off: PasteOff::No,
                 trusted: true,
                 repaint_wanted: false,
                 status_on_untrusted: false,
@@ -835,6 +857,15 @@ impl Overlay {
         shadow.feed(bytes);
         let _ = shadow.take_replies(); // the user's terminal answers queries
         o.tracker.feed(bytes);
+        if o.tracker.take_paste_change() {
+            // Counted again from this chunk's write, even if it only turned bracketed paste on
+            // and off again: the terminal may have been bracketing in between.
+            o.paste_off = if o.tracker.paste_off() {
+                PasteOff::Unwritten
+            } else {
+                PasteOff::No
+            };
+        }
         o.core.last_activity = Some(now);
         // 3. The core confirms, contradicts or ends the epoch; the predictor re-plans; what may
         //    be written is painted again. With nothing outstanding, no screen read: the core
@@ -912,7 +943,14 @@ impl Overlay {
         // offline or answer read, or cut across reads, still starts or ends the paste (rule 6).
         let paste_before = o.paste.in_paste();
         o.marks.clear();
-        o.paste.scan(bytes, at, &mut o.marks);
+        // A start marker is content once the terminal has had bracketed paste off for long
+        // enough: it was not bracketing, so the "paste" is text the unmarked rules cover. Until
+        // then a marker may be a real paste the terminal began before it applied the `?2004 l`.
+        let starts = match o.paste_off {
+            PasteOff::Since(t) => now <= t + PASTE_MODE_SETTLE,
+            PasteOff::No | PasteOff::Unwritten => true,
+        };
+        o.paste.scan(bytes, at, starts, &mut o.marks);
         let mut kind = kind;
         if g.paste && kind == InputKind::Typed {
             let tail = o.paste_until.is_some_and(|t| now <= t);
@@ -1022,6 +1060,23 @@ impl Overlay {
         o.flush_paint(&st, now)
     }
 
+    /// The caller has written everything the overlay returned so far to the user's terminal, at
+    /// `now`. Only this starts the count after bracketed paste was turned off (rule 6): until
+    /// then a start marker always starts a paste.
+    pub fn written(&mut self, now: Time) {
+        let o = &mut self.o;
+        if o.paste_off == PasteOff::Unwritten && !o.tracker.sync_output() {
+            o.paste_off = PasteOff::Since(now);
+        }
+    }
+
+    /// **Test only** (`testkit`): whether a start marker read at `now` would be content (the
+    /// terminal has had bracketed paste off, written, for longer than [`PASTE_MODE_SETTLE`]).
+    #[cfg(feature = "testkit")]
+    pub fn paste_marker_is_content(&self, now: Time) -> bool {
+        matches!(self.o.paste_off, PasteOff::Since(t) if now > t + PASTE_MODE_SETTLE)
+    }
+
     /// Time passed. Call at [`Overlay::next_deadline`], or periodically.
     pub fn on_tick(&mut self, now: Time) -> Flush {
         let Overlay { shadow, o } = self;
@@ -1075,6 +1130,8 @@ impl Overlay {
         let Overlay { shadow, o } = self;
         *shadow = fresh;
         o.tracker = Tracker::new();
+        // The snapshot sets bracketed paste again; until it says, the mode is unknown.
+        o.paste_off = PasteOff::No;
         o.on_screen = None;
         o.core.snapshot(now);
         if o.cfg.guards.snapshot {
@@ -1085,13 +1142,17 @@ impl Overlay {
     }
 
     /// A fresh attach (after a take-back) rebases the input offsets to 0 (DESIGN.md §8.5): forget
-    /// what was sent and acknowledged before, and any paste in progress. Call it with
-    /// [`Overlay::reset`] when the new attach's input starts again at 0 (E1a). Without it an old
-    /// attach's acknowledgement would satisfy the prior-ack rule for the new one's keys.
+    /// what was sent and acknowledged before. Call it with [`Overlay::reset`] when the new
+    /// attach's input starts again at 0 (E1a). Without it an old attach's acknowledgement would
+    /// satisfy the prior-ack rule for the new one's keys.
+    ///
+    /// A paste in progress is kept, a marker cut at the rebase too: the user's terminal is one
+    /// stream across attaches, so the paste's tail is still coming. Kept, a paste with no end
+    /// leaves prediction off (it fails safe); since a start marker that is content does not
+    /// start one ([`PASTE_MODE_SETTLE`]), only a marker that came while the terminal may still
+    /// have been bracketing can do that.
     pub fn rebase_input(&mut self) {
         self.o.input_end = 0;
-        self.o.paste.clear();
-        self.o.paste_until = None;
         self.o.decoder.clear();
         self.o.core.rebase_input();
     }

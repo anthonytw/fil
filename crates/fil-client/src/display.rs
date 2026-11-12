@@ -369,6 +369,20 @@ impl Display {
         self.emit(TapKind::Server, f)
     }
 
+    /// Everything returned so far has been written to the user's terminal. The overlay times
+    /// how long the terminal has had bracketed paste off from here, not from when the bytes were
+    /// parsed (`docs/m3/plan.md` §2.4 rule 6).
+    pub fn written(&mut self) {
+        let now = self.now();
+        self.overlay.written(now);
+    }
+
+    /// **Test only**: whether a start marker read `after` from now would be content.
+    #[cfg(test)]
+    pub(crate) fn paste_marker_is_content_after(&self, after: Duration) -> bool {
+        self.overlay.paste_marker_is_content(self.now() + after)
+    }
+
     /// Bytes for the session's input stream at input offset `at` (the offset the bytes get in the
     /// terminal channel, DESIGN.md §8.5), and where they came from: only typed, live input is
     /// predicted (`docs/m3/plan.md` §2.4 rule 6). Returns what to write.

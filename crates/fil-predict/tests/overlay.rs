@@ -828,6 +828,212 @@ fn a_key_after_an_end_marker_in_the_same_read_is_typed() {
     assert_eq!(t.o.stats().guessed, guessed + 1, "c was not guessed");
 }
 
+/// Review F2 of #75: `?2004 l` written to the terminal at `off` (ms); a start marker after that.
+fn paste_off_written_at(t: &mut T, off: u64) {
+    t.server(b"\x1b[?2004l", off);
+    t.o.written(ms(off));
+}
+
+/// Review F2 of #75: a start marker within a second of the `?2004 l` being written may be a real
+/// paste the terminal began before it applied it (BUGS-2's shape): its tail, long after, is never
+/// guessed or written, with the default predictor or a hostile one. The second counts from the
+/// write, not from when the overlay parsed the bytes.
+#[test]
+fn a_start_marker_soon_after_bracketed_paste_off_is_written_still_starts_a_paste() {
+    use fil_predict::MoshConfig;
+    use fil_predict::sim::{HostileCfg, HostilePredictor};
+    let predictors: [fn() -> Box<dyn Predictor>; 2] = [
+        || Box::new(MoshPredictor::new(MoshConfig::always())),
+        || Box::new(HostilePredictor::new(HostileCfg::noisy(3))),
+    ];
+    // (parsed, written): the write may come long after the parse (a terminal slow to read).
+    for (parsed, written) in [(200, 200), (200, 1100), (200, 1700)] {
+        for p in predictors {
+            let mut t = T::with(p(), Guards::ALL, Size { cols: 40, rows: 10 });
+            t.server(b"\x1b[?2004h", 0);
+            t.o.written(ms(0));
+            t.confirm();
+            t.ack(130);
+            t.server(b"\x1b[?2004l", parsed);
+            t.o.written(ms(written));
+            let guessed = t.o.stats().guessed;
+            // 1.8 s after the parse, under a second after the write.
+            let mut head = b"\x1b[200~".to_vec();
+            head.extend_from_slice(&[b'x'; 60]);
+            let at = written + 900;
+            assert!(t.key(&head, at).paint.is_empty());
+            t.server(&[b'x'; 60], at + 100);
+            t.ack(at + 150);
+            for (i, c) in [b"c", b"d", b"e"].into_iter().enumerate() {
+                let now = at + 400 + 400 * i as u64;
+                let f = t.key(c, now);
+                assert!(
+                    f.paint.is_empty() && !t.painted(),
+                    "written at {written}: the tail painted {:?}",
+                    String::from_utf8_lossy(&f.paint)
+                );
+                t.server(c, now + 110);
+                t.ack(now + 160);
+            }
+            assert_eq!(t.o.stats().guessed, guessed, "written at {written}");
+        }
+    }
+}
+
+/// Review F2 of #75: a start marker more than a second after the `?2004 l` was written is content
+/// (the terminal was not bracketing): it is a boundary, and prediction comes back after it.
+#[test]
+fn a_start_marker_long_after_bracketed_paste_off_is_written_is_content() {
+    for raw in [&b"\x1b[200~"[..], b"q\x1b[200~", b"\x1b[2", b"\x1b"] {
+        let mut t = T::trusted();
+        t.ack(130);
+        paste_off_written_at(&mut t, 200);
+        t.key(raw, 1300);
+        if raw.len() < 6 {
+            t.key(&b"\x1b[200~"[raw.len()..], 1305); // the marker cut across reads
+        }
+        t.server(b"q", 1350);
+        t.ack(1360);
+        assert!(
+            types_again(&mut t, 1500),
+            "{raw:?}: prediction never came back"
+        );
+    }
+    // Inside a real paste, a marker that is content does not end it.
+    let mut t = T::trusted();
+    t.key(b"\x1b[200~xy", 150);
+    paste_off_written_at(&mut t, 200);
+    let guessed = t.o.stats().guessed;
+    assert!(t.key(b"\x1b[200~z", 1300).paint.is_empty());
+    assert!(t.key(b"w", 1700).paint.is_empty());
+    assert_eq!(t.o.stats().guessed, guessed, "the paste's tail was guessed");
+}
+
+/// Until the `?2004 l` is known to be written, and while the program's synchronized output may
+/// hold it back, a start marker always starts a paste; a `?2004 h` and `l` in one chunk count
+/// again from its write.
+#[test]
+fn bracketed_paste_off_counts_only_from_a_write_that_applies_it() {
+    let pasted = |t: &mut T, now: u64| {
+        t.key(b"\x1b[200~", now);
+        t.server(b"q", now + 50);
+        t.ack(now + 60);
+        !types_again(t, now + 100)
+    };
+    // Never written.
+    let mut t = T::trusted();
+    t.server(b"\x1b[?2004l", 200);
+    assert!(pasted(&mut t, 5000), "unwritten");
+    // Written inside the program's synchronized output, then the batch ends.
+    let mut t = T::trusted();
+    t.server(b"\x1b[?2026h\x1b[?2004l", 200);
+    t.o.written(ms(200));
+    t.server(b"\x1b[?2026l", 3000);
+    t.o.written(ms(3000));
+    assert!(pasted(&mut t, 3500), "inside a synchronized batch");
+    // On and off again in one chunk, long after the first `?2004 l`.
+    let mut t = T::trusted();
+    paste_off_written_at(&mut t, 200);
+    t.server(b"\x1b[?2004h\x1b[?2004l", 5000);
+    t.o.written(ms(5000));
+    assert!(pasted(&mut t, 5500), "on and off in one chunk");
+    // A snapshot sets the mode again (fil's writer always says which): the count starts again
+    // from its write, also when the bytes do not say.
+    let mut t = T::trusted();
+    paste_off_written_at(&mut t, 200);
+    t.o.reset(
+        (default_backend().create)(Size { cols: 40, rows: 10 }, 0),
+        ms(5000),
+    );
+    t.server(b"$ ", 5000);
+    t.o.written(ms(5000));
+    assert!(pasted(&mut t, 5500), "after a snapshot");
+    // Each of these past its second is content again.
+    let mut t = T::trusted();
+    paste_off_written_at(&mut t, 200);
+    t.server(b"\x1b[?2004h\x1b[?2004l", 5000);
+    t.o.written(ms(5000));
+    assert!(
+        !pasted(&mut t, 6100),
+        "on and off in one chunk, past the second"
+    );
+}
+
+/// Review F1 of #86: while the terminal brackets pastes, a start marker always starts one, however
+/// long ago bracketing was turned on (or back on after an off): a real paste's tail is never
+/// guessed or written, with the default predictor or a hostile one.
+#[test]
+fn a_start_marker_long_after_bracketed_paste_on_is_written_starts_a_paste() {
+    use fil_predict::MoshConfig;
+    use fil_predict::sim::{HostileCfg, HostilePredictor};
+    let predictors: [fn() -> Box<dyn Predictor>; 2] = [
+        || Box::new(MoshPredictor::new(MoshConfig::always())),
+        || Box::new(HostilePredictor::new(HostileCfg::noisy(3))),
+    ];
+    for off_first in [false, true] {
+        for p in predictors {
+            let mut t = T::with(p(), Guards::ALL, Size { cols: 40, rows: 10 });
+            if off_first {
+                paste_off_written_at(&mut t, 0);
+            }
+            let on = if off_first { 2000 } else { 0 };
+            t.server(b"\x1b[?2004h", on);
+            t.o.written(ms(on));
+            t.server(b"$ ", on + 10);
+            t.o.written(ms(on + 10));
+            t.key(b"a", on + 20);
+            t.server(b"a", on + 130);
+            t.o.written(ms(on + 130));
+            t.ack(on + 140);
+            t.server(b"\x1b[m", on + 200); // unrelated output, written
+            t.o.written(ms(on + 200));
+            let guessed = t.o.stats().guessed;
+            let at = on + 5000;
+            assert!(t.key(b"\x1b[200~ab", at).paint.is_empty());
+            t.server(b"ab", at + 100);
+            t.o.written(ms(at + 100));
+            t.ack(at + 150);
+            for (i, c) in [b"c", b"d", b"e"].into_iter().enumerate() {
+                let now = at + 400 + 400 * i as u64;
+                let f = t.key(c, now);
+                assert!(
+                    f.paint.is_empty() && !t.painted(),
+                    "off first {off_first}: the tail painted {:?}",
+                    String::from_utf8_lossy(&f.paint)
+                );
+                t.server(c, now + 110);
+                t.o.written(ms(now + 110));
+                t.ack(now + 160);
+            }
+            assert_eq!(t.o.stats().guessed, guessed, "off first {off_first}");
+        }
+    }
+}
+
+/// Review observation 7 of #75: a take-back keeps a paste in progress (the terminal is one
+/// stream across attaches), so the paste's tail is not guessed after the rebase.
+#[test]
+fn a_paste_in_progress_survives_a_take_back() {
+    let mut t = T::trusted();
+    t.key(b"\x1b[200~ab", 200);
+    t.o.reset(
+        (default_backend().create)(Size { cols: 40, rows: 10 }, 0),
+        ms(300),
+    );
+    t.o.rebase_input();
+    t.at = 0;
+    t.server(b"$ ab", 310);
+    t.confirm();
+    t.ack(450);
+    let guessed = t.o.stats().guessed;
+    assert!(t.key(b"cd", 500).paint.is_empty());
+    assert_eq!(t.o.stats().guessed, guessed, "the paste's tail was guessed");
+    t.key(b"\x1b[201~", 510);
+    t.server(b"cd", 600);
+    t.ack(610);
+    assert!(types_again(&mut t, 700), "prediction never came back");
+}
+
 /// A recording of the keys the predictor was given, around the default predictor.
 struct Recorder {
     inner: MoshPredictor,

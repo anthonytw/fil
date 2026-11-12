@@ -54,8 +54,8 @@ lipo -info "$out/$UNIVERSAL/fil" >&2
 # runner. It need not match anyone else's `codesign`: the release-verify of a signed release
 # compares the binaries through macho_norm.py, which normalizes the signature away
 # (docs/m4/release.md section 10.3). (Developer ID signing and notarization are done after CI by
-# `just release-sign-macos`.)
+# `tests/release/just.sh release-sign-macos`.)
 codesign --force --sign - --identifier fil "$out/$UNIVERSAL/fil" >&2
 codesign --verify --strict --verbose=2 "$out/$UNIVERSAL/fil" >&2
-just no-test-hooks "$out/$UNIVERSAL/fil"
+"$ROOT/tests/release/just.sh" no-test-hooks "$out/$UNIVERSAL/fil"
 sha256 "$out/$UNIVERSAL/fil" | sed "s|\$|  $UNIVERSAL/fil|" >&2

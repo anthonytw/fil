@@ -121,7 +121,7 @@ tools_image() { cross_image x86_64-unknown-linux-musl; }
 # tool in no binary), pinned by the digest of its multi-architecture index, so that the package job
 # (amd64) and the VM's rebuild (arm64) run the same nfpm. To bump it: resolve the new tag's index
 # digest (`docker image inspect --format '{{json .RepoDigests}}'` after a pull), change both here,
-# and re-run a release dry run and `just release-verify`.
+# and re-run a release dry run and `tests/release/just.sh release-verify`.
 NFPM_VERSION=2.48.0
 NFPM_IMAGE=docker.io/goreleaser/nfpm@sha256:d57a1452e7a019896b355f7b1ec67262278f6c503631f652d4fce7aef9ac8df7
 # package_path KIND PATH: where a file at PATH in a Linux archive (bin/fil, libexec/..., share/...)
@@ -299,7 +299,7 @@ dev_id_requirement() {
 TEST_OVERRIDES="FIL_RELEASE_VERIFY FIL_NOTARYTOOL FIL_CODESIGN FIL_DITTO FIL_RELEASE_PACK_CMD FIL_RELEASE_SIGNERS FIL_GH FIL_MACOS_TEAM_ID FIL_RELEASE_ROOT
   FIL_GATE_GH FIL_GPG FIL_RPMSIGN FIL_RPMKEYS FIL_PACKAGE_KEY_FILE FIL_RELEASE_REPO_URL FIL_PUBLISH_CARGO FIL_PUBLISH_CURL FIL_RESERVE_CARGO FIL_RESERVE_CURL
   FIL_DOCKER FIL_LIMACTL FIL_SSH FIL_SECURITY FIL_CARGO FIL_CRATES_CURL FIL_DF FIL_SSH_ADD FIL_GPG_PRESET FIL_RELEASE_TTY FIL_RELEASE_LOCK_HOLD
-  FIL_SIGN_MACOS FIL_SIGN_PACKAGES FIL_RELEASE_KEYS FIL_RELEASE_POLL FIL_BREW FIL_RELEASE_SHARED FIL_RELEASE_SELFTEST"
+  FIL_SIGN_MACOS FIL_SIGN_PACKAGES FIL_RELEASE_KEYS FIL_RELEASE_POLL FIL_BREW FIL_RELEASE_SHARED FIL_ENTRY_CHECK_STOP FIL_RELEASE_SELFTEST"
 
 # The owner's Developer ID (sign-macos.sh, release-preflight.sh); FIL_CODESIGN_IDENTITY names another.
 DEFAULT_CODESIGN_IDENTITY='Developer ID Application: Anthony Wertz (6X3PT3FXGA)'

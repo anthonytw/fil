@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The rebuild half of `just release-verify`. It runs INSIDE the Linux VM and is piped there by
+# The rebuild half of `tests/release/just.sh release-verify`. It runs INSIDE the Linux VM and is piped there by
 # verify.sh. The COMPARISON with the release is the verifier's own (verify.sh runs on the owner's
 # machine); the BUILD RECIPE is not: build-binary.sh, package.sh and Cross.toml's image pins come
 # from the commit that is rebuilt. That is acceptable because release-verify has first checked that

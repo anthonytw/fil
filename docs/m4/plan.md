@@ -73,7 +73,7 @@ M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the
    - `macos-check`, on both architectures, with the macOS-remote job;
    - the drop-in suite on both Pis, with the candidate's aarch64 binary;
    - the realnet `install` part.
-3. **The Linux binaries and archives are reproducible:** the two CI builds of the candidate give identical SHA-256s, and the owner's independent rebuild (`just release-verify`, in the VM) reproduces the binaries.
+3. **The Linux binaries and archives are reproducible:** the two CI builds of the candidate give identical SHA-256s, and the owner's independent rebuild (`tests/release/just.sh release-verify`, in the VM) reproduces the binaries.
 4. **The docs are complete,** and the tests that tie the config reference and the man page to the code pass.
 5. **The notices are complete:** every crate in the release graph, plus Rust's standard library and musl.
 6. **The repository has been recreated** (owner). **v0.1.0 is published:** a signed tag, a GitHub Release with signed checksums and attestations, and the Homebrew formula, with the other channels of goal 3 (crates.io, `.deb` and `.rpm`, the AUR, the Nix flake and its nixpkgs PR) and the Debian and Fedora submissions started. The site launches with it if the owner has done the site steps by then. The site does not gate the release.
@@ -410,7 +410,7 @@ Every package keeps M2's rules:
 - **Done when:** both jobs are green on main, or each red one is a filed finding with an owner, and §16.9 says "supported; `fil ports` shows forwards only" (proposed).
 
 **REL: release builds and provenance**
-- **Owns:** `.github/workflows/release.yml` (new), the `[profile.release]` table and `rust-version` in the root `Cargo.toml`, `Cross.toml` (an x86_64 image, pinned by digest), `tests/release/**` (new), the `justfile` recipes `release-build`, `release-check` and `release-verify`, and DESIGN §13 ("Builds").
+- **Owns:** `.github/workflows/release.yml` (new), the `[profile.release]` table and `rust-version` in the root `Cargo.toml`, `Cross.toml` (an x86_64 image, pinned by digest), `tests/release/**` (new), the `justfile` recipes `release-build`, `release-check` and `release-verify` (since 2026-11-11 in `tests/release/release.just`, with the other release-path recipes, so that the justfile needs no code owner: `docs/m4/release.md` §9), and DESIGN §13 ("Builds").
 - **Triggers:** `workflow_dispatch` (a dry run from any ref: artifacts uploaded to the run, nothing published, no attestation) and a push of a `v*` tag.
 - **Permissions:**
   - every job: `contents: read`;
@@ -445,7 +445,7 @@ Every package keeps M2's rules:
   - it builds the vendored source archive and `SHA256SUMS`;
   - it creates the attestations, with `actions/attest-build-provenance` pinned by SHA;
   - it opens a **draft** GitHub Release, which the owner publishes after signing (§5, SHIP).
-- **`just release-verify VERSION`,** the owner's check before signing and anyone's afterward:
+- **`tests/release/just.sh release-verify VERSION`,** the owner's check before signing and anyone's afterward:
   - It downloads a release.
   - It checks the tag with `git verify-tag` against the allowed-signers file **from `main` (or the verifier's own copy), never from the tag**, and checks that the tag is on `main`.
   - It checks `SHA256SUMS.sig` with `ssh-keygen -Y verify`, then the checksums.
@@ -712,7 +712,7 @@ Steps:
 
 1. **A release-candidate dry run** from main, and the RC checks of §1, "Done when".
 2. **The tag.** The owner tags `v0.1.0` (annotated, SSH-signed) and pushes it, and the workflow builds the draft.
-3. **The owner's check.** The owner runs `just release-verify 0.1.0` (the narrow checks and the rebuild comparison), signs `SHA256SUMS` (`ssh-keygen -Y sign -n fil-release`), attaches `SHA256SUMS.sig` and publishes the draft.
+3. **The owner's check.** The owner runs `tests/release/just.sh release-verify 0.1.0` (the narrow checks and the rebuild comparison), signs `SHA256SUMS` (`ssh-keygen -Y sign -n fil-release`), attaches `SHA256SUMS.sig` and publishes the draft.
 4. **The tap.** The coordinator opens the tap PR (PKG). The owner merges it, or the bot does if the owner allows it.
 5. **The site.** If SITE is ready, the site task deploys with the release notes.
 
@@ -731,7 +731,7 @@ Each PR runs `just ci` and the package's tests with its mutation table, and gets
 | `macos-check` `check` | GitHub, Apple silicon and Intel | the gate, PTYs, harnesses, the reduced forward soak, `dropin --local` |
 | `macos-check` `remote` | GitHub, Apple silicon | macOS as the remote, with the upgrade in place and TMP's `clean-tmps` case |
 | `release.yml` dry run | GitHub | the archives, the layout, reproducibility of binaries and archives, `release-check` |
-| `just release-verify` | the VM (amd64 emulation) | the independent rebuild |
+| `tests/release/just.sh release-verify` | the VM (amd64 emulation) | the independent rebuild |
 | `just fuzz` campaign | the VM or a runner | FUZZ's targets, one hour each, during SWEEP |
 | `log_blocking`, `tmp_clean` | `just ci` | LOG's blocked writer; TMP's mechanism |
 | Pi drop-in with the release bits | the Pis | the M1 and M2 suites on the RC's own aarch64 binary |

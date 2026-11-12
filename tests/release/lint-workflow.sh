@@ -25,6 +25,13 @@
 #      no `${{ }}` expression inside a `run:` (values reach the shell through `env:`);
 #   8. every `cargo`/`cross` build, install, vendor or metadata command, in the workflow and in
 #      tests/release/*.sh, passes `--locked`.
+#   9. no step runs `just` itself: a recipe runs as `tests/release/just.sh RECIPE`, which reads only
+#      the owned tests/release/release.just, never the top-level justfile (it has no code owner, and
+#      just evaluates its assignments as soon as it parses it; tests/release/recipes.sh).
+#  10. the release scripts' own tests (selftest.sh, which has no code owner) run in a job
+#      `release-test` of their own, not beside an owned step, and `publish` needs that job;
+#  11. the `prepare` job runs `cargo deny --locked check` with at least `bans` and `sources`, so that
+#      deny.toml (owned) bounds the unowned Cargo.lock on the release path itself.
 #
 # The check profile (--check): these workflows run on a manual dispatch only and hold no secret.
 #   C1. the workflow's `permissions:` is a block holding `contents: read` only; no job names a
@@ -181,6 +188,9 @@ awk '
         }
       }
       if (indent == 4 && line ~ /^    if:/) job_if[job] = line
+      if (indent == 4 && line ~ /^    needs:/) job_needs[job] = line
+      if (line ~ /just\.sh release-test/ || line ~ /selftest\.sh/) runs_selftest[job] = 1
+      if (job == "prepare" && line ~ /(run:|^)[ ]*cargo deny --locked check( [a-z]+)+[ ]*$/ && line ~ / bans( |$)/ && line ~ / sources( |$)/) deny_seen = 1
       if (indent == 4 && line ~ /^    environment:/) { e = line; sub(/^    environment:[ ]*/, "", e); job_env[job] = e }
     }
     # whole-file rules
@@ -209,6 +219,10 @@ awk '
       if (job_if["crates-io"] != tag_if) bad("crates-io does not run only for a push of a v* tag: " job_if["crates-io"])
       if (job_env["crates-io"] != "crates-io") bad("crates-io does not run in the environment crates-io: " job_env["crates-io"])
     }
+    if (!deny_seen) bad("prepare does not run cargo deny --locked check with bans and sources (the unowned Cargo.lock is bounded by deny.toml there)")
+    if (!("release-test" in jobs)) bad("no job release-test (the self-test runs in a job of its own)")
+    for (j in runs_selftest) if (j != "release-test") bad("job " j " runs the self-test beside its own steps (only the job release-test may)")
+    if (job_needs["publish"] !~ /[[ ,]release-test[],]/) bad("publish does not need release-test: " job_needs["publish"])
     for (j in job_env) if (j != "crates-io") bad("job " j " names an environment (" job_env[j] "); only crates-io may")
     exit fails ? 1 : 0
   }
@@ -231,4 +245,12 @@ for s in "$scripts_dir"/build-binary.sh "$scripts_dir"/macos-build.sh "$scripts_
   [ -f "$s" ] && check_locked "$s"
 done
 [ "$missing" = 0 ] || exit 1
+
+# 9. no bare `just`: a command line (or a run: value) that starts with it, or runs it after ;, && or |
+hits=$(sed 's/[[:space:]]#.*$//' "$wf" | grep -nE '^[[:space:]]*(- )?(run:[[:space:]]*)?just([[:space:]]|$)|(;|&&|[|])[[:space:]]*just([[:space:]]|$)' | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+if [ -n "$hits" ]; then
+  echo "lint-workflow: $wf: a step runs just, which reads the unowned justfile (use tests/release/just.sh RECIPE):" >&2
+  echo "$hits" >&2
+  exit 1
+fi
 echo "lint-workflow: $wf ok"

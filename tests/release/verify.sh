@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `just release-verify`: the owner's check before signing a release, and anyone's afterward
+# `tests/release/just.sh release-verify`: the owner's check before signing a release, and anyone's afterward
 # (docs/m4/plan.md, REL; docs/m4/release.md section 4).
 #
 #   verify.sh VERSION [--dry-run] [--from-run RUN | --from-dir DIR] [--repo OWNER/REPO]
@@ -41,7 +41,7 @@
 #
 # --reuse-rebuild: compare with the rebuild an earlier full run left in WORK/rebuilt instead of
 # rebuilding again, when that rebuild is of the same commit in the same mode (WORK/rebuilt.commit,
-# written after a rebuild whose copy-out succeeded); otherwise it rebuilds as usual. `just release`
+# written after a rebuild whose copy-out succeeded); otherwise it rebuilds as usual. `tests/release/just.sh release`
 # uses it for the verification after signing (step 12), which then reuses step 7's rebuild of the
 # tag's commit (owner, 2026-11-09). Every other check runs as without it.
 #

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the `fil` release binary of one Linux target, in the digest-pinned image of Cross.toml, and
 # put it at OUT/TARGET/fil. This is the one place that says how; release.yml's build jobs,
-# `just release-build` and `just release-verify`'s rebuild all call it.
+# `just release-build` and `tests/release/just.sh release-verify`'s rebuild all call it.
 #
 #   build-binary.sh TARGET OUT
 #
@@ -49,5 +49,5 @@ case $target in
   aarch64-*) arch='ELF 64-bit.*ARM aarch64' ;;
 esac
 grep -Eq "$arch.*(statically linked|static-pie linked)" <<< "$desc" || die "$out/$target/fil is not a static binary for $target"
-just no-test-hooks "$out/$target/fil"
+"$ROOT/tests/release/just.sh" no-test-hooks "$out/$target/fil"
 sha256 "$out/$target/fil" | sed "s|\$|  $target/fil|" >&2

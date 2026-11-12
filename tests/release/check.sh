@@ -113,7 +113,7 @@ if [ -n "$rv" ] && [ "$rv" = "$tc" ]; then ok "rust-version $rv is the pinned to
 
 # ---- the tree: the dependency graph of the release binary
 if [ "$tree" = 1 ]; then
-  if (cd "$ROOT" && just release-deps) > "$work/deps.log" 2>&1; then ok "release-deps (no vt100, no test-hooks in the release graph)"; else
+  if ("$ROOT/tests/release/just.sh" release-deps) > "$work/deps.log" 2>&1; then ok "release-deps (no vt100, no test-hooks in the release graph)"; else
     cat "$work/deps.log" >&2
     fail "release-deps"
   fi
@@ -326,7 +326,7 @@ for label in x86_64-linux-musl aarch64-linux-musl universal-apple-darwin source;
   # must read $REMAP_CARGO_HOME/registry/..., never the builder's cargo home.
   if grep -aqF -- "$REMAP_CARGO_HOME/registry/src/" "$b"; then ok "$name: bin/fil carries remapped source paths ($REMAP_CARGO_HOME/registry/...)"; else fail "$name: bin/fil has no $REMAP_CARGO_HOME/registry/src/ path: the path remap was not applied"; fi
   [ "$hit" = 0 ] && ok "$name: bin/fil has no builder path and no FIL_TEST_ string"
-  if (cd "$ROOT" && just no-test-hooks "$b") > "$work/nth.log" 2>&1; then ok "$name: no-test-hooks"; else cat "$work/nth.log" >&2; fail "$name: no-test-hooks"; fi
+  if ("$ROOT/tests/release/just.sh" no-test-hooks "$b") > "$work/nth.log" 2>&1; then ok "$name: no-test-hooks"; else cat "$work/nth.log" >&2; fail "$name: no-test-hooks"; fi
   desc=$(file "$b")
   case $label in
     x86_64-linux-musl | aarch64-linux-musl)

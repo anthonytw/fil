@@ -134,6 +134,13 @@ mutate_wf "a secret passed to format" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1
 mutate_wf "secrets: inherit" 's/(  prepare:\n)/$1    secrets: inherit\n/'
 mutate_wf "prepare's actions: read becomes write" 's/(  prepare:.*?      actions: )read/${1}write/s'
 mutate_wf "another job gets id-token: write" 's/(  packages-arm64:.*?    permissions:\n      contents: read\n)/$1      id-token: write\n/s'
+mutate_wf "a step runs just itself (it would read the unowned justfile)" 's/run: tests\/release\/just.sh release-deps/run: just release-deps/'
+mutate_wf "a run block runs just after &&" 's/(tests\/release\/lint-workflow.sh --check [^\n]*)/$1 && just release-test/'
+mutate_wf "the self-test job no longer gates publish" 's/needs: \[prepare, release-test, package/needs: [prepare, package/'
+mutate_wf "prepare runs the self-test again" 's/(run: tests\/release\/just.sh crates-check\n)/$1      - run: tests\/release\/just.sh release-test\n/'
+mutate_wf "prepare no longer checks the lock's sources" 's/check bans licenses sources/check bans licenses/'
+mutate_wf "prepare checks the lock without --locked" 's/cargo deny --locked check/cargo deny check/'
+mutate_wf "the lock's check moved out of prepare" 's/      - name: The lock.s sources, bans and licenses[^\n]*\n        run: cargo deny --locked check bans licenses sources\n//'
 # --locked: scripts in a copy of the directory
 mkdir -p "$tmp/scripts"
 cp "$RELEASE_DIR"/*.sh "$tmp/scripts/"
@@ -270,23 +277,147 @@ expect_fail "notes.sh: an uppercase commit is refused" "$RELEASE_DIR/notes.sh" 9
 expect_fail "notes.sh: a commit with a second line is refused" "$RELEASE_DIR/notes.sh" 9.9.9 o/r "$sha
 main"
 
-# the files that decide what a release is need the owner's review
+# the files that decide what a release is, or who signs it, need the owner's review, and only those
+# (narrowed on 2026-11-11, owner)
 echo "== CODEOWNERS"
-for path in /justfile /Cargo.toml /deny.toml /about.toml /about.hbs /.cargo/ /.gitattributes '/packaging/**' /flake.nix /flake.lock /docs/man/install-pandoc.sh /docs/man/build.sh /.github/macos-team-id /.github/package-signing-key.asc /.github/release-signers '/.github/workflows/**' '/tests/release/**' /Cross.toml /rust-toolchain.toml; do
+for path in /Cargo.toml /deny.toml /about.toml /about.hbs /.cargo/ /.gitattributes '/packaging/**' /flake.nix /flake.lock '/docs/man/**' /.github/CODEOWNERS /.github/macos-team-id /.github/package-signing-key.asc /.github/release-signers '/.github/workflows/**' '/tests/release/**' /Cross.toml /rust-toolchain.toml /rust-toolchain; do
   expect_pass "CODEOWNERS lists $path" grep -qxF "$path @anthonytw" "$REPO_ROOT/.github/CODEOWNERS"
 done
+for path in /justfile; do
+  expect_fail "CODEOWNERS does not list $path" grep -q "^$path" "$REPO_ROOT/.github/CODEOWNERS"
+done
+# codeowners_owner FILE PATH...: each PATH's owners under FILE (GitHub's rule: the last matching
+# pattern wins, and a pattern with no owners leaves the path unowned), as "PATH OWNERS" or "PATH -".
+# It knows the three pattern forms the file uses (/exact, /dir/, /dir/**) and refuses any other.
+codeowners_owner() {
+  python3 -I - "$@" << 'EOF2'
+import sys
+rules = []
+for line in open(sys.argv[1]):
+    f = line.split("#", 1)[0].split()
+    if not f:
+        continue
+    p = f[0]
+    if not p.startswith("/") or ("*" in p and not p.endswith("/**")) or p.count("*") > 2:
+        sys.exit(f"codeowners_owner: a pattern this test cannot read: {p}")
+    rules.append((p, f[1:]))
+def match(p, path):
+    if p.endswith("/**"):
+        return path.startswith(p[:-2])
+    if p.endswith("/"):
+        return path.startswith(p)
+    return path == p
+for path in sys.argv[2:]:
+    owners = None
+    for p, o in rules:
+        if match(p, path):
+            owners = o
+    print(path, " ".join(owners) if owners else "-")
+EOF2
+}
+owned=() unowned=(/.github/workflows/linux-check.yml /.github/workflows/macos-check.yml /justfile /tests/release/selftest.sh /tests/release/selftest_macho.py /tests/release/selftest_pkg.py /docs/man/fil.1)
+for f in "$REPO_ROOT"/tests/release/*; do
+  case ${f##*/} in selftest.sh | selftest_macho.py | selftest_pkg.py) ;; *) owned+=("/tests/release/${f##*/}") ;; esac
+done
+# a file added later in an owned directory is owned until CODEOWNERS says otherwise
+owned+=(/.github/workflows/release.yml /.github/workflows/new.yml /tests/release/new-step.sh /packaging/new/x /.cargo/config.toml /flake.nix /flake.lock /rust-toolchain /docs/man/strip-links.lua /docs/man/build.sh /docs/man/install-pandoc.sh /docs/man/new-filter.lua)
+codeowners_owner "$REPO_ROOT/.github/CODEOWNERS" "${owned[@]}" "${unowned[@]}" > "$tmp/owners" 2>&1 || cat "$tmp/owners" >&2
+for path in "${owned[@]}"; do
+  expect_pass "CODEOWNERS: $path is the owner's" grep -qxF "$path @anthonytw" "$tmp/owners"
+done
+for path in "${unowned[@]}"; do
+  expect_pass "CODEOWNERS: $path has no owner" grep -qxF "$path -" "$tmp/owners"
+done
+expect_pass "CODEOWNERS: release.just, just.sh, entry-check.sh and recipes.sh are among the owned files" sh -c 'for f in release.just just.sh entry-check.sh recipes.sh; do grep -qxF "/tests/release/$f @anthonytw" "$1" || exit 1; done' sh "$tmp/owners"
+{ cat "$REPO_ROOT/.github/CODEOWNERS"; echo "/tests/release/release.just"; } > "$tmp/CODEOWNERS.mut"
+expect_pass "mutation: an ownerless line after the directory unowns the file" test "$(codeowners_owner "$tmp/CODEOWNERS.mut" /tests/release/release.just)" = "/tests/release/release.just -"
 # ...and every path it lists that has no glob exists (a rename would silently drop the protection),
-# except .cargo/ and .gitattributes, which are listed so that adding one needs the owner
+# except .cargo/, .gitattributes and rust-toolchain, which are listed so that adding one needs the owner
 codeowners_missing() { # FILE: the non-glob paths in a CODEOWNERS file that do not exist
   local cpath
   while read -r cpath _; do
-    case $cpath in '#'* | '' | *'*'* | /.cargo/ | /.gitattributes) continue ;; esac
+    case $cpath in '#'* | '' | *'*'* | /.cargo/ | /.gitattributes | /rust-toolchain) continue ;; esac
     [ -e "$REPO_ROOT$cpath" ] || echo "$cpath"
   done < "$1"
 }
-expect_pass "every CODEOWNERS path exists (but .cargo/ and .gitattributes)" test -z "$(codeowners_missing "$REPO_ROOT/.github/CODEOWNERS")"
+expect_pass "every CODEOWNERS path exists (but .cargo/, .gitattributes and rust-toolchain)" test -z "$(codeowners_missing "$REPO_ROOT/.github/CODEOWNERS")"
 { cat "$REPO_ROOT/.github/CODEOWNERS"; echo "/no-such-file @anthonytw"; } > "$tmp/CODEOWNERS.mut"
 expect_pass "mutation: a CODEOWNERS path that does not exist is caught" test "$(codeowners_missing "$tmp/CODEOWNERS.mut")" = /no-such-file
+
+# the release path reads the owned release.just alone, never the unowned justfile
+echo "== release recipes (recipes.sh, just.sh, entry-check.sh)"
+expect_pass "recipes.sh passes on the tree" "$RELEASE_DIR/recipes.sh" "$REPO_ROOT"
+rt=$tmp/recipes
+# rt_tree NAME: a copy of the justfile and tests/release in $rt/NAME, to mutate
+rt_tree() { mkdir -p "$rt/$1/tests" && cp "$REPO_ROOT/justfile" "$rt/$1/" && cp -R "$REPO_ROOT/tests/release" "$rt/$1/tests/"; }
+rt_tree clean
+expect_pass "recipes.sh passes on an unchanged copy" "$RELEASE_DIR/recipes.sh" "$rt/clean"
+# rt_mut NAME PERL_EXPR [FILE]: a copy with FILE (default release.just) changed; recipes.sh must fail
+rt_mut() {
+  local name=$1 expr=$2 f=${3:-tests/release/release.just}
+  rt_tree "m$((++rt_n))"
+  perl -0pi -e "$expr" "$rt/m$rt_n/$f"
+  if cmp -s "$REPO_ROOT/$f" "$rt/m$rt_n/$f"; then flunk "recipes mutation '$name' did not change $f (the test is stale)"; else
+    expect_fail "mutation: $name" "$RELEASE_DIR/recipes.sh" "$rt/m$rt_n"
+  fi
+}
+rt_n=0
+rt_mut "release.just imports a file" 's/^(set lazy\n)/${1}import '"'"'x.just'"'"'\n/m'
+rt_mut "release.just imports a file if it exists (import?)" 's/^(set lazy\n)/${1}import? '"'"'x.just'"'"'\n/m'
+rt_mut "release.just mounts a module" 's/^(set lazy\n)/${1}mod zz\n/m'
+rt_mut "release.just mounts a module if it exists (mod?)" 's/^(set lazy\n)/${1}mod? zz '"'"'zz.just'"'"'\n/m'
+rt_mut "release.just without set lazy" 's/^set lazy\n//m'
+rt_mut "release.just runs in its own directory" 's/^set working-directory := .*\n//m'
+rt_mut "release.just runs one level up only" "s/^set working-directory := '\\.\\.\\/\\.\\.'/set working-directory := '..'/m"
+rt_mut "a recipe in release.just that recipes.sh does not list" 's/\z/\nrelease-extra:\n    true\n/'
+rt_mut "release without the entry check" 's/^(release version \*args:\n)    tests\/release\/entry-check.sh release\n/$1/m'
+rt_mut "release-keys checks the wrong recipe's entry" 's/entry-check.sh release-keys$/entry-check.sh release/m'
+rt_mut "build-binary.sh runs just itself" 's/"\$ROOT\/tests\/release\/just.sh" no-test-hooks/just no-test-hooks/' tests/release/build-binary.sh
+rt_mut "check.sh runs just itself, in a subshell" 's/\("\$ROOT\/tests\/release\/just.sh" release-deps\)/(cd "\$ROOT" \&\& just release-deps)/' tests/release/check.sh
+rt_mut "a release script runs just after a ;" 's/^(set -euo pipefail\n)/${1}true; just release-deps\n/m' tests/release/package.sh
+expect_pass "recipes.sh: a message that names just is not a command" sh -c 'grep -q "\"run: just release-keys" "$1"; "$2" "$3"' sh "$RELEASE_DIR/release-keys.sh" "$RELEASE_DIR/recipes.sh" "$rt/clean"
+
+# The reviewer's hijacks (PR #74): a justfile whose assignments run code, or that mounts or imports
+# a file that does, must not run anything through tests/release/just.sh. Through the top-level
+# justfile they do run (which shows the test is real), and the owner's commands refuse to.
+# ec_h CMD...: CMD with entry-check.sh's walk ended at this script's process, so that the `just ci`
+# (or anything else) above the self-test is not part of the test
+ec_h() { env FIL_RELEASE_SELFTEST=1 FIL_ENTRY_CHECK_STOP=$$ "$@"; }
+rt_tree hijack
+h=$rt/hijack
+{ printf '_x := `touch PWNED1`\n_y := shell("touch PWNED2")\n'; printf "mod? zz 'zz.just'\nimport? 'x.just'\n"; } >> "$h/justfile"
+printf '_z := `touch PWNED3`\n' > "$h/zz.just"
+printf '_w := `touch PWNED4`\n' > "$h/x.just"
+expect_fail "hijack: tests/release/just.sh no-test-hooks fails on a missing binary..." "$h/tests/release/just.sh" no-test-hooks /nonexistent
+expect_pass "hijack: ...and ran nothing of the justfile or its modules" sh -c 'cd "$1" && ! ls PWNED* > /dev/null 2>&1' sh "$h"
+(cd "$h" && just no-test-hooks /nonexistent) > /dev/null 2>&1 || true
+expect_pass "hijack: the same through the justfile runs all four (the test is real)" sh -c 'cd "$1" && test -f PWNED1 && test -f PWNED2 && test -f PWNED3 && test -f PWNED4' sh "$h"
+rm -f "$h"/PWNED*
+expect_pass "hijack: recipes.sh passes (the justfile is not on the release path)" "$RELEASE_DIR/recipes.sh" "$h"
+expect_fail "hijack: just release-keys through the justfile is refused..." ec_h sh -c 'cd "$1" && just release-keys status' sh "$h"
+grep -q 'release: STOP: release-keys was started through a justfile other than tests/release/release.just' "$tmp/out.log" && pass "...by the entry check, which names the owned command" || { flunk "...by the entry check, which names the owned command"; sed "s/^/       | /" "$tmp/out.log"; }
+# just.sh runs release.just's recipes in the repository root, from wherever it is run
+expect_pass "just.sh: the recipes run in the repository root, from any directory" sh -c 'cd / && "$1/tests/release/just.sh" --evaluate > /dev/null && cd "$1/tests" && test "$("$1/tests/release/just.sh" --dry-run release-test 2>&1 | head -n 1)" = "tests/release/lint-workflow.sh .github/workflows/release.yml"' sh "$h"
+# entry-check.sh: refuses under any `just` ancestor that is not release.just; a direct call is fine
+ec=$RELEASE_DIR/entry-check.sh
+# fakejust JUSTFILE|- CMD...: CMD under a process whose argv is `just [--justfile JUSTFILE] ...`
+cat > "$tmp/fakejust" << 'EOF2'
+#!/usr/bin/env bash
+jf=$1
+shift
+if [ "$jf" = - ]; then exec -a just bash -c '"$@"; rc=$?; exit $rc' bash "$@"; fi
+exec -a just bash -c 'shift 2; "$@"; rc=$?; exit $rc' bash --justfile "$jf" "$@"
+EOF2
+chmod +x "$tmp/fakejust"
+fj=$tmp/fakejust
+expect_pass "entry-check: no just above it passes" ec_h "$ec" release
+expect_fail "entry-check: a just ancestor with no --justfile is refused" ec_h "$fj" - "$ec" release
+expect_fail "entry-check: a just ancestor with another justfile is refused" ec_h "$fj" /x/justfile "$ec" release
+expect_pass "entry-check: a just ancestor running tests/release/release.just passes" ec_h "$fj" /x/tests/release/release.just "$ec" release
+expect_fail "entry-check: release.just under the top-level justfile is refused" ec_h "$fj" - "$fj" /x/tests/release/release.just "$ec" release
+expect_fail "entry-check: the stop override without FIL_RELEASE_SELFTEST=1 is refused" env -u FIL_RELEASE_SELFTEST FIL_ENTRY_CHECK_STOP=$$ "$ec" release
+grep -q 'FIL_ENTRY_CHECK_STOP is set (a test-only override)' "$tmp/out.log" && pass "...with that message" || { flunk "...with that message"; sed "s/^/       | /" "$tmp/out.log"; }
+
 
 # ============================================================== 4. release-check on synthetic releases
 echo "== release-check"
@@ -295,8 +426,9 @@ echo "== release-check"
 # and archives made with whatever tar the machine has.
 mk_tree() { # DIR VER
   local d=$1
-  mkdir -p "$d/crates/fil-proto/src" "$d/crates/fil-proto/tests/golden" "$d/crates/fil-transport/src/pipe"
-  cp "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cross.toml" "$REPO_ROOT/rust-toolchain.toml" "$REPO_ROOT/justfile" "$REPO_ROOT/LICENSE" "$REPO_ROOT/README.md" "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$d/"
+  mkdir -p "$d/crates/fil-proto/src" "$d/crates/fil-proto/tests/golden" "$d/crates/fil-transport/src/pipe" "$d/tests/release"
+  cp "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cross.toml" "$REPO_ROOT/rust-toolchain.toml" "$REPO_ROOT/LICENSE" "$REPO_ROOT/README.md" "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$d/"
+  cp "$REPO_ROOT/tests/release/release.just" "$REPO_ROOT/tests/release/just.sh" "$d/tests/release/"
   cp "$REPO_ROOT/crates/fil-proto/src/limits.rs" "$d/crates/fil-proto/src/"
   cp "$REPO_ROOT/crates/fil-proto/tests/golden/wire.txt" "$d/crates/fil-proto/tests/golden/"
   cp "$REPO_ROOT/crates/fil-transport/src/pipe/remote-commands.txt" "$d/crates/fil-transport/src/pipe/"
@@ -1487,7 +1619,7 @@ expect_fail "sign-macos: an upload that stops after the first file fails" sm FAK
 cp "$tmp/out.log" "$ms/last.log"
 expect_pass "sign-macos: ...the draft now holds the signed archive and the old SHA256SUMS" sh -c 'cmp "$1/draft/SHA256SUMS" "$1/files.verified/SHA256SUMS" && ! cmp -s "$1/draft/$2" "$1/files.verified/$2"' sh "$ms" "$MAC.tar.gz"
 expect_pass "sign-macos: ...the verified files were not touched" files_untouched
-expect_pass "sign-macos: ...and it says to run it again" grep -q 'run .just release-sign-macos 0.9.0. again' "$ms/last.log"
+expect_pass "sign-macos: ...and it says to run it again" grep -q 'run .tests/release/just.sh release-sign-macos 0.9.0. again' "$ms/last.log"
 expect_pass "sign-macos: a rerun, from the draft alone, completes the signing" sm
 expect_pass "sign-macos: ...the draft has the new SHA256SUMS and its signature" sh -c 'cmp "$1/draft/SHA256SUMS" "$1/work/files/SHA256SUMS" && test -s "$1/draft/SHA256SUMS.sig"' sh "$ms"
 expect_pass "sign-macos: ...the signed release verifies (agree)" VM agree "$ms/work/files" "$MV"
@@ -1781,6 +1913,9 @@ printf 'release namespaces="git" %s\nrelease namespaces="fil-release" %s\n' "$(c
 echo 'fake key' > "$pf/clone/.github/package-signing-key.asc"
 printf '[target.x86_64-unknown-linux-musl]\nimage = "example.invalid/cross@sha256:%064d"\n' 0 > "$pf/clone/Cross.toml"
 echo '[package]' > "$pf/clone/tests/terminals/exporter/Cargo.toml"
+# the recipes check reads the real release.just and release scripts (with the real just, below)
+mkdir -p "$pf/clone/tests"
+cp -R "$REPO_ROOT/tests/release" "$pf/clone/tests/"
 pg add -A
 pg commit -q -m r
 pg remote add origin "$pf/origin.git"
@@ -1877,7 +2012,9 @@ cat > "$pf/bin/codesign" << 'EOF2'
 #!/bin/sh
 [ -z "${FAKE_CODESIGN_FAIL:-}" ] || { echo "errSecInternalComponent" >&2; exit 1; }
 EOF2
-for t in just rpmsign rpmkeys xcrun ssh-add; do printf '#!/bin/sh\necho %s stub\n' "$t" > "$pf/path/$t"; done
+for t in rpmsign rpmkeys xcrun ssh-add; do printf '#!/bin/sh\necho %s stub\n' "$t" > "$pf/path/$t"; done
+# just: a stub, but recipes.sh's --dump goes to the real one
+printf '#!/bin/sh\ncase " $* " in *" --dump "*) exec %s "$@" ;; esac\necho just stub\n' "$(command -v just)" > "$pf/path/just"
 chmod +x "$pf/bin"/* "$pf/path"/*
 # pfx [ENV=VALUE ...] CMD...: CMD with the fixture's stubs; pfr [ENV=VALUE ...]: the preflight itself
 pfx() {
@@ -1909,7 +2046,10 @@ pf_refs > "$pf/refs.before"
 expect_pass "preflight: everything in order passes" pfr
 expect_pass "preflight: ...and changed no ref and no file of the clone" sh -c 'd=$1; pg() { git -C "$d/clone" "$@"; }; { pg for-each-ref --format="%(refname) %(objectname)" | LC_ALL=C sort; pg status --porcelain; } | cmp -s - "$d/refs.before"' sh "$pf"
 expect_pass "preflight: --list shows the step map" sh -c '"$1" --list | grep -q "^sign-packages  *package-key$"' sh "$PF"
-expect_pass "preflight: sourcing it runs nothing and defines the API" bash -c 'source "$1" && pf_init 0.9.0 && test "$(pf_checks_from crates)" = "overrides tools lock disk tree gh github-ssh crates-env"' sh "$PF"
+expect_pass "preflight: sourcing it runs nothing and defines the API" bash -c 'source "$1" && pf_init 0.9.0 && test "$(pf_checks_from crates)" = "overrides tools lock disk tree recipes gh github-ssh crates-env"' sh "$PF"
+expect_pass "preflight: the recipes check passes on the tree" pfx env FIL_RELEASE_ROOT="$rt/clean" bash -c 'source "$1" && pf_init 0.9.0 && PF_CUR=recipes && pf_check_recipes' sh "$PF"
+expect_fail "preflight: the recipes check fails when release.just imports a file" pfx env FIL_RELEASE_ROOT="$rt/m1" bash -c 'source "$1" && pf_init 0.9.0 && PF_CUR=recipes && pf_check_recipes' sh "$PF"
+grep -q 'FAIL  recipes: .*release.just imports or mounts another file' "$tmp/out.log" && pass "...with that message" || { flunk "...with that message"; sed "s/^/       | /" "$tmp/out.log"; }
 expect_fail "preflight: an unknown step is refused" pfx "$PF" 0.9.0 --repo o/r --from nosuch
 expect_fail "preflight: an unknown check is refused" pfx "$PF" 0.9.0 --repo o/r --only nosuch
 # the override check (outside the self-test, a fake is fatal)
@@ -2485,7 +2625,7 @@ rl_kind 3 dry-run pending
 expect_pass "release status: wrote no state" test ! -e "$RSTATE"
 expect_pass "release status: ...and changed no ref or file of the clone" sh -c 'rl_refs() { git -C "$1" for-each-ref --format="%(refname) %(objectname)" | grep -v "^refs/remotes/" | LC_ALL=C sort; git -C "$1" status --porcelain; }; rl_refs "$1" | cmp -s - "$2"' sh "$pf/clone" "$rs/refs.before"
 rl_paused 2 mirror
-expect_pass "release run: ...at the confirmation, with no terminal, in the failure format" sh -c 'grep -q "input is not a terminal: nothing was done" "$1" && grep -q "^  do:    run it in a terminal (there is no --yes)" "$1" && grep -q "^  then:  just release 0.9.0 .*(steps 1-1 are done" "$1"' sh "$rs/run.out"
+expect_pass "release run: ...at the confirmation, with no terminal, in the failure format" sh -c 'grep -q "input is not a terminal: nothing was done" "$1" && grep -q "^  do:    run it in a terminal (there is no --yes)" "$1" && grep -q "^  then:  tests/release/just.sh release 0.9.0 .*(steps 1-1 are done" "$1"' sh "$rs/run.out"
 expect_pass "release run: ...the preflight ran for mirror and after" grep -q '^preflight: all .* checks passed for 0.9.0' "$rs/run.out"
 expect_pass "release run: ...the state is bound to the version and HEAD" sh -c 'grep -qx "version=0.9.0" "$1" && grep -qx "release_commit=$2" "$1"' sh "$RSTATE" "$RR"
 expect_pass "release run: ...and the lock is gone" test ! -e "$RW/.lock"
@@ -3032,7 +3172,7 @@ cat > "$rs/golden" << 'EOF2'
 17/17 finish next
 EOF2
 expect_pass "release status: the whole listing matches its golden" diff "$rs/golden" "$rs/golden.out"
-expect_pass "release status: ...and it shows the keys" grep -q '^keys (just release-keys status):' "$rs/status.out"
+expect_pass "release status: ...and it shows the keys" grep -q '^keys (tests/release/just.sh release-keys status):' "$rs/status.out"
 rl_kind 3 dry-run "done (implied)" "GitHub down: the tag still verifies" FAKE_RL_GH_DOWN=1
 rl_kind 6 tag-run "next (unknown)" "GitHub down" FAKE_RL_GH_DOWN=1
 # a good tag, the state gone, HEAD on a later main commit: not burned; the run names the release
@@ -3436,7 +3576,7 @@ expect_pass "release brew: ...one formula commit, reused" sh -c 'test "$(git --g
 expect_pass "release brew: ...saying the release is out, and how to run the install test again" sh -c 'grep -q "the release is out" "$1" && grep -q -- "--redo brew" "$1"' sh "$rs/ra.out"
 calls6_are 1 2 2 1
 r5 "release finish: ...again: brew detects as done (the tap has it); forgetting the keys fails at 17" 1 'FAILED at step 17/17 finish' FAKE_KEYS_FORGET_FAIL=1 < /dev/null
-expect_pass "release finish: ...with the known fix" grep -q 'just release-keys forget --need ssh,gpg' "$rs/ra.out"
+expect_pass "release finish: ...with the known fix" grep -q 'tests/release/just.sh release-keys forget --need ssh,gpg' "$rs/ra.out"
 r5 "release finish: ...again: exit 0" 0 'fil 0.9.0 is released' < /dev/null
 r5 "release brew: --redo brew after the failed install test: installs, pushes nothing, asks nothing" 0 'is released' -- --redo brew < /dev/null
 expect_pass "release brew: ...installed this time" sh -c 'test "$(grep -c "^brew install o/tap/fil$" "$1")" = 2 && ! grep -q "release: CONFIRM" "$2"' sh "$rs/calls.log" "$rs/ra.out"

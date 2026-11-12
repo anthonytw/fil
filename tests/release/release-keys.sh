@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `just release-keys unlock|status|forget`: the release's keys, unlocked once per session (the
+# `tests/release/just.sh release-keys unlock|status|forget`: the release's keys, unlocked once per session (the
 # one-command release, its section 3; docs/m4/release.md section 10.4 has the one-time setup).
 #
 #   release-keys.sh unlock [--ttl 8h] [--need ssh,gpg,apple]
@@ -182,7 +182,7 @@ preset_tool() {
 }
 
 # The reapers: one per keygrip and gpg home, whatever started it, so a second unlock (another
-# checkout, `just release`) replaces it instead of leaving one behind that fires mid-release.
+# checkout, `tests/release/just.sh release`) replaces it instead of leaving one behind that fires mid-release.
 # Record: REAPERS/<cksum of the gpg home>-<GRIP>, lines pid=, deadline= (epoch seconds), homedir=.
 reapers=${XDG_CACHE_HOME:-$HOME/.cache}/fil/release-keys
 gpg_home() { gpgconf --list-dirs homedir; }
@@ -353,7 +353,7 @@ gpg_status() {
   done
   for g in $grips; do
     if reaper_corrupt "$g"; then
-      echo "gpg    CORRUPT    the reaper record $(reaper_file "$g") is not pid=/deadline= numbers; run: just release-keys forget --need gpg"
+      echo "gpg    CORRUPT    the reaper record $(reaper_file "$g") is not pid=/deadline= numbers; run: tests/release/just.sh release-keys forget --need gpg"
       return 1
     fi
   done
@@ -362,10 +362,10 @@ gpg_status() {
   pid=$(reaper_num "$1" pid)
   left=$(($(reaper_num "$1" deadline) + 0 - $(date +%s)))
   if ! reaper_alive "$pid"; then
-    echo "gpg    NO-REAPER  the package key $fpr is cached with no reaper: a preset passphrase does not expire; run: just release-keys forget --need gpg"
+    echo "gpg    NO-REAPER  the package key $fpr is cached with no reaper: a preset passphrase does not expire; run: tests/release/just.sh release-keys forget --need gpg"
     return 1
   elif [ "$left" -le 0 ]; then
-    echo "gpg    OVERDUE    the package key $fpr is still cached past its deadline (reaper pid $pid); run: just release-keys forget --need gpg"
+    echo "gpg    OVERDUE    the package key $fpr is still cached past its deadline (reaper pid $pid); run: tests/release/just.sh release-keys forget --need gpg"
     return 1
   fi
   echo "gpg    ready      the package key $fpr is cached, forgotten in $(hms "$left") (reaper pid $pid)"

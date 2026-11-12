@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Check a release tag the way the owner's `just release-verify` does:
+# Check a release tag the way the owner's `tests/release/just.sh release-verify` does:
 #
 #   verify-tag.sh REPO TAG [MAINREF]
 #

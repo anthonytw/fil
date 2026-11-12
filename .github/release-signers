@@ -10,7 +10,7 @@
 # no private key ever: namespaces="git" verifies the signed tag (git verify-tag), and
 # namespaces="fil-release" verifies SHA256SUMS.sig (ssh-keygen -Y verify -n fil-release).
 #
-# `just release-verify` reads this file from MAIN, never from the tag being checked, so a key added
+# `tests/release/just.sh release-verify` reads this file from MAIN, never from the tag being checked, so a key added
 # only on a tag's own commit verifies nothing (tests/release/verify-tag.sh). Rotating the key is a PR
 # to main; a tag signed by a retired key stops verifying once main drops it.
 release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILrP95b5kPn5fGzawh/SRaiMekWFgRDDqHjEfnDbuUFY

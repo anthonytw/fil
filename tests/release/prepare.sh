@@ -3,7 +3,7 @@
 # plausible release. These checks catch MISTAKES. They are not the gate: on a tag push Actions runs
 # the workflow file of the tagged commit, so whoever can push a `v*` tag controls this script and
 # the signers file it reads. The gates are the tag ruleset, the draft that a person publishes and
-# `just release-verify` with the owner's signature on SHA256SUMS (docs/m4/plan.md, REL).
+# `tests/release/just.sh release-verify` with the owner's signature on SHA256SUMS (docs/m4/plan.md, REL).
 #
 # Environment (set by Actions): GITHUB_EVENT_NAME, GITHUB_REF, GITHUB_REF_NAME, GITHUB_OUTPUT.
 # Prints `version`, `epoch` and `release` (true on a tag push) to GITHUB_OUTPUT.
@@ -39,7 +39,7 @@ if [ "$event" = push ] && [[ $ref == refs/tags/v* ]]; then
   if git -C "$ROOT" show refs/remotes/origin/main:.github/release-signers 2> /dev/null | grep -Evq '^[[:space:]]*(#|$)'; then
     "$RELEASE_DIR/verify-tag.sh" "$ROOT" "$tag" refs/remotes/origin/main
   else
-    echo "::warning::.github/release-signers on main has no key (placeholder): the tag signature was NOT checked here. The owner verifies it with 'just release-verify' before publishing."
+    echo "::warning::.github/release-signers on main has no key (placeholder): the tag signature was NOT checked here. The owner verifies it with 'tests/release/just.sh release-verify' before publishing."
   fi
 elif [ "$event" = push ]; then
   die "a push that is not a v* tag started the release workflow"

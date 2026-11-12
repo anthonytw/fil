@@ -34,7 +34,7 @@ if [ -f "$ROOT/CHANGELOG.md" ]; then
   ' "$ROOT/CHANGELOG.md"
 fi
 # The macOS paragraph below is true of the published release: the owner signs and notarizes the macOS
-# binary after CI (`just release-sign-macos`, docs/m4/release.md section 10.3), before publishing.
+# binary after CI (`tests/release/just.sh release-sign-macos`, docs/m4/release.md section 10.3), before publishing.
 cat << EOT
 
 ## Verify what you downloaded
@@ -52,7 +52,7 @@ ssh-keygen -Y verify -f SIGNERS -I release -n fil-release -s SHA256SUMS.sig < SH
 **on main**. fil is GPL-3.0-or-later: each archive carries \`share/doc/fil/LICENSE\` and the
 third-party notices, \`share/doc/fil/THIRD-PARTY-NOTICES.md\`. \`fil-$v-source.tar.gz\` is the
 Corresponding Source with every dependency vendored; it builds offline. The Linux binaries and
-archives are reproducible (\`just release-verify\` rebuilds them in a pinned image).
+archives are reproducible (\`tests/release/just.sh release-verify\` rebuilds them in a pinned image).
 
 **macOS.** Download \`fil-$v-universal-apple-darwin.tar.gz\`: its \`bin/fil\` is signed with the
 owner's Developer ID (hardened runtime) and notarized by Apple, which a bare command-line binary
@@ -68,7 +68,7 @@ gh attestation verify fil-$v-universal-apple-darwin.ci.tar.gz $attest_flags
 tests/release/verify-macos.sh agree . $v
 \`\`\`
 
-\`just release-verify $v\` does all of this, and more (it also rebuilds the other archives). The macOS
+\`tests/release/just.sh release-verify $v\` does all of this, and more (it also rebuilds the other archives). The macOS
 binary itself is not independently reproduced from source by CI; \`--mac-rebuild FILE\` compares a
 build of your own with it once both signatures are normalized away.
 EOT

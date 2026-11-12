@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The macOS half of `just release-verify` (docs/m4/release.md section 10.3). verify.sh calls it; it is
+# The macOS half of `tests/release/just.sh release-verify` (docs/m4/release.md section 10.3). verify.sh calls it; it is
 # a script of its own so that the self-test can run it on signed fixtures.
 #
 #   verify-macos.sh agree  DIR VERSION
@@ -75,9 +75,9 @@ if printf '%s\n' "$info" | grep -qv ' identifier=fil '; then fail "a slice of th
 case $kinds in
   "adhoc ")
     if [ "$presign" = 1 ]; then
-      note "the macOS binary is CI's ad hoc build: not yet signed by the owner (just release-sign-macos)"
+      note "the macOS binary is CI's ad hoc build: not yet signed by the owner (tests/release/just.sh release-sign-macos)"
     else
-      fail "the macOS binary is only ad hoc signed: it is not Developer-ID signed and notarized (just release-sign-macos)"
+      fail "the macOS binary is only ad hoc signed: it is not Developer-ID signed and notarized (tests/release/just.sh release-sign-macos)"
     fi
     ;;
   "signed ")

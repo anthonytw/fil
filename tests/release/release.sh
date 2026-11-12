@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `just release X.Y.Z`: the one-command, resumable release (docs/m4/release.md section 9.5). It binds
+# `tests/release/just.sh release X.Y.Z`: the one-command, resumable release (docs/m4/release.md section 9.5). It binds
 # a run to the version and the release commit, takes the lock, runs the preflight, and works out from
 # the world (git refs, GitHub's runs and releases, crates.io, the Homebrew tap) which of the seventeen
 # steps are done, then does the next step's action and the ones after it, through `finish`. Re-run the
@@ -221,7 +221,7 @@ TAG=v$V
 W=$ROOT/target/release-verify/$V
 STATE=$W/release.state
 LOCK=$W/.lock
-AGAIN="just release $V"
+AGAIN="tests/release/just.sh release $V"
 
 # Every test-only override: a NOTE each, and refused outside the self-test.
 test_override_notes
@@ -1052,7 +1052,7 @@ print_status() {
       *) printf '  %2d/%d %-17s %-16s %s\n' "$i" "$NSTEPS" "$(step_name $i)" "$(label "$k")" "${NOTES[i]}" ;;
     esac
   done
-  echo "keys (just release-keys status):"
+  echo "keys (tests/release/just.sh release-keys status):"
   "$KEYS" status --need ssh,gpg < /dev/null 2>&1 | sed 's/^/  /' || true
 }
 
@@ -1133,7 +1133,7 @@ known_fix() {
       elif log_has 'permission denied \(publickey\)|could not read from remote'; then
         echo "ssh-add your GitHub key (ssh -T git@github.com must say Hi $PF_OWNER)"
       elif log_has 'failed to sign|no private key found|agent refused|could not sign|signing failed|incorrect passphrase|couldn.t find key|ssh-keygen.*(error|failed)'; then
-        echo "the release key is not in the agent: just release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
+        echo "the release key is not in the agent: tests/release/just.sh release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
       fi
       ;;
     tag-run | upload | publish | crates)
@@ -1155,19 +1155,19 @@ known_fix() {
       elif log_has '"status": "(Invalid|Rejected)"|status: (Invalid|Rejected)'; then
         echo "Apple rejected the notarization (its log is in target/release-verify/$V/macsign-logs); nothing was uploaded: send it to the coordinator"
       elif log_has 'agent refused|couldn.t find key|signing failed|no private key'; then
-        echo "the release key is not in the agent: just release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
+        echo "the release key is not in the agent: tests/release/just.sh release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
       elif log_has 'HTTP 5[0-9][0-9]|bad gateway|timed? ?out|connection (reset|refused)|could not resolve|network'; then
         echo "Apple, GitHub or the network failed for a moment: run it again (sign-macos.sh resumes; nothing is signed twice)"
       fi
       ;;
     sign-packages)
       if log_has 'no pinentry|bad passphrase|inappropriate ioctl|signing failed|no secret key|cannot open .*/dev/tty'; then
-        echo "the package key's passphrase is not cached in gpg-agent: just release-keys unlock --need gpg --ttl $ttl, or run it again at a terminal (it asks)"
+        echo "the package key's passphrase is not cached in gpg-agent: tests/release/just.sh release-keys unlock --need gpg --ttl $ttl, or run it again at a terminal (it asks)"
       fi
       ;;
     sign-sums)
       if log_has 'agent refused|couldn.t find key|no such identity|signing failed|incorrect passphrase|load key|no private key'; then
-        echo "the release key is not in the agent: just release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
+        echo "the release key is not in the agent: tests/release/just.sh release-keys unlock --need ssh --ttl $ttl, or run it again at a terminal (it asks)"
       fi
       ;;
     brew)
@@ -1181,7 +1181,7 @@ known_fix() {
       ;;
     finish)
       if log_has 'release-keys'; then
-        echo "forget the keys yourself: just release-keys forget --need ssh,gpg (then run it again for the summary)"
+        echo "forget the keys yourself: tests/release/just.sh release-keys forget --need ssh,gpg (then run it again for the summary)"
       fi
       ;;
   esac
@@ -1485,10 +1485,10 @@ keys_ready() {
   if ! is_tty; then
     sed 's/^/  /' "$scratch/keys.out" >&2
     report PAUSED "$NEXT" "the keys $1 are not unlocked (above), and the input is not a terminal to unlock them: nothing was done" \
-      "run it in a terminal (it asks for the passphrases once), or first: just release-keys unlock --need $1 --ttl $ttl"
+      "run it in a terminal (it asks for the passphrases once), or first: tests/release/just.sh release-keys unlock --need $1 --ttl $ttl"
   fi
   log "unlocking the keys the remaining steps need ($1), for $ttl"
-  "$KEYS" unlock --need "$1" --ttl "$ttl" || report FAILED "$NEXT" "release-keys.sh unlock --need $1 failed (it says why above)" "fix that (just release-keys status --need $1), then run it again"
+  "$KEYS" unlock --need "$1" --ttl "$ttl" || report FAILED "$NEXT" "release-keys.sh unlock --need $1 failed (it says why above)" "fix that (tests/release/just.sh release-keys status --need $1), then run it again"
 }
 
 # ---- the actions of steps 5-12.
@@ -1790,7 +1790,7 @@ act_publish() {
   # the crates wait or a failure (a failure to forget is reported, and does not stop the release)
   echo "release-keys.sh forget --need ssh,gpg" >> "$STEP_LOG"
   "$KEYS" forget --need ssh,gpg < /dev/null >> "$STEP_LOG" 2>&1 \
-    || log "WARNING: release-keys.sh forget failed (the log says why): forget them yourself, just release-keys forget --need ssh,gpg"
+    || log "WARNING: release-keys.sh forget failed (the log says why): forget them yourself, tests/release/just.sh release-keys forget --need ssh,gpg"
   pub_confirm publish
   # The answer may have taken hours: the draft is read again, every step must still hold, and the
   # draft must hold exactly the release's files, each the one step 12 verified (any writer can
@@ -2056,7 +2056,7 @@ act_finish() {
     echo "  install test     $t"
     echo "  AUR              $aur/PKGBUILD (rendered, not published)"
     [ ! -d "$SHARED" ] || echo "  for the coordinator: $SHARED/SHA256SUMS and SHA256SUMS.sig"
-    echo "  keys             forgotten (just release-keys status)"
+    echo "  keys             forgotten (tests/release/just.sh release-keys status)"
   } | tee -a "$STEP_LOG"
 }
 

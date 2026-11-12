@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# `just release-sign-packages VERSION`: the owner signs the release's two .rpm packages on their own
+# `tests/release/just.sh release-sign-packages VERSION`: the owner signs the release's two .rpm packages on their own
 # machine, never in CI (decided, owner 2026-11-04: D3, under N4), then rewrites SHA256SUMS and signs
 # it with OpenPGP too (docs/m4/release.md section 10.4).
 #
 #   sign-packages.sh VERSION [DIR]
 #
-#   DIR   the release files that `just release-verify VERSION --pre-sign` verified (default
+#   DIR   the release files that `tests/release/just.sh release-verify VERSION --pre-sign` verified (default
 #         target/release-verify/VERSION/files). They are changed IN PLACE: the two .rpm files gain
 #         a signature, SHA256SUMS is rewritten and SHA256SUMS.asc is written. Nothing is uploaded.
 #         Before it changes anything it writes DIR/.signed-locally (a dotfile: release-check and
-#         the upload commands do not see it), so that a later `just release-verify` in download
+#         the upload commands do not see it), so that a later `tests/release/just.sh release-verify` in download
 #         mode moves DIR aside instead of deleting these not-yet-uploaded files (verify.sh).
 #
 # The key is the one .github/package-signing-key.asc holds (its fingerprint is used to pick it from
@@ -28,7 +28,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: sign-packages.sh VERSION [DIR]"
 version=${1#v}
 dir=${2:-$REPO_ROOT/target/release-verify/$version/files}
-[ -d "$dir" ] || die "no directory $dir (run just release-verify $version --pre-sign first)"
+[ -d "$dir" ] || die "no directory $dir (run tests/release/just.sh release-verify $version --pre-sign first)"
 dir=$(cd "$dir" && pwd)
 gpg=${FIL_GPG:-gpg}
 rpmsign=${FIL_RPMSIGN:-rpmsign}

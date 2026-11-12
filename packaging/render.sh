@@ -6,7 +6,7 @@
 #   brew      packaging/homebrew/fil.rb.in       -> OUTDIR/fil.rb
 #   aur       packaging/aur/PKGBUILD.in, SRCINFO.in -> OUTDIR/PKGBUILD, OUTDIR/.SRCINFO
 #   SUMS      the release's SHA256SUMS (the one the owner signed: check it against SHA256SUMS.sig,
-#             or take it from `just release-verify`'s work directory, before rendering)
+#             or take it from `tests/release/just.sh release-verify`'s work directory, before rendering)
 #   URL_BASE  where the archives are (default: the GitHub Release of vVERSION); a test may point it
 #             at a local directory (file://...)
 #

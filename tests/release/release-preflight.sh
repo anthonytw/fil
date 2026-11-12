@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `just release-preflight X.Y.Z`: everything a release needs, checked before anything is done
+# `tests/release/just.sh release-preflight X.Y.Z`: everything a release needs, checked before anything is done
 # (docs/m4/release.md section 9.4). Read-only: it changes nothing in the clone, on GitHub or on
 # Gitea, and pulls nothing. Its traces: a dangling signed commit object (the commit-signing check:
 # `git commit-tree -S` of the empty tree), which `git gc` removes; in the VM, a removed container,
@@ -12,7 +12,7 @@
 #   release-preflight.sh --list
 #
 #   --from STEP    only the checks that STEP and the steps after it need (default: the first step,
-#                  so every check). The steps are those of `just release` (PR 3; `--list` shows the
+#                  so every check). The steps are those of `tests/release/just.sh release` (PR 3; `--list` shows the
 #                  map): a resume at `crates` does not need the VM.
 #   --only CHECKS  exactly these checks (comma-separated), plus the override check, which always runs.
 #   --commit SHA   the release commit R the run is bound to: HEAD must be R, and R on --origin's main
@@ -56,8 +56,8 @@ PF_KEY_WARN_DAYS=60
 PF_OVERRIDES=$(printf '%s\n' $TEST_OVERRIDES | grep -vx FIL_RELEASE_SELFTEST | tr '\n' ' ')
 
 # The checks, in the order they run.
-PF_CHECKS="overrides tools lock disk tree version lockfiles github-main gh github-ssh commit-signing crates-env tag-ruleset tag-free docker vm release-key package-key apple"
-# The steps of `just release` (docs: the design's section 5), in order.
+PF_CHECKS="overrides tools lock disk tree recipes version lockfiles github-main gh github-ssh commit-signing crates-env tag-ruleset tag-free docker vm release-key package-key apple"
+# The steps of `tests/release/just.sh release` (docs: the design's section 5), in order.
 PF_STEPS="candidate mirror dry-run dry-verify tag tag-run verify-presign sign-macos sign-packages sign-sums upload verify-signed publish verify-published crates brew finish"
 
 # pf_step_checks STEP: the checks STEP needs (besides the ones every invocation runs).
@@ -91,7 +91,7 @@ pf_step_after_tag() {
   return 1
 }
 # Checked on every invocation, whatever the remaining steps are.
-PF_ALWAYS="overrides tools lock disk tree"
+PF_ALWAYS="overrides tools lock disk tree recipes"
 
 # pf_checks_from STEP: the checks for STEP and every step after it, in PF_CHECKS order.
 pf_checks_from() {
@@ -244,7 +244,7 @@ pf_check_lock() {
     pf_fail "another release run (pid $pid) holds $l" "two runs at once" "wait for it, or stop it (kill $pid)"
     return 1
   fi
-  pf_warn "a stale lock (pid ${pid:-unknown} is not running): $l; just release removes it (or: rm -r '$l')"
+  pf_warn "a stale lock (pid ${pid:-unknown} is not running): $l; tests/release/just.sh release removes it (or: rm -r '$l')"
 }
 
 # pf_avail_kib DF ARGS...: the free KiB that `DF ARGS` (POSIX df -Pk) reports ("" if unknown).
@@ -311,6 +311,18 @@ pf_check_tree() {
     if [ -n "$PF_COMMIT" ]; then pf_ok "clean, HEAD is the bound release commit $head, on $PF_ORIGIN's main"; else pf_ok "clean, HEAD is $PF_ORIGIN's main: release commit $head"; fi
   fi
   return "$bad"
+}
+# The release path reads tests/release/release.just (owned) alone, never the justfile (unowned):
+# tests/release/recipes.sh, on the clone's tree.
+pf_check_recipes() {
+  local out
+  if out=$("$RELEASE_DIR/recipes.sh" "$ROOT" 2>&1); then
+    pf_ok "${out#recipes: }"
+  else
+    pf_fail "$(printf '%s' "$out" | sed 's/^recipes: //' | tr '\n' ' ')" "a release path that reads a file with no code owner (the justfile, or one release.just imports)" \
+      "a PR on Gitea that keeps tests/release/release.just self-contained and the release scripts on tests/release/just.sh (tests/release/recipes.sh says what it requires), merged to main"
+    return 1
+  fi
 }
 # The release commit: what the tree check found, or HEAD.
 pf_r() { [ -n "$PF_R" ] || PF_R=$(pf_git rev-parse -q --verify 'HEAD^{commit}' 2> /dev/null || true); echo "$PF_R"; }

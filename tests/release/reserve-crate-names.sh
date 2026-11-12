@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `just reserve-crate-names`: reserve the crates.io names of the nine published crates with a 0.0.1
+# `tests/release/just.sh reserve-crate-names`: reserve the crates.io names of the nine published crates with a 0.0.1
 # placeholder each (docs/m4/release.md section 10; docs/m4/plan.md OQ-3, decided by the owner
 # 2026-11-04). Run by whoever holds the publishing crates.io account, after `cargo login`. No
 # crates.io token goes to CI, and nothing here publishes the real workspace crates: each placeholder is

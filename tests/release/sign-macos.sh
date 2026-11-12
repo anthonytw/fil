@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `just release-sign-macos X.Y.Z`: the owner signs and notarizes the macOS binary on their own Mac,
+# `tests/release/just.sh release-sign-macos X.Y.Z`: the owner signs and notarizes the macOS binary on their own Mac,
 # never in CI (decided, owner 2026-11-04: N4; docs/m4/release.md section 10.3).
 #
 #   sign-macos.sh VERSION [--repo OWNER/REPO] [--work DIR] [--force]
@@ -33,7 +33,7 @@
 #   8. verifies that signature against the signers;
 #   9. uploads the archive, SHA256SUMS and SHA256SUMS.sig to the draft (gh release upload --clobber).
 # The results are staged in DIR/macsign-staged and copied over the verified files (so that
-# `just release-sign-packages` continues from them) only after the upload succeeded. If the upload
+# `tests/release/just.sh release-sign-packages` continues from them) only after the upload succeeded. If the upload
 # stops half way, run this script again: the draft still holds CI's .ci archive, which is all it needs.
 #
 # Environment: FIL_CODESIGN_IDENTITY (the certificate's name, as in the keychain; default DEFAULT_CODESIGN_IDENTITY in common.sh; `-`
@@ -89,9 +89,9 @@ scratch=$work/macsign
 mkdir -p "$logs"
 
 # ---- 1. what was verified, and the local checks again
-[ -f "$work/verified" ] || die "STOP: $work/verified is missing: run the full verification first: just release-verify $version --pre-sign"
+[ -f "$work/verified" ] || die "STOP: $work/verified is missing: run the full verification first: tests/release/just.sh release-verify $version --pre-sign"
 for l in rebuild=1 dry=0 "sums=$(sha256 "$dl/SHA256SUMS" 2> /dev/null || echo none)"; do
-  grep -qx "$l" "$work/verified" || die "STOP: $work/verified does not say '$l': the files in $dl are not the ones the full 'just release-verify $version --pre-sign' verified. Run it again."
+  grep -qx "$l" "$work/verified" || die "STOP: $work/verified does not say '$l': the files in $dl are not the ones the full 'tests/release/just.sh release-verify $version --pre-sign' verified. Run it again."
 done
 if grep -qx 'macos=signed' "$work/verified" && [ "$force" = 0 ]; then
   die "STOP: this release is already signed (macos=signed in $work/verified); pass --force to sign and notarize again"
@@ -127,7 +127,7 @@ while read -r kind name digest; do
     "$gh" release download "$tag" --repo "$repo" -p "$name" -D "$work/dlcheck" || die "STOP: cannot download $name"
     digest=$(sha256 "$work/dlcheck/$name")
   fi
-  grep -qx "$name $digest" "$work/allowed" || die "STOP: the draft's $name is not what was verified (digest $digest): the draft changed since 'just release-verify $version --pre-sign'. Verify it again."
+  grep -qx "$name $digest" "$work/allowed" || die "STOP: the draft's $name is not what was verified (digest $digest): the draft changed since 'tests/release/just.sh release-verify $version --pre-sign'. Verify it again."
   echo "$name" >> "$seen"
 done <<< "$listing"
 for f in "$dl"/*; do
@@ -229,9 +229,9 @@ log "SHA256SUMS.sig is a valid fil-release signature by $principal"
 
 # ---- 9. upload to the draft (the results are in $staged; the verified files are not changed yet)
 if ! (cd "$staged" && "$gh" release upload "$tag" --repo "$repo" --clobber "$archive" SHA256SUMS SHA256SUMS.sig); then
-  die "the upload stopped part way. The draft still holds CI's $ci_archive, which is all this needs: run 'just release-sign-macos $version' again (it signs and notarizes once more)."
+  die "the upload stopped part way. The draft still holds CI's $ci_archive, which is all this needs: run 'tests/release/just.sh release-sign-macos $version' again (it signs and notarizes once more)."
 fi
 cp "$staged/$archive" "$staged/SHA256SUMS" "$staged/SHA256SUMS.sig" "$dl/"
 printf 'sums=%s\nrebuild=1\npresign=1\ndry=0\nmacos=signed\n' "$(sha256 "$dl/SHA256SUMS")" > "$work/verified"
-log "uploaded $archive, SHA256SUMS and SHA256SUMS.sig to the draft $tag (SHA256SUMS.sig now covers unsigned rpms until 'just release-sign-packages' and the signing after it)"
-log "next: just release-sign-packages $version (docs/m4/release.md section 9.2)"
+log "uploaded $archive, SHA256SUMS and SHA256SUMS.sig to the draft $tag (SHA256SUMS.sig now covers unsigned rpms until 'tests/release/just.sh release-sign-packages' and the signing after it)"
+log "next: tests/release/just.sh release-sign-packages $version (docs/m4/release.md section 9.2)"

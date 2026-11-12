@@ -1,18 +1,28 @@
-# Code owners (docs/m4/plan.md, REL). The files that decide what a release is, and who may sign it,
-# need the owner's review. This takes effect only with the "require review from Code Owners"
-# setting of the main ruleset, which is the owner's to turn on.
+# Code owners (docs/m4/plan.md, REL; narrowed on 2026-11-11, owner). Only the files that decide what a
+# release is, or who may sign it, need the owner's review, not every PR. This takes effect only with
+# the "require review from Code Owners" setting of the main ruleset, which is the owner's to turn on.
+#
+# The last pattern that matches a file wins, and a pattern with no owner leaves it unowned. So the
+# directories below are owned as a whole and the few files that need no owner are named after them:
+# a NEW file in them (a release script, a workflow that could ask for a token or a secret) is owned
+# until someone unowns it here, which itself needs the owner.
+/.github/CODEOWNERS @anthonytw
 /.github/release-signers @anthonytw
 /.github/package-signing-key.asc @anthonytw
+/.github/macos-team-id @anthonytw
 /.github/workflows/** @anthonytw
-/.github/CODEOWNERS @anthonytw
 /tests/release/** @anthonytw
 /Cross.toml @anthonytw
 /rust-toolchain.toml @anthonytw
-/.github/macos-team-id @anthonytw
-# What else decides what a release is: the recipes `ci` and the release run, the workspace manifest
-# (profile, version, patches), the dependency and notice policy and its template, cargo and git
-# settings that would reach the builds, the packaging templates and the Nix flake, and the man-page toolchain installer (docs/m4/plan.md, DOC).
-/justfile @anthonytw
+# rustup prefers this name over rust-toolchain.toml when both exist; listed so that adding it needs the owner.
+/rust-toolchain @anthonytw
+# What else decides what a release is: the workspace manifest (profile, version, patches, and cross's
+# metadata), the dependency and notice policy and its template, cargo and git settings that would
+# reach the builds, the packaging templates, the Nix flake (the Nix channel's build), and the man
+# pages' toolchain, build and pandoc filter (docs/m4/plan.md, DOC). The release path's recipes are
+# tests/release/release.just (owned above), which reads no other file: release.yml,
+# the release scripts and the owner run it through tests/release/just.sh, never the top-level justfile
+# (tests/release/recipes.sh, and lint-workflow.sh's rule 9).
 /Cargo.toml @anthonytw
 /deny.toml @anthonytw
 /about.toml @anthonytw
@@ -22,5 +32,16 @@
 /packaging/** @anthonytw
 /flake.nix @anthonytw
 /flake.lock @anthonytw
-/docs/man/install-pandoc.sh @anthonytw
-/docs/man/build.sh @anthonytw
+/docs/man/** @anthonytw
+# Unowned. The justfile (nothing on the release path reads it, above). The manual check workflows use
+# no secret and ask for no write permission (contents and actions: read only), which the owned
+# lint-workflow.sh --check requires, run by release.yml's prepare job and by the owned `release-test`
+# recipe before selftest.sh; a dispatch on a ci/ branch runs that branch's copy of them anyway. The
+# release scripts' own tests: release.yml runs them in a job of their own whose writes reach no
+# other job, and they build nothing that ships. And the fil(1) page, which is text.
+/.github/workflows/linux-check.yml
+/.github/workflows/macos-check.yml
+/tests/release/selftest.sh
+/tests/release/selftest_macho.py
+/tests/release/selftest_pkg.py
+/docs/man/fil.1

@@ -2,13 +2,13 @@
 #
 #   push of a `v*` tag   builds the release files and opens a DRAFT GitHub Release with build
 #                        provenance attestations. Never published: the owner runs
-#                        `just release-verify`, signs SHA256SUMS offline and publishes the draft.
+#                        `tests/release/just.sh release-verify`, signs SHA256SUMS offline and publishes the draft.
 #   workflow_dispatch    a DRY RUN from any ref (`gh workflow run release.yml --ref BRANCH`): the same
 #                        builds and checks, artifacts uploaded to the run. Nothing is published, no
 #                        attestation is made, and the jobs it runs have no `id-token` or
 #                        `attestations` permission at all.
 #
-# Supply chain, enforced by `just release-test` (tests/release/lint-workflow.sh):
+# Supply chain, enforced by tests/release/lint-workflow.sh (the prepare job and `release-test` run it):
 #   - every action is pinned by full commit SHA (the comment names the tag; to bump one, resolve the
 #     tag to its commit with `gh api repos/OWNER/REPO/git/ref/tags/TAG`, dereferencing an annotated
 #     tag, and change the SHA and the comment together);
@@ -16,6 +16,8 @@
 #     builds in are pinned by digest in Cross.toml;
 #   - no secret, no cache, no `pull_request_target`; `--locked` on every cargo and cross build;
 #     checkout leaves no token in .git/config;
+#   - no step runs `just` itself: recipes run as `tests/release/just.sh RECIPE`, which reads only the
+#     owned tests/release/release.just, never the unowned top-level justfile;
 #   - only the `publish` job has `contents: write`, `id-token: write` and `attestations: write`, and
 #     it runs only on a `v*` tag push;
 #   - the `crates-io` job (crates.io by trusted publishing, N8) also runs only on a `v*` tag push,
@@ -23,7 +25,7 @@
 #     owner's approval. Approve it after publishing the GitHub Release: it refuses a release that
 #     is still a draft or has no SHA256SUMS.sig.
 # A workflow file on some other branch could still ask for an `id-token`. The attestation's real
-# check is the narrow one in `just release-verify` (`gh attestation verify --repo --cert-identity
+# check is the narrow one in `tests/release/just.sh release-verify` (`gh attestation verify --repo --cert-identity
 # --source-ref --source-digest --signer-digest --deny-self-hosted-runners`), plus the tag ruleset that keeps anyone else from creating a `v*` tag. The tag
 # checks in `prepare` catch mistakes; they are not the gate (tests/release/prepare.sh).
 name: release
@@ -65,12 +67,24 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          # cargo-about renders the notices; the version is pinned in the justfile too, and
-          # `just notices` refuses any other.
-          tool: just@1.59.0,cargo-about@0.9.3
+          # cargo-about renders the notices; the version is pinned in tests/release/release.just too, and
+          # `just notices` refuses any other. cargo-deny checks the lock below (the same version as the
+          # check workflows').
+          tool: just@1.59.0,cargo-about@0.9.3,cargo-deny@0.20.2
       - name: Version, source date and tag checks
         id: prepare
         run: tests/release/prepare.sh
+      # Every recipe below runs through tests/release/just.sh, which reads only the owned
+      # tests/release/release.just, never the top-level justfile (it has no code owner).
+      - name: The release recipes are tests/release/release.just's, which is self-contained
+        run: tests/release/recipes.sh
+      # The owned lints, whatever the unowned selftest.sh (the release-test job) says: this
+      # workflow's rules, and the read-only profile of the two check workflows, which have no code
+      # owner.
+      - name: The workflows' lint (release.yml, and the check workflows read-only)
+        run: |
+          tests/release/lint-workflow.sh .github/workflows/release.yml
+          tests/release/lint-workflow.sh --check .github/workflows/linux-check.yml .github/workflows/macos-check.yml
       - name: The crates-io environment requires the owner's review (a warning on a dry run)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -82,15 +96,45 @@ jobs:
             tests/release/crates-io-gate.sh --environment-only --warn
           fi
       - name: The release tree's dependency graph
-        run: just release-deps
+        run: tests/release/just.sh release-deps
+      # Cargo.lock has no code owner; deny.toml (owned) bounds what it may name, here on the release
+      # path itself and not only in the unowned `just ci`: crates.io only, no unknown registry or git
+      # source, the bans and the license list. Deterministic: no advisory database (the RustSec
+      # advisories change with the date, and `just ci` and the dry run's suite=all check them before
+      # the tag). lint-workflow.sh rule 11 keeps this step here.
+      - name: The lock's sources, bans and licenses are deny.toml's (cargo deny, offline policy)
+        run: cargo deny --locked check bans licenses sources
       - name: Notices (THIRD-PARTY-NOTICES.md is current for the release graph; package.sh ships it)
-        run: just notices
+        run: tests/release/just.sh notices
       - name: Lint the release scripts
-        run: shellcheck -x -S warning tests/release/*.sh
-      - name: The release scripts' own tests (workflow lint, tag signers, release-check)
-        run: just release-test
+        # --norc: no .shellcheckrc of the tree turns a check off
+        run: shellcheck --norc -x -S warning tests/release/*.sh
       - name: The nine crates package and build for crates.io (a dry run; nothing is uploaded)
-        run: just crates-check
+        run: tests/release/just.sh crates-check
+
+  release-test:
+    # The release scripts' own tests, in a job of their own: selftest.sh has no code owner, so it
+    # runs where nothing it writes ($GITHUB_ENV, $GITHUB_PATH, the workspace) reaches an owned step
+    # of another job. publish waits for it. After package: every artifact name the release jobs
+    # download is taken by then (upload-artifact refuses a duplicate), so nothing this job could
+    # upload with the runner's token can stand in for one.
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: just@1.59.0
+      - name: The release scripts' own tests (workflow lint, tag signers, release-check)
+        run: tests/release/just.sh release-test
 
   build-linux:
     needs: prepare
@@ -332,7 +376,7 @@ jobs:
   publish:
     # The only job with write permissions, and only on a tag push. It makes a DRAFT.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [prepare, package, smoke-macos, packages-arm64]
+    needs: [prepare, release-test, package, smoke-macos, packages-arm64]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

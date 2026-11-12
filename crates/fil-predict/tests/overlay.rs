@@ -2138,6 +2138,95 @@ fn a_backspace_blank_overwritten_by_the_next_key_is_confirmed() {
     assert_eq!((s.confirmed, s.mispredicted.contradicted), (0, 1), "{s:?}");
 }
 
+/// A later key explains an overwrite in place only where its own echo lands (review pr87 N1):
+/// Enter's echo is CR LF, a Left only moves the cursor, and a Backspace erases the one character
+/// before the cursor. So a masking prompt's `x\b*` or a redraw's `x\r$ a*` stays contradicted
+/// with Enter or a Left typed after the guess, and with `x`, `y` and a Backspace, the Backspace
+/// explains the overwrite of `y`'s cell, not of `x`'s.
+#[test]
+fn a_later_key_explains_only_the_overwrite_its_echo_makes() {
+    // (confirmed, contradicted) for each case, compared at once, so a failure shows them all.
+    let mut got = Vec::new();
+    // The keys typed after `x`. Nothing after Enter or a paste is followed, a Backspace or an
+    // insert at `x`'s cell included (review pr87-n1 M5); a Left at the start of the line is a
+    // no-op, so the Rights after three Lefts take the cursor past `x` (review pr87-n1 N1).
+    for (keys, chunk) in [
+        (&[&b"\r"[..]][..], &b"x\x08*\r\n"[..]),
+        (&[b"\x1b[D"], b"x\x08*\x08"),
+        (&[b"\r"], b"x\r$ a*\r\n"),
+        (&[b"\r", b"\x7f"], b"x\x08*\r\n"),
+        (&[b"\x1b[200~b\x1b[201~", b"\x1b[D", b"z"], b"x\x08*"),
+        (
+            &[b"\x1b[D", b"\x1b[D", b"\x1b[D", b"\x1b[C", b"\x1b[C", b"z"],
+            b"x\x08*",
+        ),
+    ] {
+        let mut t = fixed(vec![(0, 2), (0, 3)]);
+        t.confirm(); // `$ a`, the guess at (0, 2)
+        assert!(!t.key(b"x", 200).paint.is_empty(), "x not written");
+        for (n, k) in (0..).zip(keys) {
+            t.key(k, 210 + 10 * n);
+        }
+        t.server(chunk, 300);
+        let s = t.o.stats();
+        got.push((
+            chunk.escape_ascii().to_string(),
+            (s.confirmed, s.mispredicted.contradicted),
+        ));
+    }
+    // `x` and `y` written, the Backspace not guessed (the fixed cells are used up): `y` is the
+    // one it erases, `x` is contradicted.
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 4)]);
+    t.confirm();
+    assert!(!t.key(b"x", 200).paint.is_empty(), "x not written");
+    assert!(!t.key(b"y", 210).paint.is_empty(), "y not written");
+    t.key(b"\x7f", 220);
+    let chunk = b"x\x08*y\x08*\x08 \x08";
+    t.server(chunk, 300);
+    let s = t.o.stats();
+    got.push((
+        chunk.escape_ascii().to_string(),
+        (s.confirmed, s.mispredicted.contradicted),
+    ));
+    let want: Vec<_> = got
+        .iter()
+        .zip([(0, 1), (0, 1), (0, 1), (0, 1), (0, 1), (0, 1), (1, 1)])
+        .map(|((c, _), w)| (c.clone(), w))
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// An insert or a delete left of a guess redraws the rest of the line over its cell, so the
+/// key explains the overwrite (review pr87-n1 S1): `x`, `y`, Left, Left, `z` echoed by readline
+/// as `xy\b\bzxy\b\b`, and `x`, `y`, Left, Backspace as `xy\b\by \b\b`, confirm both guesses.
+#[test]
+fn an_insert_or_a_delete_left_of_a_guess_explains_its_redraw() {
+    for (keys, chunk) in [
+        (
+            &[&b"\x1b[D"[..], b"\x1b[D", b"z"][..],
+            &b"xy\x08\x08zxy\x08\x08"[..],
+        ),
+        (&[b"\x1b[D", b"\x7f"], b"xy\x08\x08y \x08\x08"),
+    ] {
+        // `x` and `y` written; the keys after them not guessed (the fixed cells are used up).
+        let mut t = fixed(vec![(0, 2), (0, 3), (0, 4)]);
+        t.confirm();
+        assert!(!t.key(b"x", 200).paint.is_empty(), "x not written");
+        assert!(!t.key(b"y", 210).paint.is_empty(), "y not written");
+        for (n, k) in (0..).zip(keys) {
+            t.key(k, 220 + 10 * n);
+        }
+        t.server(chunk, 300);
+        let s = t.o.stats();
+        assert_eq!(
+            (s.confirmed, s.mispredicted.total()),
+            (2, 0),
+            "{}: {s:?}",
+            chunk.escape_ascii()
+        );
+    }
+}
+
 /// Content a scroll, shift or erase moves into a guessed cell is not a draw: an unechoed `q`,
 /// and a `q` one row down pulled into its cell by a delete-line before a clear, is `ended`.
 #[test]

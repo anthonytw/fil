@@ -416,8 +416,9 @@ pred_tag_run() { rv_has "$1" "workflowName release" && rv_has "$1" "event push" 
 # run_ours ID: a dispatched run that is this release's: triggered by the gh user running the command
 # and created no earlier than the state was bound to the release commit (bound_at, 5 minutes of clock
 # slack; R can sit on GitHub's main for days before the release, so R's own commit time would let an
-# older run in, of another `ref` input, which GitHub does not report). A state that lost bound_at, or
-# none yet, falls back to R's commit time. The workflows' inputs are
+# older run in, of another `ref` input, which GitHub does not report). A run sets BOUND_AT before its
+# first detection (a new or reset state: now); without it (--status of a state that has none) no
+# listed run is this release's. The workflows' inputs are
 # not reported, so a run found by listing, not dispatched and recorded by the command, needs this.
 # 0 yes, 1 no, 2 GitHub could not be asked.
 GH_USER=''
@@ -426,8 +427,8 @@ run_ours() {
   [ -n "$GH_USER" ] || GH_USER=$(gh_read api user --jq .login) || return 2
   [ -n "$GH_USER" ] || return 2
   out=$(gh_read api "repos/$repo/actions/runs/$1" --jq '[.triggering_actor.login // "", .created_at // ""] | @tsv') || return 2
-  gt=$(st_num bound_at)
-  [ -n "$gt" ] || gt=$(rg show -s --format=%ct "$G" 2> /dev/null) || return 2
+  gt=${BOUND_AT:-$(st_num bound_at)}
+  is_num "$gt" || return 1
   printf '%s\n' "$out" | python3 -I -c 'import datetime, sys
 user, gt = sys.argv[1], int(sys.argv[2])
 f = (sys.stdin.read().rstrip("\n").split("\t") + ["", ""])[:2]
@@ -1298,6 +1299,8 @@ act_mirror() {
   if [ "$now" = "$R" ] || rg merge-base --is-ancestor "$R" "$now"; then
     echo "$github's main is $now now, which has the release commit $R: nothing to push" >> "$STEP_LOG"
     log "$github's main moved to $(short "$now") during the confirmation, and has the release commit: nothing to push"
+    # the tag step verifies against refs/remotes/$github/main, which must have caught up
+    rg fetch -q --no-tags "$github" 2>> "$STEP_LOG" || step_fail "git fetch $github failed" "run it again"
     return 0
   fi
   rg merge-base --is-ancestor "$now" "$R" \
@@ -2195,6 +2198,11 @@ hard_stop() {
   report FAILED "$HARD_STEP" "$HARD" "this version is burned: bump to the next patch version (a PR on Gitea: just set-version), and release that"
 }
 
+# The window for runs found by listing opens when the state is bound (run_ours): now, for a new or
+# reset state, so no run from before this release's first run counts. Written to the state below,
+# once the detection has not refused the checkout.
+BOUND_AT=$(st_num bound_at)
+[ -n "$BOUND_AT" ] || BOUND_AT=$(date -u +%s)
 detect_all
 if [ "$TAG_STATE" = mismatch ]; then
   LAST_DONE=0
@@ -2202,7 +2210,7 @@ if [ "$TAG_STATE" = mismatch ]; then
 fi
 st_set version "$V"
 st_set release_commit "$R"
-[ -n "$(st_num bound_at)" ] || st_set bound_at "$(date -u +%s)"
+st_set bound_at "$BOUND_AT"
 record_found
 main_stop
 hard_stop

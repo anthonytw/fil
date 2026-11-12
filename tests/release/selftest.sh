@@ -3000,6 +3000,16 @@ rm -f "$RSTATE"
 ra_expect "release actions: ...the state deleted: foreign and older running runs are not attached to" 2 'PAUSED at step 5/17 tag' < /dev/null
 calls_are 1 5 0 1
 expect_pass "release actions: ...two new runs, and this release's macos-check run kept" sh -c 'grep -qx dry_run=104 "$1" && grep -qx checks_linux=105 "$1" && grep -qx checks_macos=103 "$1"' sh "$RSTATE"
+# a fresh state (the first run, or a deleted one): a green suite=all run on R created before this
+# run, though after R's commit time, is not this release's: it is passed over and dispatched again
+ra_reset
+ra_expect "release actions: a first run through dry-verify" 2 'PAUSED at step 5/17 tag' -- --confirm-each <<< "0.9.0"
+calls_are 1 3 0 1
+rm -f "$RSTATE"
+python3 -I -c 'import json, sys, time; r = json.load(open(sys.argv[1])); r["created"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 301)); json.dump(r, open(sys.argv[1], "w"))' "$rs/world/runs/102.json"
+ra_expect "release actions: ...the state deleted: a green run from before the new bind is not attached" 2 'PAUSED at step 5/17 tag' < /dev/null
+calls_are 1 4 0 2
+expect_pass "release actions: ...a new linux-check run is dispatched and recorded, the others kept" sh -c 'grep -qx dry_run=101 "$1" && grep -qx checks_linux=104 "$1" && grep -qx checks_macos=103 "$1" && grep -Eqx "bound_at=[0-9]+" "$1"' sh "$RSTATE"
 # a recorded run GitHub no longer has: forgotten, and the step goes on as if none was recorded
 ra_reset
 ra_expect "release actions: a wait that dies, once more" 1 'FAILED at step 3/17 dry-run' FAKE_WATCH_FAIL=1 <<< "0.9.0"
@@ -3086,7 +3096,7 @@ grep -Ev '^(checks_linux|bound_at)=' "$rs/state.k" > "$RSTATE"
 echo "bound_at=$(($(date -u +%s) + 3600))" >> "$RSTATE"
 rl_kind 3 dry-run next "a run from before the bind is not attached"
 grep -Ev '^(checks_linux|bound_at)=' "$rs/state.k" > "$RSTATE"
-rl_kind 3 dry-run "done (checked)" "...a state without bound_at falls back to R's commit time"
+rl_kind 3 dry-run next "...a state without bound_at: no listed run counts"
 cp "$rs/run102.saved" "$rs/world/runs/102.json"
 grep -v '^checks_linux=' "$rs/state.k" > "$RSTATE"
 cp "$rs/world/runs/102.json" "$rs/run102.saved"
@@ -3146,7 +3156,7 @@ rl_kind 6 tag-run next
 GMOVED=$(gh_move_main "$RG")
 expect_fail "release run: after the tag, GitHub's main past R with a commit only GitHub has stops the run" rl
 last
-expect_pass "release run: ...saying its commits must reach Gitea's main, not that the version is burned" sh -c 'grep -q "FAILED at step 6/17 tag-run" "$1" && grep -q "with commits Gitea.s main (origin/main) lacks" "$1" && ! grep -q "this version is burned" "$1"' sh "$rs/last.log"
+expect_pass "release run: ...saying its commits must reach Gitea's main, not that the version is burned" sh -c 'grep -q "FAILED at step 6/17 tag-run" "$1" && grep -q "with commits Gitea.s main (origin/main) lacks" "$1" && ! grep -q "this version is burned" "$1" && ! grep -q "^preflight: " "$1"' sh "$rs/last.log"
 rls > "$rs/status.out" 2>&1 || true
 expect_pass "release status: ...and --status warns of it" grep -q "WARNING: github's main .* with commits Gitea's main (origin/main) lacks" "$rs/status.out"
 RS_SIG=$({ pg show "$RG:.github/release-signers"; echo '# changed'; } | pg hash-object -w --stdin)
@@ -3157,7 +3167,7 @@ git --git-dir="$pf/github.git" fetch -q "$pf/clone" "+$RS_SIG:refs/heads/main"
 git --git-dir="$pf/origin.git" fetch -q "$pf/clone" "+$RS_SIG:refs/heads/main"
 expect_fail "release run: after the tag, GitHub's main (on Gitea's main) with another release-signers stops the run" rl
 last
-expect_pass "release run: ...saying the signers differ from the release commit's" sh -c 'grep -q "FAILED at step 6/17 tag-run" "$1" && grep -q "has a .github/release-signers that differs from the release commit" "$1"' sh "$rs/last.log"
+expect_pass "release run: ...saying the signers differ from the release commit's, before the preflight runs" sh -c 'grep -q "FAILED at step 6/17 tag-run" "$1" && grep -q "has a .github/release-signers that differs from the release commit" "$1" && ! grep -q "^preflight: " "$1"' sh "$rs/last.log"
 git --git-dir="$pf/github.git" update-ref refs/heads/main "$RG"
 git --git-dir="$pf/origin.git" update-ref refs/heads/main "$RR"
 pg fetch -q origin

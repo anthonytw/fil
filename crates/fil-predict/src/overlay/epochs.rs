@@ -80,6 +80,11 @@ pub struct Mispredicted {
     pub ended: u64,
     /// The predictor withdrew it.
     pub withdrawn: u64,
+    /// A gate retraction (decided, owner 2026-11-11; `docs/m3/plan.md` §2.5): taken off the
+    /// screen in a server-output chunk before its echo came (a painting gate closed, or its
+    /// epoch ended there), its cell still blank, and the next glyph its cell then showed was its
+    /// own. The user saw a correct glyph go and come back, never a wrong one.
+    pub hidden: u64,
 }
 
 impl Mispredicted {
@@ -90,6 +95,13 @@ impl Mispredicted {
             + self.password
             + self.ended
             + self.withdrawn
+            + self.hidden
+    }
+
+    /// The mispredictions that ended what was written (all but `hidden`, whose guess may still
+    /// be pending in a confirmed epoch): what the adversarial bar counts runs after.
+    pub fn ending(&self) -> u64 {
+        self.total() - self.hidden
     }
 }
 
@@ -217,6 +229,23 @@ pub(crate) struct Guess {
     /// boundary: it stays drawn until it settles, but belongs to no epoch the core is confirming
     /// (`Guards::keep_on_boundary`).
     kept: bool,
+    /// Written, then taken off the screen by a painting gate in a server-output chunk while
+    /// pending, its cell blank: a gate retraction if its echo then confirms it (`hidden`).
+    gated: bool,
+}
+
+/// A written guess retired while off the screen and unechoed, in a server-output chunk (or
+/// after a gate took it off): held until its cell shows a glyph (`Mispredicted::hidden` if its
+/// own, else `bucket`), a new guess takes the cell, or a lifecycle event comes (`bucket`: it was
+/// off the screen before the event, so the event did not withdraw it, §2.5's fault bar).
+// No `Debug`: it holds a guessed glyph (docs/m3/plan.md §4.3).
+#[derive(Clone)]
+struct Held {
+    cell: (u16, u16),
+    glyph: char,
+    /// The misprediction it is counted as unless its own glyph comes.
+    bucket: Outcome,
+    by_ack: bool,
 }
 
 // No `Debug`: it holds guessed glyphs (docs/m3/plan.md §4.3).
@@ -322,6 +351,15 @@ pub(crate) struct Core {
     /// Settled since the predictor was last told.
     pub settled: Vec<Settled>,
     pub stats: PredictStats,
+    /// Gate retractions waiting for their cell's next glyph ([`Held`]). Bounded by the screen:
+    /// drawing a guess in a cell settles the one held there ([`Core::unhold`]), so there is at
+    /// most about one per cell, and a lifecycle event empties it.
+    held: Vec<Held>,
+    /// Holds made, and holds since settled in their `bucket` ([`Core::ending_seen`]).
+    holds: (u64, u64),
+    /// The overlay is handling a server-output chunk: a written guess retired there as a
+    /// misprediction while its cell is blank is held ([`Held`]).
+    pub in_server: bool,
     /// Where the cursor was left by the current epoch's latest confirmed guess: in a confirmed
     /// epoch, a chunk that leaves the cursor there is explained (the second piece of an echo cut
     /// after the glyph, `g ` then `\x1b[1D`, or a `\b \b` in pieces). One value, except for the
@@ -362,6 +400,9 @@ impl Core {
             deferred: Vec::new(),
             settled: Vec::new(),
             stats: PredictStats::default(),
+            held: Vec::new(),
+            holds: (0, 0),
+            in_server: false,
             echoed_at: Vec::new(),
             kept_echoed_at: Vec::new(),
             fresh_echo: false,
@@ -785,6 +826,7 @@ impl Core {
             grace: None,
             carried: false,
             kept: false,
+            gated: false,
         });
         self.stats.guessed += 1;
     }
@@ -809,6 +851,7 @@ impl Core {
             grace: None,
             carried: false,
             kept: false,
+            gated: false,
         });
     }
 
@@ -833,6 +876,14 @@ impl Core {
     /// Ends the current epoch: what is written is withdrawn, the rest dropped, and the next
     /// guesses are tentative.
     pub fn end(&mut self, why: Why, v: Option<&dyn ScreenView>, now: Time) {
+        if let Why::Lifecycle(r) = why
+            && !matches!(
+                r,
+                WithdrawReason::Predictor | WithdrawReason::Superseded | WithdrawReason::Ended
+            )
+        {
+            self.release_held();
+        }
         if why.is_boundary() && self.hidden && !self.g.quiet_boundaries {
             return; // the mutation: M0's predictor skipped its epochs while it showed nothing
         }
@@ -899,6 +950,7 @@ impl Core {
     /// confirmed: a resize (rule 9), where the screen's trust, not the epoch, decides what is
     /// written next.
     pub fn withdraw_all(&mut self, reason: WithdrawReason, v: &dyn ScreenView, now: Time) {
+        self.release_held();
         for i in 0..self.keys.len() {
             if self.is_pending(i) {
                 self.retire(i, Why::Lifecycle(reason), Some(v), now);
@@ -914,6 +966,7 @@ impl Core {
     /// A snapshot replaces the shadow: the epoch ends (unless `Guards::snapshot` is off), and
     /// what was written is classified once the snapshot has landed ([`Core::classify_deferred`]).
     pub fn snapshot(&mut self, now: Time) {
+        self.release_held();
         self.epoch += 1;
         if !self.g.snapshot {
             // The mutation: the epoch survives the reset; the snapshot becomes the new baseline.
@@ -1030,6 +1083,34 @@ impl Core {
             }
             return;
         }
+        if g.gated {
+            match outcome {
+                Outcome::Confirmed | Outcome::Restyled => {
+                    s.mispredicted.hidden += 1;
+                    return;
+                }
+                // Off the screen since its gate, before the event: not a guess the event
+                // withdrew (§2.5's fault bar), but one whose echo never brought it back.
+                Outcome::Withdrawn(
+                    WithdrawReason::Backstop
+                    | WithdrawReason::Snapshot
+                    | WithdrawReason::Resize
+                    | WithdrawReason::Takeover
+                    | WithdrawReason::Detached
+                    | WithdrawReason::Exit
+                    | WithdrawReason::Refusal,
+                ) => {
+                    s.mispredicted.ended += 1;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        Self::count_written(s, outcome, by_ack);
+    }
+
+    /// Counts a written guess's outcome in its bucket.
+    fn count_written(s: &mut PredictStats, outcome: Outcome, by_ack: bool) {
         match outcome {
             Outcome::Confirmed => s.confirmed += 1,
             Outcome::Restyled => s.restyled += 1,
@@ -1069,7 +1150,12 @@ impl Core {
             return;
         };
         let outcome = self.outcome(&g, why, v);
-        self.count(&g, outcome, by_ack);
+        if let Some(h) = self.hold(&g, outcome, by_ack, v) {
+            self.held.push(h);
+            self.holds.0 += 1;
+        } else {
+            self.count(&g, outcome, by_ack);
+        }
         if let Some(gm) = self.keys[i].guess.as_mut() {
             gm.state = match why {
                 Why::Lifecycle(WithdrawReason::Predictor) => GState::Withdrawn,
@@ -1086,6 +1172,134 @@ impl Core {
                 settled: now,
             });
         }
+    }
+
+    /// Whether a written guess retired as a misprediction is held as a possible gate retraction
+    /// ([`Held`]): its cell blank, and either a gate took it off already or it is retired while
+    /// a server-output chunk is handled (its epoch ended there, its backstop or the predictor
+    /// took it off then).
+    fn hold(
+        &self,
+        g: &Guess,
+        outcome: Outcome,
+        by_ack: bool,
+        v: Option<&dyn ScreenView>,
+    ) -> Option<Held> {
+        let GKind::Glyph {
+            row, col, glyph, ..
+        } = g.kind
+        else {
+            return None;
+        };
+        if !g.written {
+            return None;
+        }
+        let mispredicted = matches!(
+            outcome,
+            Outcome::Contradicted
+                | Outcome::Withdrawn(
+                    WithdrawReason::Ended
+                        | WithdrawReason::Expired
+                        | WithdrawReason::Predictor
+                        | WithdrawReason::Password
+                )
+        );
+        if !mispredicted || !(g.gated || self.in_server) {
+            return None;
+        }
+        let blank = v
+            .and_then(|v| v.cell(row, col))
+            .is_some_and(|c| c.text.trim().is_empty());
+        blank.then_some(Held {
+            cell: (row, col),
+            glyph,
+            bucket: outcome,
+            by_ack,
+        })
+    }
+
+    /// A gate took these written cells off the screen in a server-output chunk: each pending
+    /// guess there whose cell is still blank is a gate retraction if its echo then confirms it.
+    pub fn gated(&mut self, cells: &[(u16, u16)], v: &dyn ScreenView) {
+        for k in &mut self.keys {
+            let Some(g) = k.guess.as_mut() else { continue };
+            if g.state != GState::Pending || !g.written {
+                continue;
+            }
+            if let GKind::Glyph { row, col, .. } = g.kind
+                && cells.contains(&(row, col))
+                && v.cell(row, col).is_some_and(|c| c.text.trim().is_empty())
+            {
+                g.gated = true;
+            }
+        }
+    }
+
+    pub fn has_held(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// Settles the held guesses whose cell now shows a glyph: `hidden` if it is their own.
+    pub fn resolve_held(&mut self, v: &dyn ScreenView) {
+        let mut i = 0;
+        while i < self.held.len() {
+            let h = &self.held[i];
+            let text = v.cell(h.cell.0, h.cell.1).map_or("", |c| c.text);
+            if text.trim().is_empty() {
+                i += 1;
+                continue;
+            }
+            let own = text == text_of(h.glyph);
+            let h = self.held.swap_remove(i);
+            if own {
+                self.stats.mispredicted.hidden += 1;
+            } else {
+                self.settle_held(&h);
+            }
+        }
+    }
+
+    /// Counts a held guess in its bucket: its own glyph will not decide it.
+    fn settle_held(&mut self, h: &Held) {
+        Self::count_written(&mut self.stats, h.bucket, h.by_ack);
+        self.holds.1 += 1;
+    }
+
+    /// A new guess takes this cell: a held guess there was a misprediction after all. Called for
+    /// every cell drawn; a linear scan, as `held` is bounded by the screen (one per cell at most,
+    /// since this settles the one there).
+    fn unhold(&mut self, cell: (u16, u16)) {
+        while let Some(i) = self.held.iter().position(|h| h.cell == cell) {
+            let h = self.held.swap_remove(i);
+            self.settle_held(&h);
+        }
+    }
+
+    /// A lifecycle event (a snapshot, a reset, a resize, a takeover): the held guesses are
+    /// settled in their buckets. They were off the screen before the event, so it did not
+    /// withdraw them (§2.5's fault bar: `withdrawn` only removes guesses written when the fault
+    /// happened).
+    pub fn release_held(&mut self) {
+        for h in std::mem::take(&mut self.held) {
+            self.settle_held(&h);
+        }
+    }
+
+    /// The visible mispredictions other than `hidden` as each was first counted, including the
+    /// held guesses: it only grows (a held guess settled as `hidden` does not take one back),
+    /// for the driver's run check.
+    pub fn ending_seen(&self) -> u64 {
+        self.stats.mispredicted.ending() + self.holds.0 - self.holds.1
+    }
+
+    /// The counts, with the held guesses in the buckets they fall in if their own glyph never
+    /// comes.
+    pub fn stats_now(&self) -> PredictStats {
+        let mut s = self.stats;
+        for h in &self.held {
+            Self::count_written(&mut s, h.bucket, h.by_ack);
+        }
+        s
     }
 
     /// Confirms key `i`'s guess, and the moves before it (the program handles keys in order).
@@ -1589,6 +1803,11 @@ impl Core {
 
     /// The overlay wrote these cells (guesses, not the status line) with this pen.
     pub fn mark_written(&mut self, cells: &[(u16, u16)], pen: Attrs) {
+        if !self.held.is_empty() {
+            for &c in cells {
+                self.unhold(c);
+            }
+        }
         for k in &mut self.keys {
             let Some(g) = k.guess.as_mut() else { continue };
             if g.state != GState::Pending {

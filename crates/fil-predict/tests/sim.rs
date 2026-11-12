@@ -32,22 +32,34 @@ fn seeds() -> u64 {
 /// Visible mispredictions by kind: `ended`, `contradicted`, the rest.
 fn kinds(m: &Mispredicted, keys: u64) -> String {
     let per = |n: u64| n as f64 * 1000.0 / keys.max(1) as f64;
-    let other = m.total() - m.ended - m.contradicted;
+    let other = m.total() - m.ended - m.contradicted - m.hidden;
     format!(
-        "ended {:.2} contradicted {:.2} other {:.2}",
+        "ended {:.2} contradicted {:.2} hidden {:.2} other {:.2}",
         per(m.ended),
         per(m.contradicted),
+        per(m.hidden),
         per(other)
     )
 }
 
 fn add(a: &mut Mispredicted, b: &Mispredicted) {
-    a.contradicted += b.contradicted;
-    a.echo_ack += b.echo_ack;
-    a.expired += b.expired;
-    a.password += b.password;
-    a.ended += b.ended;
-    a.withdrawn += b.withdrawn;
+    // Destructured, so a new bucket cannot be left out of the soak's counts.
+    let Mispredicted {
+        contradicted,
+        echo_ack,
+        expired,
+        password,
+        ended,
+        withdrawn,
+        hidden,
+    } = *b;
+    a.contradicted += contradicted;
+    a.echo_ack += echo_ack;
+    a.expired += expired;
+    a.password += password;
+    a.ended += ended;
+    a.withdrawn += withdrawn;
+    a.hidden += hidden;
 }
 
 fn scenario(sc: Scenario) {

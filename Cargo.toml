@@ -50,3 +50,35 @@ codegen-units = 1
 lto = "fat"
 strip = "symbols"
 debug = 0
+
+# Tests (dev and test profiles; `test` inherits `dev`, its package overrides included). The terminal
+# emulators and the prediction engine are pure computation that the tests drive hard: fil-predict's
+# simulator checks an oracle screen after every flush, and fil-term's tests replay long streams. In
+# a debug build they run about ten times slower (the test-suite sweep, 2026-11-11: sim.rs's echo case
+# 2.8 CPU-s at opt-level 0, 0.25 s at 2). Optimizing only these five costs about 40 CPU-s of compile
+# and keeps the rest of the workspace quick to build and debuggable. `"*"` alone would not reach
+# fil-predict and fil-term, which are workspace members.
+[profile.dev.package.fil-predict]
+opt-level = 2
+
+[profile.dev.package.fil-term]
+opt-level = 2
+
+[profile.dev.package.alacritty_terminal]
+opt-level = 2
+
+[profile.dev.package.vt100]
+opt-level = 2
+
+[profile.dev.package.vte]
+opt-level = 2
+
+# The harness builds in CI (the drop-in suite, the prediction harness, fidelity, the forward soak and
+# the no-test-hooks check): the release profile's code and settings (optimized, stripped, no debug
+# info) without what makes it slow to build, fat LTO and a single codegen unit. These builds test
+# behavior and feature unification, not the shipped bytes; the release build and the release suite
+# (`just ci-release`, the check workflows' suite=all) still build with `release`. Never ships.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16

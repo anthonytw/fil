@@ -31,6 +31,19 @@ name_ok() { [[ ${1:-} =~ ^[a-z][a-z0-9-]{0,31}$ ]]; }
 arg_ok() { [[ $1 =~ ^[A-Za-z0-9._:/=@,+%-]*$ ]]; }
 max_bytes=$((128 * 1024 * 1024))
 export XDG_RUNTIME_DIR="/run/user/$uid"
+# A machine-wide XDG base directory that is not under this account's home is another user's: the
+# GitHub runner image sets XDG_CONFIG_HOME=/home/runner/.config in /etc/environment, which
+# pam_env hands to every ssh login, so `fil server` looked for its daemon.toml in the runner's
+# home (Permission denied). On a Pi none is set; drop such a one, so fil uses its defaults here.
+for v in XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME; do
+  case ${!v-} in
+    "" | "$HOME"/*) ;;
+    *) unset "$v" ;;
+  esac
+done
+# The same for the session bus, which the gate's `systemctl --user` and fil's `systemd-run --user
+# --scope` reach: this account's own, never one handed down from the machine.
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 
 case "$verb" in
   fil)

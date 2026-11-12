@@ -13,7 +13,9 @@
 //!   left/right margins (DECLRMM), national charset mode, synchronized output.
 //! - **Charsets.** Neither backend reports G0-G3 or which one is invoked, but with DEC
 //!   special graphics designated an ASCII `a` prints as a box-drawing glyph. DECSC/DECRC
-//!   (and `CSI s/u`, `?1049`, `?1048`) save and restore the charset state too.
+//!   (and `CSI s/u`, `?1049`, `?1048`) save and restore the charset state too. Terminals keep
+//!   those saves differently (one per screen, or tmux's one for both), so a restore brings back
+//!   only what every model agrees on (`Modes::saved`, `Modes::last`).
 //! - **The active hyperlink (OSC 8).** The model has links on cells, not the one the
 //!   terminal will attach to the next character. Painting a restored cell that carries a
 //!   link changes it, so we must put the program's link back afterwards.
@@ -55,9 +57,10 @@ pub enum Blocker {
     /// shadow screen is stale and anything restored from it would be wrong.
     ProgramSync,
     /// A soft terminal reset (DECSTR) left insert mode, origin mode or the scroll region unknown,
-    /// a cursor restore after it left the cursor's position in dispute, or a cursor restore
-    /// left the open hyperlink unknown: terminals disagree on all of them. Cleared when the
-    /// program sets the mode, the region or the link.
+    /// a cursor restore left origin mode, autowrap, the open hyperlink or the cursor's position
+    /// in dispute, or `?47 h`/`?1047 h` left the screen unknown: terminals disagree on all of
+    /// them. Cleared when the program sets the mode, the region, the link, the cursor position
+    /// or switches screens with `?1049`.
     Uncertain,
 }
 
@@ -67,12 +70,56 @@ enum Charset {
     Other,
 }
 
-#[derive(Clone, Copy)]
-struct SavedCharsets {
+/// What a cursor save holds that painting depends on. Terminals disagree on where a save goes
+/// and what a restore brings back (`Modes::saved`), so a field may be unknown: `None`, or
+/// `Charset::Other` for a character set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SavedCursor {
     g: [Charset; 4],
     gl: usize,
     /// DECSC also saves DECOM (xterm, the VT spec); alacritty does not.
-    origin: bool,
+    origin: Option<bool>,
+    /// kitty also saves DECAWM; the others do not.
+    autowrap: Option<bool>,
+    /// Which save this is (a stamp from `Modes::stamp`), standing in for the cursor position:
+    /// two slots with the same stamp put the cursor in the same place.
+    stamp: Option<u64>,
+}
+
+impl SavedCursor {
+    /// What a restore with nothing saved brings back: xterm resets the character sets (others
+    /// keep them), origin mode is off, autowrap on (kitty's empty save).
+    const EMPTY: SavedCursor = SavedCursor {
+        g: [Charset::Other; 4],
+        gl: 0,
+        origin: Some(false),
+        autowrap: Some(true),
+        stamp: Some(0),
+    };
+
+    fn or_empty(s: Option<SavedCursor>) -> SavedCursor {
+        s.unwrap_or(SavedCursor::EMPTY)
+    }
+
+    /// What two saves have in common: whatever they disagree on is unknown.
+    fn agree(&self, other: &SavedCursor) -> SavedCursor {
+        fn same<T: PartialEq + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
+            if a == b { a } else { None }
+        }
+        let mut g = [Charset::Other; 4];
+        for (i, slot) in g.iter_mut().enumerate() {
+            if self.gl == other.gl && self.g[i] == other.g[i] {
+                *slot = self.g[i];
+            }
+        }
+        SavedCursor {
+            g,
+            gl: self.gl,
+            origin: same(self.origin, other.origin),
+            autowrap: same(self.autowrap, other.autowrap),
+            stamp: same(self.stamp, other.stamp),
+        }
+    }
 }
 
 struct Modes {
@@ -87,14 +134,29 @@ struct Modes {
     /// lands, so it is unknown until the program sets one (`CSI r`).
     region_unknown: bool,
     autowrap: bool,
+    /// A restore may have changed DECAWM (kitty restores it, the others do not).
+    autowrap_unknown: bool,
     lr_margins: bool,
     nrcs: bool,
     sync: bool,
     g: [Charset; 4],
     gl: usize,
     single_shift: bool,
-    saved: Option<SavedCharsets>,
-    tainted: bool,
+    /// The DECSC save of the primary [0] and the alternate [1] screen, as xterm, kitty, WezTerm
+    /// and alacritty keep it (one per screen, DESIGN.md §6.5): `?1049 h` saves into the
+    /// primary's and `?1049 l` restores it, whichever screen a DECSC went to in between.
+    saved: [Option<SavedCursor>; 2],
+    /// The DECSC save as tmux keeps it: one for both screens, which `?1049 h` does not write
+    /// (tmux has a separate save for that, and its `?1049 l` restores neither origin mode nor
+    /// the character sets). DECRC brings back only what this and `saved` agree on.
+    last: Option<SavedCursor>,
+    /// On the alternate screen; `None` after `?47 h` or `?1047 h` (most terminals switch, the
+    /// shadow's alacritty does not), which blocks painting until a switch every terminal makes.
+    alt: Option<bool>,
+    /// The last stamp handed out (`SavedCursor::stamp`).
+    stamp: u64,
+    /// An image or double-size line is on the primary [0] or the alternate [1] screen.
+    tainted: [bool; 2],
     link: Option<Link>,
     /// The program has used OSC 8 since the last reset.
     link_possible: bool,
@@ -102,11 +164,13 @@ struct Modes {
     /// saves it with the cursor, xterm has no links to save. Unknown until the program next
     /// sends OSC 8.
     link_unknown: bool,
-    /// A soft reset (DECSTR) with no cursor save since: a restore now lands where terminals
-    /// disagree (the shadow and xterm at home, kitty and tmux at the old saved cursor).
-    reset_unsaved: bool,
-    /// The cursor's position came from such a restore, and no absolute position (`CUP`, `HVP`)
-    /// has been set since (`crate::CoreView::cursor_disputed`).
+    /// A soft reset (DECSTR) on the primary [0] or the alternate [1] screen with no cursor save
+    /// there since: a restore now lands where terminals disagree (the shadow and xterm at home,
+    /// kitty and tmux at the old saved cursor).
+    reset_unsaved: [bool; 2],
+    /// The cursor's position came from such a restore, or from one terminals take from different
+    /// saves (tmux's single DECSC save, `?1048`, `?1049 l` outside the alternate screen), and no
+    /// absolute position (`CUP`, `HVP`) has been set since (`crate::CoreView::cursor_disputed`).
     cursor_disputed: bool,
 }
 
@@ -119,58 +183,100 @@ impl Default for Modes {
             origin_unknown: false,
             region_unknown: false,
             autowrap: true,
+            autowrap_unknown: false,
             lr_margins: false,
             nrcs: false,
             sync: false,
             g: [Charset::Ascii; 4],
             gl: 0,
             single_shift: false,
-            saved: None,
-            tainted: false,
+            saved: [None; 2],
+            last: None,
+            alt: Some(false),
+            stamp: 0,
+            tainted: [false; 2],
             link: None,
             link_possible: false,
             link_unknown: false,
-            reset_unsaved: false,
+            reset_unsaved: [false; 2],
             cursor_disputed: false,
         }
     }
 }
 
 impl Modes {
-    fn save(&mut self) {
-        self.reset_unsaved = false;
-        self.saved = Some(SavedCharsets {
-            g: self.g,
-            gl: self.gl,
-            origin: self.origin,
-        });
+    /// The screens a save or a restore may act on: the current one, or both while that is
+    /// unknown.
+    fn screens(&self) -> &'static [usize] {
+        match self.alt {
+            Some(false) => &[0],
+            Some(true) => &[1],
+            None => &[0, 1],
+        }
     }
 
+    /// The state a save made now holds, with a new stamp.
+    fn current(&mut self) -> SavedCursor {
+        self.stamp += 1;
+        SavedCursor {
+            g: self.g,
+            gl: self.gl,
+            origin: (!self.origin_unknown).then_some(self.origin),
+            autowrap: (!self.autowrap_unknown).then_some(self.autowrap),
+            stamp: Some(self.stamp),
+        }
+    }
+
+    /// Merges `cur` into slot `i` of `saved`: some terminals saved there, others did not.
+    fn maybe_save(&mut self, i: usize, cur: &SavedCursor) {
+        self.saved[i] = Some(SavedCursor::or_empty(self.saved[i]).agree(cur));
+    }
+
+    /// DECSC and `CSI s`: the current screen's slot and tmux's single one.
+    fn save(&mut self) {
+        let cur = self.current();
+        match self.alt {
+            Some(alt) => {
+                self.saved[usize::from(alt)] = Some(cur);
+                self.reset_unsaved[usize::from(alt)] = false;
+            }
+            None => {
+                self.maybe_save(0, &cur);
+                self.maybe_save(1, &cur);
+            }
+        }
+        self.last = Some(cur);
+    }
+
+    /// DECRC and `CSI u`: per-screen terminals restore their screen's slot, tmux its single one.
     fn restore(&mut self) {
-        if self.reset_unsaved {
+        let mut from = SavedCursor::or_empty(self.last);
+        for &i in self.screens() {
+            from = from.agree(&SavedCursor::or_empty(self.saved[i]));
+        }
+        let reset = self.screens().iter().any(|&i| self.reset_unsaved[i]);
+        // A slot tmux and the others filled from different saves puts the cursor in different
+        // places (or the stamp is unknown).
+        self.apply_restore(from, reset || from.stamp.is_none());
+    }
+
+    /// Brings back what `from` holds. Some terminals do not restore origin mode or DECAWM at
+    /// all, so a mode that `from` does not agree with the current one on becomes unknown.
+    fn apply_restore(&mut self, from: SavedCursor, disputed: bool) {
+        if disputed {
             self.cursor_disputed = true;
         }
         if self.link_possible {
             self.link_unknown = true;
         }
-        // Whether a restore brings origin mode back depends on the terminal (xterm does,
-        // alacritty does not). If the saved value differs from the current one, the terminal's
-        // mode is unknown until the program sets it. (Nothing saved restores "off".)
-        if self.saved.is_some_and(|s| s.origin) != self.origin {
+        if from.origin != Some(self.origin) {
             self.origin_unknown = true;
         }
-        match self.saved {
-            Some(s) => {
-                self.g = s.g;
-                self.gl = s.gl;
-            }
-            // A restore with nothing saved: xterm resets the sets, alacritty ignores a
-            // `?1049 l` outside the alternate screen. Unknown until designated again.
-            None => {
-                self.g = [Charset::Other; 4];
-                self.gl = 0;
-            }
+        if from.autowrap != Some(self.autowrap) {
+            self.autowrap_unknown = true;
         }
+        self.g = from.g;
+        self.gl = from.gl;
     }
 
     fn set_mode(&mut self, private: bool, n: u16, on: bool) {
@@ -183,19 +289,84 @@ impl Modes {
                 self.origin = on;
                 self.origin_unknown = false;
             }
-            (true, 7) => self.autowrap = on,
+            (true, 7) => {
+                self.autowrap = on;
+                self.autowrap_unknown = false;
+            }
             (true, 42) => self.nrcs = on,
             (true, 69) => self.lr_margins = on,
             (true, 2026) => self.sync = on,
-            (true, 1048 | 1049) => {
-                if on {
-                    self.save();
-                } else {
-                    self.restore();
+            // xterm, kitty and WezTerm save into the screen's slot; tmux and alacritty ignore it.
+            (true, 1048) if on => {
+                let cur = self.current();
+                for &i in self.screens() {
+                    self.maybe_save(i, &cur);
                 }
+                self.last = Some(SavedCursor::or_empty(self.last).agree(&cur));
+            }
+            // A restore in some terminals, nothing in others: the cursor may or may not move.
+            (true, 1048) => {
+                let mut from = self.current();
+                for &i in self.screens() {
+                    from = from.agree(&SavedCursor::or_empty(self.saved[i]));
+                }
+                self.apply_restore(from, true);
+            }
+            // Switching screens without a save: most terminals do it, alacritty ignores it.
+            (true, 47 | 1047) if on => {
+                if self.alt == Some(false) {
+                    self.alt = None;
+                }
+            }
+            // Every terminal that honors it is on the primary screen now; alacritty ignores it,
+            // which leaves it there too unless it had entered the alternate one with `?1049 h`.
+            (true, 47 | 1047) => {
+                self.alt = match self.alt {
+                    Some(true) => None,
+                    _ => Some(false),
+                };
+            }
+            // Entering the alternate screen saves the cursor into the primary's slot and clears
+            // the alternate screen. tmux's DECSC slot is untouched.
+            (true, 1049) if on && self.alt == Some(false) => {
+                let cur = self.current();
+                self.saved[0] = Some(cur);
+                self.reset_unsaved[0] = false;
+                self.alt = Some(true);
+                self.tainted[1] = false;
+            }
+            // Already there (or maybe): xterm saves again, into the screen it is on, the others
+            // ignore it. Either way every terminal ends up on the alternate screen.
+            (true, 1049) if on => {
+                let cur = self.current();
+                for &i in self.screens() {
+                    self.maybe_save(i, &cur);
+                }
+                self.alt = Some(true);
+            }
+            // Leaving: per-screen terminals restore the primary's slot; tmux restores the cursor
+            // from its own save but keeps origin mode and the character sets as they are, so only
+            // what the two agree on survives. Outside the alternate screen xterm still restores
+            // and kitty, WezTerm, tmux and alacritty ignore it, so the cursor is disputed.
+            (true, 1049) => {
+                let outside = self.alt != Some(true);
+                let from = SavedCursor::or_empty(self.saved[0]).agree(&self.current());
+                self.alt = Some(false);
+                self.apply_restore(from, outside || self.reset_unsaved[0]);
             }
             _ => {}
         }
+    }
+
+    /// An image or double-size line may be on the screen now.
+    fn taint(&mut self) {
+        for &i in self.screens() {
+            self.tainted[i] = true;
+        }
+    }
+
+    fn tainted(&self) -> bool {
+        self.screens().iter().any(|&i| self.tainted[i])
     }
 }
 
@@ -214,7 +385,7 @@ impl Perform for Modes {
 
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
         if action == 'q' {
-            self.tainted = true; // sixel
+            self.taint(); // sixel
         }
     }
 
@@ -232,7 +403,7 @@ impl Perform for Modes {
                 self.link_unknown = false;
                 self.link = (!uri.is_empty()).then_some(Link { params: p, uri });
             }
-            [b"1337", f, ..] if f.starts_with(b"File=") => self.tainted = true,
+            [b"1337", f, ..] if f.starts_with(b"File=") => self.taint(),
             _ => {}
         }
     }
@@ -254,16 +425,25 @@ impl Perform for Modes {
                 self.insert_unknown = true;
                 self.origin_unknown = true;
                 self.region_unknown = true;
+                // kitty ignores DECSTR, so DECAWM stays off there.
+                self.autowrap_unknown |= !self.autowrap;
                 self.autowrap = true;
                 self.g = [Charset::Other; 4];
                 self.gl = 0;
                 self.single_shift = false;
-                self.saved = Some(SavedCharsets {
-                    g: [Charset::Other; 4],
-                    gl: 0,
-                    origin: false,
-                });
-                self.reset_unsaved = true;
+                // xterm and WezTerm reset the screen's cursor save, kitty keeps it, and tmux's
+                // single save is untouched.
+                self.stamp += 1;
+                let reset = SavedCursor {
+                    origin: Some(false),
+                    autowrap: Some(true),
+                    stamp: Some(self.stamp),
+                    ..SavedCursor::EMPTY
+                };
+                for &i in self.screens() {
+                    self.maybe_save(i, &reset);
+                    self.reset_unsaved[i] = true;
+                }
             }
             ([], 'H' | 'f') => self.cursor_disputed = false,
             ([], 'r') => self.region_unknown = false,
@@ -272,7 +452,10 @@ impl Perform for Modes {
             ([], 'J') => {
                 let n = params.iter().next().and_then(|p| p.first()).copied();
                 if matches!(n, Some(2 | 3)) {
-                    self.tainted = false;
+                    // Only the screen it is on, and nothing while that is unknown.
+                    if let Some(alt) = self.alt {
+                        self.tainted[usize::from(alt)] = false;
+                    }
                 }
             }
             _ => {}
@@ -289,10 +472,13 @@ impl Perform for Modes {
                     Charset::Other
                 };
             }
-            ([b'#'], b'3' | b'4' | b'5' | b'6') => self.tainted = true,
+            ([b'#'], b'3' | b'4' | b'5' | b'6') => self.taint(),
             ([], b'c') => {
                 // RIS. Not synchronized output: the shadow's batch only ends at `?2026 l`
                 // (alacritty's processor keeps it through a reset), so stay blocked until then.
+                // This puts `alt` on the primary screen, where tmux stays on the alternate one.
+                // Nothing depends on that yet: tmux's DECSC save ignores the screen, both screens
+                // are blank after it, and a `?1049 l` restores nothing saved (unknown charsets).
                 let sync = self.sync;
                 *self = Modes::default();
                 self.sync = sync;
@@ -371,7 +557,7 @@ impl Tracker {
             self.parser.advance(&mut self.modes, piece);
             let rested = self.scan.scan(piece);
             if self.scan.take_graphics() {
-                self.modes.tainted = true;
+                self.modes.taint();
             }
             self.follow(piece, rested);
             if self.unrested > MAX_SEQUENCE {
@@ -420,7 +606,7 @@ impl Tracker {
             self.modes.link_unknown = true;
         } else if head.starts_with(b"\x1b]1337;File=") {
             // An iTerm2/WezTerm inline image.
-            self.modes.tainted = true;
+            self.modes.taint();
         }
     }
 
@@ -436,7 +622,7 @@ impl Tracker {
             }
             self.scan.scan(std::slice::from_ref(&b));
             if self.scan.take_graphics() {
-                self.modes.tainted = true;
+                self.modes.taint();
             }
             if self.scan.at_rest() {
                 self.stop_dropping();
@@ -486,10 +672,13 @@ impl Tracker {
             || self.modes.origin_unknown
             // The region only matters where an origin-mode cursor is placed.
             || (self.modes.region_unknown && (self.modes.origin || self.modes.origin_unknown))
+            || self.modes.autowrap_unknown
             || self.modes.link_unknown
-            // A cursor restored after a soft reset: terminals put it in different places
-            // (`docs/m3/terminals.md` finding 2).
+            // A cursor restored where terminals put it in different places: after a soft reset
+            // (`docs/m3/terminals.md` finding 2), or from saves they keep differently.
             || self.modes.cursor_disputed
+            // `?47 h` or `?1047 h`: the shadow may show the other screen.
+            || self.modes.alt.is_none()
     }
 
     /// The program has synchronized output (`?2026`) on.
@@ -526,7 +715,7 @@ impl Tracker {
         if !self.charset_is_ascii() {
             v.push(Blocker::Charset);
         }
-        if m.tainted {
+        if m.tainted() {
             v.push(Blocker::Tainted);
         }
         if m.sync {
@@ -838,6 +1027,125 @@ mod tests {
             fed(b"\x1b[?6h\x1b8").blockers(),
             vec![Blocker::Charset, Blocker::Uncertain]
         );
+    }
+
+    #[test]
+    fn each_screen_has_its_own_cursor_save() {
+        // Leaving the alternate screen restores what entering it saved (origin off), not the
+        // DECSC made on the alternate screen (origin on): the mode may change, so it is unknown.
+        let t = fed(b"\x1b[?1049h\x1b[?6h\x1b7\x1b[?1049l");
+        assert_eq!(t.blockers(), vec![Blocker::Uncertain]);
+        // The alternate screen's save survives a visit to the primary screen.
+        let t = fed(b"\x1b[?1049h\x1b(0\x1b7\x1b(B\x1b[?1049l\x1b[?1049h\x1b8");
+        assert!(!t.charset_is_ascii());
+        // `?1049 h` on the alternate screen saves there in xterm, not in alacritty.
+        let t = fed(b"\x1b[?1049h\x1b7\x1b[?6h\x1b[?1049h\x1b[?6l\x1b8");
+        assert!(t.blockers().contains(&Blocker::Uncertain));
+        // The same with nothing saved there: xterm's save is ASCII, the empty one is not.
+        assert!(!fed(b"\x1b[?1049h\x1b[?1049h\x1b8").charset_is_ascii());
+    }
+
+    #[test]
+    fn a_restore_brings_back_only_what_per_screen_saves_and_tmux_agree_on() {
+        // tmux keeps one DECSC save for both screens (measured on 3.8): after a DECSC on the
+        // alternate screen, a DECRC on the primary restores that one, where xterm restores the
+        // primary's. Origin: off on tmux, on in xterm.
+        let t = fed(b"\x1b[?6h\x1b7\x1b[?1049h\x1b[?6l\x1b7\x1b[?1049l\x1b[?6h\x1b8");
+        assert!(
+            t.blockers().contains(&Blocker::Uncertain),
+            "{:?}",
+            t.blockers()
+        );
+        // Charsets: DEC graphics on tmux, ASCII in xterm.
+        let t = fed(b"\x1b7\x1b[?1049h\x1b(0\x1b7\x1b(B\x1b[?1049l\x1b8");
+        assert!(!t.charset_is_ascii());
+        // A DECSC on the primary screen after the visit is one save they all agree on.
+        let t = fed(b"\x1b[?1049h\x1b(0\x1b7\x1b(B\x1b[?1049l\x1b7\x1b8");
+        assert!(t.blockers().is_empty(), "{:?}", t.blockers());
+        // The cursor position: tmux's `?1049 h` does not write its DECSC save, so a DECRC after
+        // the visit lands at the old DECSC on tmux and at the `?1049 h` position in xterm.
+        let t = fed(b"\x1b7\x1b[?1049h\x1b[?1049l\x1b8");
+        assert!(t.cursor_disputed());
+        assert!(!fed(b"\x1b7\x1b[?1049h\x1b[?1049l\x1b8\x1b[1;1H").cursor_disputed());
+    }
+
+    #[test]
+    fn leaving_the_alternate_screen_keeps_the_charsets_on_tmux() {
+        // tmux's `?1049 l` restores the cursor, not G0-G3: DEC graphics stay invoked there.
+        assert!(!fed(b"\x1b[?1049h\x1b(0\x1b[?1049l").charset_is_ascii());
+        assert!(fed(b"\x1b[?1049h\x1b(0\x1b[?1049l\x1b(B").charset_is_ascii());
+    }
+
+    #[test]
+    fn switching_screens_without_a_save_leaves_the_screen_unknown() {
+        // `?47`/`?1047` switch screens in xterm, kitty, WezTerm and tmux; the shadow's
+        // alacritty ignores them, so nothing is painted until every terminal is on the primary
+        // screen again.
+        for h in [&b"\x1b[?47h"[..], b"\x1b[?1047h"] {
+            assert_eq!(fed(h).blockers(), vec![Blocker::Uncertain]);
+            let l = [h, &b"\x1b[?47l"[..]].concat();
+            assert!(fed(&l).blockers().is_empty());
+        }
+        // A DECSC there may have gone to either screen's slot (or tmux's): the restore on the
+        // primary screen is unknown.
+        let t = fed(b"\x1b[?6l\x1b7\x1b[?1047h\x1b[?6h\x1b7\x1b[?1047l\x1b[?6h\x1b8");
+        assert!(
+            t.blockers().contains(&Blocker::Uncertain),
+            "{:?}",
+            t.blockers()
+        );
+        // Leaving a `?1049` alternate screen with `?47 l`: alacritty ignores it.
+        assert_eq!(
+            fed(b"\x1b[?1049h\x1b[?47l").blockers(),
+            vec![Blocker::Uncertain]
+        );
+        // `?1049 l` puts everyone on the primary screen (the cursor is disputed until set).
+        let t = fed(b"\x1b[?1049h\x1b[?47l\x1b[?1049l");
+        assert!(t.cursor_disputed());
+        let t = fed(b"\x1b[?1049h\x1b[?47l\x1b[?1049l\x1b[H");
+        assert!(t.blockers().is_empty(), "{:?}", t.blockers());
+    }
+
+    #[test]
+    fn a_1048_save_is_honored_by_some_terminals_only() {
+        // xterm, kitty and WezTerm save; tmux and alacritty ignore it.
+        let t = fed(b"\x1b[?6h\x1b[?1048h\x1b[?6l\x1b8");
+        assert!(
+            t.blockers().contains(&Blocker::Uncertain),
+            "{:?}",
+            t.blockers()
+        );
+        // Its restore moves the cursor in some terminals only.
+        assert!(fed(b"\x1b[?1048h\x1b[?1048l").cursor_disputed());
+    }
+
+    #[test]
+    fn a_soft_reset_on_one_screen_disputes_a_restore_there_after_a_visit_to_the_other() {
+        let t = fed(b"\x1b[?1049h\x1b7\x1b[!p\x1b[?1049l\x1b[?1049h\x1b8");
+        assert!(t.cursor_disputed());
+    }
+
+    #[test]
+    fn a_restore_may_bring_back_autowrap_on_kitty() {
+        let t = fed(b"\x1b[?7l\x1b7\x1b[?7h\x1b8");
+        assert_eq!(t.blockers(), vec![Blocker::Uncertain]);
+        assert!(
+            fed(b"\x1b[?7l\x1b7\x1b[?7h\x1b8\x1b[?7h")
+                .blockers()
+                .is_empty()
+        );
+        assert!(fed(b"\x1b7\x1b8").blockers().is_empty());
+    }
+
+    #[test]
+    fn a_taint_stays_with_its_screen() {
+        // An image on the primary screen, cleared away only on the alternate one.
+        let t = fed(b"\x1b#6\x1b[?1049h\x1b[2J\x1b[?1049l");
+        assert_eq!(t.blockers(), vec![Blocker::Tainted]);
+        // On the alternate screen it does not block, and the next visit starts clean.
+        assert!(fed(b"\x1b#6\x1b[?1049h").blockers().is_empty());
+        let t = fed(b"\x1b[?1049h\x1b#6\x1b[?1049l\x1b[?1049h");
+        assert!(t.blockers().is_empty());
     }
 
     #[test]

@@ -267,6 +267,20 @@ fn a_resize_redraws_the_status_for_the_new_size() {
     });
 }
 
+/// The cursor save is one per screen: a save on the alternate screen is not what leaving it
+/// restores. (Seed 77 on alacritty: the tracker kept one save, so after `?1049 l` it believed
+/// origin mode was still on, and the paint ended with a `CSI ? 6 h` the terminal never had.)
+#[test]
+fn a_save_on_the_alternate_screen_is_not_restored_by_leaving_it() {
+    each_backend(|r| {
+        r.server(b"$ \x1b[?1049h\x1b[2;8r\x1b[?6h\x1b7\x1b[?1049l\x1b[5;1H");
+        r.status(lines(&[" fil: no reply "]));
+        r.server(b"x");
+        r.server(b"\x1b[r\x1b[?6l");
+        r.assert_clean();
+    });
+}
+
 // ---- seeded random sessions --------------------------------------------------------------
 
 struct Rng(u64);
@@ -328,7 +342,9 @@ const STATUSES: &[&[&str]] = &[
 /// Seeds that once failed, kept forever: 39 found that DECSTR leaves alacritty's scroll region
 /// out of step with the one it reports, so an origin-mode cursor restore landed a row off.
 /// 79 (vt100) found that DECSC saves origin mode in xterm but not in the shadow backends.
-const REGRESSION_SEEDS: &[u64] = &[39, 79];
+/// 77 (alacritty) found that the tracker kept one cursor save for both screens, so leaving the
+/// alternate screen "restored" a DECSC made on it.
+const REGRESSION_SEEDS: &[u64] = &[39, 77, 79];
 
 #[test]
 fn random_sessions_never_corrupt_the_screen() {

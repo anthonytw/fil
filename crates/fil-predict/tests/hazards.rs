@@ -181,10 +181,11 @@ fn soft_reset_leaves_the_charset_unknown() {
 #[test]
 fn restore_without_a_save_leaves_the_charset_unknown() {
     // Found by the soak: `?1049 l` outside the alternate screen. xterm restores (and resets
-    // the sets), alacritty ignores it and stays in DEC graphics.
+    // the sets), alacritty ignores it and stays in DEC graphics. (The `CUP` settles where the
+    // cursor is, which the restore also leaves in dispute, so only the charset guard is left.)
     let t = Trace::new()
         .server(0, b"\x1b(0")
-        .server(5, b"\x1b[?1049l")
+        .server(5, b"\x1b[?1049l\x1b[H")
         .input(10, b"x")
         .input(20, b"y");
     hazard(

@@ -387,7 +387,15 @@ after every flush, on both backends, with scripted cases and seeded random sessi
 (`just status-soak`). The random sessions found one more hazard (row 7, the scroll region after
 DECSTR), and review of the client found another: DECSC saves origin mode in xterm but not in
 the shadow backends, so after a restore that would change it the tracker treats origin mode as
-unknown (vt100 seed 79; both backends now run the full byte pool).
+unknown (vt100 seed 79; both backends now run the full byte pool). Alacritty seed 77 found that
+the tracker kept a single cursor save where terminals keep one per screen: leaving the alternate
+screen compared the mode against a DECSC made on it, the tracker kept origin mode on while the
+terminal turned it off, and the paint ended with a `CSI ? 6 h` that left it on. The tracker now
+keeps a save per screen, plus the single save tmux keeps for both screens (measured on 3.8), and a
+restore brings back only what the two models agree on; the rest is unknown and blocks painting.
+`?47` and `?1047` (which the shadow ignores) leave the screen unknown, images and double-size lines
+taint only their own screen, and a restore that kitty would use to bring back DECAWM leaves
+autowrap unknown.
 
 Known limit: a resize erases against the old geometry, as for predictions. For a pinned status
 this matters when the window gets *narrower* while something is drawn: a reflowing terminal re-wraps

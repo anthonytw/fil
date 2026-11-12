@@ -8,6 +8,8 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 Predictive local echo, on by default.
 
+0.2.0 keeps 0.1.0's wire (`wire 1.14` in `fil --version`), so a 0.2.0 client goes on using a 0.1.0 daemon that is still running on a host. Install 0.2.0 on each host, then end your sessions there (or `fil kill` them), so the daemon's fixes below take effect; the guide's "Upgrading" section has the details.
+
 A known limit, to be fixed in 0.2.1: once something interrupts the run of guesses (Enter, Tab, Ctrl-W, a Backspace while keys are still on their way, reaching the end of the line, fish's or zsh's autosuggestions), prediction stays off until your typing slows below about one key per round trip, about 7 keys a second at a 150 ms round trip and 2.5 at 400 ms. It never shows anything wrong: fil just does not guess, and you see your keys when the host echoes them, as over ssh. The guide's "Predictive echo" section has the details.
 
 ### Added

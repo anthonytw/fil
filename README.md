@@ -46,7 +46,7 @@ Check these fingerprints against the copies in the repository before you trust a
 
 ## Status
 
-fil 0.1.0, the first release, is an ssh/et drop-in: the client, the daemon, sessions that survive a reconnect or a takeover, both transports, port forwards, `fil ports`, the agent relay, server policy, and installing over ssh. The next release, 0.2.0, is in progress and adds predictive local echo. The design and the milestones are in [DESIGN.md](DESIGN.md) (§15); the changes are in [CHANGELOG.md](CHANGELOG.md).
+fil is an ssh/et drop-in: the client, the daemon, sessions that survive a reconnect or a takeover, both transports, port forwards, `fil ports`, the agent relay, server policy, and installing over ssh, as released in 0.1.0. 0.2.0 adds predictive local echo (below). The design and the milestones are in [DESIGN.md](DESIGN.md) (§15); the changes are in [CHANGELOG.md](CHANGELOG.md).
 
 ### Predictive echo (0.2.0)
 

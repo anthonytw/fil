@@ -173,7 +173,7 @@ recipe ends by listing the parts that failed: `just ci`;
 no-test-hooks check (`shipped-no-test-hooks`); full fidelity; the PTY prediction harness at its
 defaults; the prediction matrix (`predict-suites all`); terminal pacing; and the full drop-in
 suite (`dropin --local --scale full`). On GitHub: `linux-check` `suite=all` (check, release-test,
-`full-scale`, which is `test-release` on Linux, realnet, aarch64, terminals) and `macos-check`
+`full-scale`, which is `test-release` on Linux, realnet, aarch64, `arm64-remote`, terminals; `arm64-remote` is the static aarch64 build as the remote host on GitHub's arm64 runner, driven by `pi_e2e` and the full drop-in suite with prediction on, which replaced the test Pis as a release gate on 2026-11-11, `docs/m1/pi.md`) and `macos-check`
 `suite=all` on Apple silicon AND Intel (every test, the full drop-in suite, release-test, the
 shipped no-test-hooks check; remote; brew with a release run). The `full-scale` job's 60 min and
 the suite=all limits are estimates until a run measures them. release.yml runs release-test

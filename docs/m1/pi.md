@@ -4,6 +4,8 @@
 
 The M1 scenarios, run on real hardware: this Mac's `fil` client, driven in a pseudo-terminal, against `fil server --stdio` on two aarch64 Debian 13 Raspberry Pi 5s, called "pi1" and "pi2" below. It is on demand and never part of `just ci`.
 
+**The Pis are optional now (decided, owner 2026-11-11: "drop the Pis as a 0.2.0 gate, replace with an automated Linux arm64 remote run").** The same drivers (`pi_e2e` here, and the drop-in suite, `docs/m1/dropin.md`, `docs/m3/dropin.md`) run automatically against GitHub's arm64 Linux runner as the remote host: [On GitHub's arm64 runner](#on-githubs-arm64-runner), below. That run is the release gate for aarch64 Linux as a remote; a Pi run is an extra, with the commands on this page.
+
 ## Setup
 
 Each Pi has an unprivileged account, `fil-test`, that the Mac's ssh key reaches through a forced-command gate. The gate allows exactly these verbs; there is no shell and no scp:
@@ -59,6 +61,29 @@ The driver is `crates/fil/examples/pi_e2e.rs`:
 - Before and after every scenario it ends its own sessions with `fil kill`, then runs the gate's `reset`. A panic in a scenario is reported as that scenario's failure and the cleanup still runs (a Ctrl-C does not clean up: run `reset` by hand). After the last scenario on a host, a daemon or socket left behind is a failure.
 
 Do not run two copies at once. `reset` kills everything the account runs.
+
+## On GitHub's arm64 runner
+
+`linux-check` with `suite=arm64-remote` (and `suite=all`) runs the job `arm64-remote` on `ubuntu-24.04-arm`, after the `aarch64` job of the same run:
+
+```sh
+gh workflow run linux-check.yml --ref ci/BRANCH -f ref=SHA -f suite=arm64-remote
+```
+
+1. **The remote binaries** are the `aarch64` job's artifact `fil-aarch64-musl`: the static `fil` and `fwdprobe` that would go on a Pi, checked against their `.sha256` files and as static aarch64 ELFs.
+2. **The host** is the runner itself, set up as a Pi is (`tests/arm64/remote.sh setup`, as root on the throwaway runner): an unprivileged `fil-test` account whose only command is a gate with the verbs in the table above (`tests/arm64/gate.sh`; the forced command of both its key and sshd's `Match User` block, with no TTY and no forwarding), lingering on, behind an sshd (the system's configuration) in a network namespace of its own, joined to the runner by a veth pair: the host is `10.0.9.2` and the client side `10.0.9.1`, private test addresses as in `tests/realnet`. So the client reaches the host over a network, as it reaches a Pi, and the daemon and everything it starts live in that namespace; on loopback the drop-in suite's cut relay (which holds the daemon's UDP range on the client side) and the daemon would compete for the same ports. Unlike the Pis' sshd drop-in it does not set `AllowTcpForwarding no`, `AllowAgentForwarding no` or `AllowStreamLocalForwarding no` for the account: fil's daemon reads those as its own server policy (DESIGN.md §11.2) and would refuse every forward and the agent relay; the key's `restrict` option already turns off ssh's own forwarding. The runner user's key and the host key are set up for `BatchMode` logins. zsh and fish are installed, so `predict_shell` runs all three shells.
+3. **The binaries are installed through the gate** (`tests/arm64/remote.sh install DIR`: `install NAME SHA256`, then `run fil --version`).
+4. **The client** is the runner's own build, as the Mac's was for the Pis: `FIL_PI_TARGETS=arm64=fil-test@10.0.9.2`, then `just pi-e2e --hosts arm64` (the scenarios of the table below) and `just dropin --hosts arm64 --scale full --predict always` (every M1 and M2 scenario with prediction always on, and the seven prediction scenarios through the 75 ms relay with their own modes, `docs/m3/dropin.md`).
+
+The artifact `arm64-remote` has the drivers' work directories (configs, client logs) and the gate's `status` and `logs` at the end; the drop-in suite's throwaway agent keys are left out.
+
+Results on GitHub: none yet; the first dispatch's go here (run, commit, the remote binary's sha256, pass, skip and fail per driver).
+
+**Validated locally first** (2026-11-12, ET), with the scripts of this branch on `main` at `84b277e`, in a throwaway systemd container in the Mac's aarch64 Linux VM standing in for the runner (`remote.sh setup` as root in it, `FIL_ARM64_CLIENT_USER` naming the client's user; the remote binaries a native static `aarch64-unknown-linux-musl` build of the same tree, not the `aarch64` job's `cross` build): `pi_e2e`, all 8 scenarios pass on the final setup; the drop-in suite, `--scale full --predict always`, 61 scenarios: the last full run passed all but `fwd_ports_view` and `predict_shell`, and after the last setup change (the sshd service, below) `fwd_ports_view` passed again, with `fwd_dynamic` and `fwd_hostile_remote`, on a fresh container. That leaves `predict_shell`, whose fish run shows one visible misprediction (`contradicted`) in every run: fish's named residual (plan §2.5, accepted for the soak on 2026-11-11), which the scenario counts as a miss. bash and zsh pass it (one run of three showed one `hidden` for bash). Getting there found three things about the host side: an `AllowTcpForwarding no` (and agent and stream-local) in the account's `Match` block makes fil refuse every forward and the agent relay, by design (above); on loopback the cut relay and the daemon compete for the UDP range, hence the namespace; and the namespace's sshd must be a service whose mounts see the user runtime directory, or the sessions get no systemd scope.
+
+**What it does not reproduce:** a real network between client and host (a veth pair has no delay, loss or firewall; the prediction scenarios' relay adds their 75 ms each way, and the real-network suites, `docs/m1/realnet.md` and `docs/m3/latency.md`, cover real paths, NAT and loss); Raspberry Pi hardware (the runner is a 4-vCPU arm64 VM, a faster machine than a Pi 5); Debian 13 (it is Ubuntu 24.04). A firewall between the two, which the Pis' first direct-mode runs met, cannot occur here.
+
+**Locally**, in the Mac's aarch64 Linux VM (`docs/dev/vm.md`): `tests/arm64/remote.sh` refuses to change a machine unless it is a GitHub-hosted runner or `FIL_ARM64_THROWAWAY=1` is set, and `teardown` removes the account, the gate, the sshd drop-in and the namespace again. `FIL_ARM64_CLIENT_USER` names the user that runs the client when there is no `sudo` (as root in a container).
 
 ## Results
 

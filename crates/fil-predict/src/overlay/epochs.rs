@@ -297,7 +297,10 @@ pub(crate) struct Core {
     keys: Vec<Key>,
     baseline: Option<Baseline>,
     /// Output arrived since the baseline while nothing was outstanding: checked at the next key.
-    pub dirty: bool,
+    /// Only [`Core::note_output`] sets it, and only [`Core::take_baseline`] clears it, which every
+    /// caller outside the output checks reaches through [`Core::rebase`] or [`Core::sync`], so no
+    /// path (a read with no key in it included) can drop it without the check (SEC-1).
+    dirty: bool,
     /// The proposed hardening (`Guards::ack_before_write`): the end of the key that confirmed the
     /// epoch, until an `EchoAck` covers it.
     awaiting_ack: Option<InputPos>,
@@ -409,9 +412,26 @@ impl Core {
 
     // ---- the lazy unexplained-output check and the baseline --------------------------
 
-    /// Takes the baseline again: the cursor, the glyphs of the rows the core watches, and every
-    /// row's stamp. Reads one row's cells and every row's stamp through the borrowed view.
-    pub fn rebase(&mut self, v: &dyn ScreenView) {
+    /// Output arrived while nothing was outstanding: no screen read now, the check runs at the
+    /// next key, edit, settlement or rebase.
+    pub fn note_output(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Takes the baseline again, after the lazy check of output that arrived since the last one
+    /// ([`Core::sync`]): a caller that takes the baseline with no key in between (a read that
+    /// decodes to no key, a release event, half a UTF-8 character) must not take output nobody
+    /// checked as the new reference.
+    pub fn rebase(&mut self, v: &dyn ScreenView, now: Time) {
+        self.check_unexplained(v, now);
+        self.take_baseline(v);
+    }
+
+    /// Takes the baseline: the cursor, the glyphs of the rows the core watches, and every row's
+    /// stamp. Reads one row's cells and every row's stamp through the borrowed view. Only for
+    /// the checks themselves ([`Core::on_chunk`], [`Core::sync`]); everything else uses
+    /// [`Core::rebase`].
+    fn take_baseline(&mut self, v: &dyn ScreenView) {
         let size = v.size();
         let cursor = cursor_of(v);
         let mut rows = BTreeMap::new();
@@ -482,6 +502,15 @@ impl Core {
     /// check it now (rule 3, "Cost"): the cursor against where it was, the cursor's row against
     /// a copy of its glyphs, every other row by its stamp. Then take the baseline again.
     pub fn sync(&mut self, v: &dyn ScreenView, now: Time) {
+        self.check_unexplained(v, now);
+        if self.dirty || self.baseline.is_none() {
+            self.take_baseline(v);
+        }
+    }
+
+    /// The lazy check itself: ends the epoch if output that arrived while nothing was outstanding
+    /// is not explained. Leaves the baseline (and `dirty`) to the caller.
+    fn check_unexplained(&mut self, v: &dyn ScreenView, now: Time) {
         if self.dirty && !self.has_pending() && self.g.unexplained {
             let unexplained = match &self.baseline {
                 // Nothing to compare with (a new overlay): it starts tentative anyway.
@@ -499,9 +528,6 @@ impl Core {
             if unexplained {
                 self.end(Why::Unexplained, Some(v), now);
             }
-        }
-        if self.dirty || self.baseline.is_none() {
-            self.rebase(v);
         }
     }
 
@@ -581,7 +607,7 @@ impl Core {
         let any = !edits.is_empty();
         self.apply_edits_only(edits, v, now);
         if any {
-            self.rebase(v);
+            self.rebase(v, now);
         }
     }
 
@@ -1146,7 +1172,7 @@ impl Core {
         let Some(base) = self.baseline.take() else {
             // Guesses with nothing to compare against: nothing can confirm them.
             self.end(Why::Unexplained, Some(v), now);
-            return self.rebase(v);
+            return self.take_baseline(v);
         };
         let d = Self::diff(&base, v);
         let cur = d.cursor;
@@ -1216,7 +1242,7 @@ impl Core {
         if self.confirmed() {
             if !contradicted.is_empty() {
                 contradict(self, &contradicted);
-                return self.rebase(v);
+                return self.take_baseline(v);
             }
             let allowed = !moved
                 || self.echoed_at.contains(&cur)
@@ -1227,16 +1253,16 @@ impl Core {
                 });
             if self.g.unexplained && (unexplained || !allowed) {
                 self.end(Why::Unexplained, Some(v), now);
-                return self.rebase(v);
+                return self.take_baseline(v);
             }
             self.confirm_reached(&matched, &matched_changed, cur, v, now);
-            return self.rebase(v);
+            return self.take_baseline(v);
         }
 
         // A tentative epoch.
         if self.g.contradiction_first && !contradicted.is_empty() {
             contradict(self, &contradicted);
-            return self.rebase(v);
+            return self.take_baseline(v);
         }
         // A kept guess settles by its glyph, but never confirms the new epoch.
         let kept_matched: Vec<usize> = matched
@@ -1254,7 +1280,7 @@ impl Core {
             } else {
                 contradict(self, &contradicted);
             }
-            return self.rebase(v);
+            return self.take_baseline(v);
         }
         let explained = !self.g.explained_chunk || (!unexplained && !stray);
         let confirming: Vec<usize> = if self.g.changed_glyph {
@@ -1290,7 +1316,7 @@ impl Core {
             // Neutral for the new epoch, but a kept guess of the ended one settles by its glyph
             // as on any other chunk (it is not the rule's to delay).
             self.confirm_reached(&kept_matched, &matched_changed, cur, v, now);
-            return self.rebase(v);
+            return self.take_baseline(v);
         }
         if explained && !confirming.is_empty() && cursor_ok {
             let first_write = !self
@@ -1310,7 +1336,7 @@ impl Core {
             }
             // With `contradiction_first` on, nothing was contradicted. Off (the mutation), the
             // contradicted guess is left pending, in a confirmed epoch.
-            return self.rebase(v);
+            return self.take_baseline(v);
         }
         // The echo of kept guesses alone (the line typed before an Enter): they are confirmed,
         // and the new epoch is still tentative.
@@ -1328,7 +1354,7 @@ impl Core {
             && kept_cursor
         {
             self.confirm_reached(&kept_matched, &matched_changed, cur, v, now);
-            return self.rebase(v);
+            return self.take_baseline(v);
         }
         if !changed
             && contradicted.is_empty()
@@ -1337,7 +1363,7 @@ impl Core {
             // Only the cursor moved, to where a kept guess's echo left it or will leave it: a
             // piece of that echo (cut after its glyph, or a Backspace's first `\b`). Neutral,
             // like a chunk that changes nothing: it confirms nothing and ends nothing.
-            return self.rebase(v);
+            return self.take_baseline(v);
         }
         // Anything else breaks rule 2: the tentative epoch ends unwritten.
         if contradicted.is_empty() {
@@ -1345,7 +1371,7 @@ impl Core {
         } else {
             contradict(self, &contradicted);
         }
-        self.rebase(v);
+        self.take_baseline(v);
     }
 
     /// Confirms the guesses in `matched` that the echo has reached. A guess whose glyph was in

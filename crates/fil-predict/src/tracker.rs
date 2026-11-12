@@ -307,11 +307,37 @@ impl Perform for Modes {
     }
 }
 
+/// The most bytes a sequence (in practice an OSC, DCS or APC string) may run before the tracker
+/// stops passing it to its parser: with its `std` feature, `vte` buffers an OSC with no cap, so
+/// an unterminated one would grow the client without bound (M3 security sweep, SEC-3). 1 MiB, as
+/// the daemon's held-back tail (`MAX_TAIL` in fil-session). Past it the string is dropped, and
+/// the scanner alone follows it until it ends; painting stays blocked ([`Blocker::MidSequence`])
+/// until then. What the string meant to the tracker is decided from its first bytes
+/// ([`HEAD`]), so a dropped inline image still taints and a dropped OSC 8 leaves the link unknown.
+pub const MAX_SEQUENCE: usize = 1024 * 1024;
+
+/// How many of a sequence's first bytes are kept to classify it if it is dropped: enough for
+/// `ESC ] 1337;File=`.
+const HEAD: usize = 16;
+
+/// The largest piece the parser is given at once, so that it holds at most
+/// `MAX_SEQUENCE + FEED_PIECE` bytes of one string.
+const FEED_PIECE: usize = 64 * 1024;
+
 /// Everything the overlay tracks about the byte stream.
 pub struct Tracker {
     parser: Parser,
     modes: Modes,
     scan: Boundary,
+    /// Bytes of the sequence in progress: since the scanner was last at rest or the last ESC,
+    /// whichever is later (CAN and SUB bring the scanner to rest). An ESC ends any string and
+    /// starts a new sequence, so this counts one sequence only.
+    unrested: usize,
+    /// The first bytes of the sequence in progress (up to [`HEAD`]).
+    head: [u8; HEAD],
+    head_len: usize,
+    /// The current sequence ran past [`MAX_SEQUENCE`]: its bytes go to the scanner only.
+    dropping: bool,
 }
 
 impl Default for Tracker {
@@ -326,16 +352,105 @@ impl Tracker {
             parser: Parser::new(),
             modes: Modes::default(),
             scan: Boundary::new(),
+            unrested: 0,
+            head: [0; HEAD],
+            head_len: 0,
+            dropping: false,
         }
     }
 
     /// Feeds server bytes (in order, exactly those the real terminal receives).
-    pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.modes, bytes);
-        self.scan.scan(bytes);
-        if self.scan.take_graphics() {
+    pub fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            if self.dropping {
+                bytes = self.drop_sequence(bytes);
+                continue;
+            }
+            let (piece, rest) = bytes.split_at(bytes.len().min(FEED_PIECE));
+            bytes = rest;
+            self.parser.advance(&mut self.modes, piece);
+            let rested = self.scan.scan(piece);
+            if self.scan.take_graphics() {
+                self.modes.tainted = true;
+            }
+            self.follow(piece, rested);
+            if self.unrested > MAX_SEQUENCE {
+                // Drop the parser's buffer now; the rest of the sequence goes to the scanner only.
+                self.parser = Parser::new();
+                self.dropping = true;
+                self.classify_dropped();
+            }
+        }
+    }
+
+    /// Updates the length and head of the sequence in progress after the parser and the scanner
+    /// took `piece`, `rested` being what the scanner returned for it.
+    fn follow(&mut self, piece: &[u8], rested: usize) {
+        if self.scan.at_rest() {
+            self.unrested = 0;
+            self.head_len = 0;
+            return;
+        }
+        // Where the sequence in progress starts in `piece`, if it does: after the last rest, or
+        // at the last ESC (which ends whatever came before it).
+        let esc = piece.iter().rposition(|&b| b == 0x1b);
+        let start = match (rested > 0).then_some(rested).max(esc) {
+            Some(start) => {
+                self.unrested = 0;
+                self.head_len = 0;
+                start
+            }
+            None => 0,
+        };
+        let seq = &piece[start..];
+        self.unrested = self.unrested.saturating_add(seq.len());
+        let n = seq.len().min(HEAD - self.head_len);
+        self.head[self.head_len..self.head_len + n].copy_from_slice(&seq[..n]);
+        self.head_len += n;
+    }
+
+    /// What a sequence being dropped would have done to the tracker, judged from its first
+    /// bytes: the parser never sees its end, so `osc_dispatch` never runs for it. (A dropped DCS,
+    /// APC, PM or SOS needs nothing here: sixel taints at `hook`, kitty graphics in the scanner.)
+    fn classify_dropped(&mut self) {
+        let head = &self.head[..self.head_len];
+        if head.starts_with(b"\x1b]8;") {
+            // The terminal may have opened (or closed) a link: unknown until the next OSC 8.
+            self.modes.link_possible = true;
+            self.modes.link_unknown = true;
+        } else if head.starts_with(b"\x1b]1337;File=") {
+            // An iTerm2/WezTerm inline image.
             self.modes.tainted = true;
         }
+    }
+
+    /// Scans an overlong sequence's bytes, a byte at a time, until it ends; the parser starts
+    /// fresh after it. ESC, CAN and SUB end it too (a new sequence or a cancel, as in the
+    /// scanner and in `vte`), and are left for the parser: what they start must not be missed.
+    /// Returns the bytes after the dropped part (empty if the sequence has not ended).
+    fn drop_sequence<'a>(&mut self, bytes: &'a [u8]) -> &'a [u8] {
+        for (i, &b) in bytes.iter().enumerate() {
+            if matches!(b, 0x1b | 0x18 | 0x1a) {
+                self.stop_dropping();
+                return &bytes[i..];
+            }
+            self.scan.scan(std::slice::from_ref(&b));
+            if self.scan.take_graphics() {
+                self.modes.tainted = true;
+            }
+            if self.scan.at_rest() {
+                self.stop_dropping();
+                return &bytes[i + 1..];
+            }
+        }
+        &[]
+    }
+
+    fn stop_dropping(&mut self) {
+        self.parser = Parser::new();
+        self.dropping = false;
+        self.unrested = 0;
+        self.head_len = 0;
     }
 
     pub fn at_rest(&self) -> bool {
@@ -432,6 +547,111 @@ mod tests {
         let mut t = Tracker::new();
         t.feed(s);
         t
+    }
+
+    #[test]
+    fn an_overlong_string_is_dropped_and_the_parser_starts_again_after_it() {
+        let mut t = fed(b"\x1b]8;;https://example.com/\x07");
+        assert!(t.link().is_some());
+        // An OSC 8 that never ends, past the cap, in chunks of odd sizes.
+        t.feed(b"\x1b]8;;");
+        let chunk = vec![b'x'; 70_001];
+        for _ in 0..(2 * MAX_SEQUENCE / chunk.len()) {
+            t.feed(&chunk);
+        }
+        assert!(t.dropping, "past the cap");
+        assert!(t.blockers().contains(&Blocker::MidSequence));
+        // The link it may have changed is unknown until the program sets one again.
+        assert!(t.blockers().contains(&Blocker::Uncertain));
+        // It ends (ST, mid-chunk), and what follows it is parsed again.
+        t.feed(b"xx\x1b\\\x1b]8;;\x07abc\x1b[4h");
+        assert!(!t.dropping);
+        assert!(t.at_rest());
+        assert!(t.link().is_none());
+        assert!(t.insert());
+        assert!(t.blockers() == vec![Blocker::Insert], "{:?}", t.blockers());
+    }
+
+    /// Feeds `intro`, then filler past the cap, in odd-sized chunks.
+    fn past_the_cap(t: &mut Tracker, intro: &[u8]) {
+        t.feed(intro);
+        let chunk = vec![b'x'; 70_001];
+        for _ in 0..(MAX_SEQUENCE / chunk.len() + 2) {
+            t.feed(&chunk);
+        }
+        assert!(t.blockers().contains(&Blocker::MidSequence));
+    }
+
+    #[test]
+    fn the_sequence_that_ends_a_dropped_string_is_parsed() {
+        // An ESC ends any string and starts a new sequence: the terminal runs it, so the
+        // tracker must too, even after dropping the string (review of PR #76, finding 1).
+        for intro in [&b"\x1bP"[..], b"\x1b]0;", b"\x1b_", b"\x1b^", b"\x1bX"] {
+            let mut t = Tracker::new();
+            past_the_cap(&mut t, intro);
+            t.feed(b"xx\x1b[4h");
+            assert!(t.at_rest(), "{intro:?}");
+            assert!(t.insert(), "{intro:?}");
+            assert_eq!(t.blockers(), vec![Blocker::Insert], "{intro:?}");
+            // The same with the ESC split from its sequence across feeds.
+            let mut t = Tracker::new();
+            past_the_cap(&mut t, intro);
+            t.feed(b"\x1b");
+            t.feed(b"[?2026h");
+            assert!(t.sync_output(), "{intro:?}");
+            // CAN cancels the string; what follows is parsed.
+            let mut t = Tracker::new();
+            past_the_cap(&mut t, intro);
+            t.feed(b"\x18\x1b(0");
+            assert!(!t.charset_is_ascii(), "{intro:?}");
+        }
+        // A string past the cap whose ESC lands right at a piece boundary: the ESC and what it
+        // starts are kept, only the string is dropped.
+        let mut t = Tracker::new();
+        let mut s = b"\x1b]0;".to_vec();
+        s.resize(MAX_SEQUENCE + 4 * FEED_PIECE - 1, b'x');
+        s.extend_from_slice(b"\x1b[4h");
+        t.feed(&s);
+        assert!(t.insert());
+        assert_eq!(t.blockers(), vec![Blocker::Insert]);
+    }
+
+    #[test]
+    fn a_dropped_inline_image_still_taints() {
+        // `imgcat` of a ~750 KB photo is more than the cap of base64 (finding 2).
+        for end in [&b"\x07"[..], b"\x1b\\"] {
+            let mut t = Tracker::new();
+            past_the_cap(&mut t, b"\x1b]1337;File=inline=1:");
+            t.feed(end);
+            assert!(t.at_rest());
+            assert_eq!(t.blockers(), vec![Blocker::Tainted], "{end:?}");
+        }
+        // Other dropped OSCs taint nothing.
+        let mut t = Tracker::new();
+        past_the_cap(&mut t, b"\x1b]52;c;");
+        t.feed(b"\x07");
+        assert!(t.blockers().is_empty(), "{:?}", t.blockers());
+    }
+
+    #[test]
+    fn a_dropped_first_link_leaves_the_link_unknown() {
+        // No OSC 8 before it: the terminal may still have opened the link (finding 2).
+        let mut t = Tracker::new();
+        past_the_cap(&mut t, b"\x1b]8;;https://example.com/");
+        t.feed(b"\x1b\\");
+        assert!(t.at_rest());
+        assert_eq!(t.blockers(), vec![Blocker::Uncertain]);
+        // The next OSC 8 settles it.
+        t.feed(b"\x1b]8;;\x1b\\");
+        assert!(t.blockers().is_empty(), "{:?}", t.blockers());
+    }
+
+    #[test]
+    fn a_long_string_under_the_cap_is_parsed() {
+        let mut t = Tracker::new();
+        let uri = "u".repeat(MAX_SEQUENCE - 100);
+        t.feed(format!("\x1b]8;;{uri}\x07").as_bytes());
+        assert_eq!(t.link().map(|l| l.uri.len()), Some(uri.len()));
     }
 
     #[test]

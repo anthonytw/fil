@@ -825,7 +825,7 @@ impl Overlay {
         //    notes the output and checks it at the next key.
         let pending = o.core.has_pending();
         if !pending {
-            o.core.dirty = true;
+            o.core.note_output();
         }
         if pending || o.status.is_some() || o.on_screen.is_some() {
             let st = Shadow::new(&**shadow);
@@ -899,7 +899,7 @@ impl Overlay {
             o.decoder.clear();
             o.core.end(Why::Unpredicted, Some(&st), now);
             o.core.last_activity = Some(now);
-            o.core.rebase(&st);
+            o.core.rebase(&st, now);
             o.report(&st, now);
             return o.flush_paint(&st, now);
         }
@@ -971,8 +971,10 @@ impl Overlay {
             // The baseline is taken once, after every key of this read.
             o.core.apply_edits_only(edits, &st, now);
         }
+        // The lazy check runs here too: a read may hold no key (a release event, half a UTF-8
+        // character), and its baseline must not take output nobody checked (SEC-1).
         o.core.last_activity = Some(now);
-        o.core.rebase(&st);
+        o.core.rebase(&st, now);
         o.report(&st, now);
         o.flush_paint(&st, now)
     }
@@ -1109,7 +1111,7 @@ impl Overlay {
             }
         }
         let st = Shadow::new(&**shadow);
-        o.core.rebase(&st);
+        o.core.rebase(&st, now);
         if o.status.is_some() {
             f.paint = o.paint(&st, now);
         }

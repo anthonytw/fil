@@ -52,6 +52,18 @@ fn listening_here(port: u16) -> bool {
     .is_ok()
 }
 
+/// The IPv4 address this machine would send from to reach `host` (an address or a name), if it is
+/// not a loopback one: the address of this machine on the host's network.
+fn route_source(host: &str) -> Option<String> {
+    let to = std::net::ToSocketAddrs::to_socket_addrs(&(host, 9))
+        .ok()?
+        .find(std::net::SocketAddr::is_ipv4)?;
+    let s = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    s.connect(to).ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
+}
+
 /// A command typed in the session; its output (with the echo) and its exit status, read with a
 /// marker only the shell computes.
 pub fn sess_status(c: &mut Client, cmd: &str) -> Result<(String, i32), String> {
@@ -218,15 +230,18 @@ pub fn fwd_hostile_remote(ctx: &Ctx, host: &str) -> Res {
             "`fil` in the session reaches the daemon of /tmp/fil-$UID, not --local's private one",
         );
     }
-    // This machine's address on its network (never printed: notes say `<ip>`).
+    // This machine's address on its network (never printed: notes say `<ip>`): en0's on a Mac,
+    // else the address this machine reaches the host from (a Linux client, such as GitHub's arm64
+    // runner, docs/m1/pi.md). A UDP socket's connect sends nothing; it only picks the route.
     let lan = Command::new("ipconfig")
         .args(["getifaddr", "en0"])
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| s.parse::<std::net::Ipv4Addr>().is_ok());
+        .filter(|s| s.parse::<std::net::Ipv4Addr>().is_ok())
+        .or_else(|| route_source(&ctx.targets.host_part(host)));
     let Some(lan) = lan else {
-        return skip("no IPv4 address on en0 for the canary");
+        return skip("no IPv4 address on en0, or towards the host, for the canary");
     };
     let MacPorts { l, .. } = mac_ports();
     let canary_port = l + 5;

@@ -2,7 +2,7 @@
 
 > **Living reference** for the scenarios it describes and **the record** of their results; where it and `DESIGN.md` or the code differ, they win.
 
-The M3 half of the drop-in suite (`docs/m1/dropin.md`, `docs/m2/dropin.md`): this Mac's `fil` client with predictive echo on, driven on a pseudo-terminal, against `fil server --stdio` on the test Pis, or against a private daemon on this machine (`--local`). The plan's list is `docs/m3/plan.md` §5.6; the real-network half (the latency cells) is `docs/m3/latency.md`.
+The M3 half of the drop-in suite (`docs/m1/dropin.md`, `docs/m2/dropin.md`): this Mac's `fil` client with predictive echo on, driven on a pseudo-terminal, against `fil server --stdio` on an arm64 Linux remote host (GitHub's arm64 runner, automated, since the owner's decision of 2026-11-11; the test Pis optionally), or against a private daemon on this machine (`--local`). The plan's list is `docs/m3/plan.md` §5.6; the real-network half (the latency cells) is `docs/m3/latency.md`.
 
 ## Running it
 
@@ -21,7 +21,7 @@ The rules of `docs/m1/dropin.md` hold (fresh evidence, exact comparisons, a clea
 
 - **types like a person:** one key at a time, about eight a second (`KEY_GAP`, 120 ms), arrows in the terminal's current cursor-key mode;
 - **runs through the cut relay with a delay** (`netcut.rs`, `set_delay`): 75 ms each way (`DELAY`), so a host on the LAN is a 150 ms round trip away and `adaptive` predicts;
-- **reads the client's own counts:** the client logs `PredictStats` (counts only, at debug) when it ends; the scenario parses that line (`predict::parse_stats`) and requires no visible misprediction (every reason of `Mispredicted` summed), and guesses written where prediction should show (`written > 0`) or none where it must not (`written == 0`);
+- **reads the client's own counts:** the client logs `PredictStats` (counts only, at debug) when it ends; the scenario parses that line (`predict::parse_stats`) and requires no visible misprediction (every reason of `Mispredicted` summed; for fish in `predict_shell`, every reason but the two of its named residual, `contradicted` and `hidden`, which plan §2.5 accepts as part of the faithful bar, decided, owner 2026-11-11, at most 2 per run; for bash, at most 1 `hidden`, the late echo after the grace tick, fixed in 0.2.1 (#91); each reported when it occurs, and more than the cap is a miss; the decision's exclusion of whole writes cannot be told apart here and is the soak's), and guesses written where prediction should show (`written > 0`) or none where it must not (`written == 0`);
 - **checks the reserved alphabet** (§5.2): the secrets are Latin-1 letters (U+00C0 to U+00FF, without `×` and `÷`), which no scenario program prints otherwise, and any one of them in the client's output (its escape sequences taken out by the driver's stripper, as a terminal decodes them) or on its emulated screen fails the scenario. The check runs at the end of every prediction scenario, not only the secret one;
 - **looks at quiet points:** after each command, once the output has been still for 1.2 s, no cell of the screen is underlined (above 80 ms a written guess is underlined, PC-1, so an underline left behind is a guess that never settled);
 - **checks input that is not predicted by timing:** a paste's glyphs must not show within half the round trip of the paste (`nothing_before_echo`): no echo can be back that soon, so anything shown is a guess;
@@ -63,9 +63,13 @@ macOS 27.2 on Apple silicon; the release client, `fil-daemon-dev` and the driver
 
 **Every M1 and M2 scenario with `--predict always`, `--local`:** 54 run, 42 pass, 11 skipped (the scenarios that need ssh as the transport or the relay to a real host, skipped on `--local` as always), 1 failed: `git_tools`, which fails the same way with `--predict off` and passes with `--predict always` under an English locale. It reads `git status`'s English text, which a non-English locale does not print: a limit of the scenario, not of prediction. No regression from prediction.
 
-### The Pis
+### The arm64 remote (GitHub's arm64 runner)
 
-> **PI-TBD: to be filled from the owner's runs** (the commands are in the coordinator's notes, outside the repo). Two rows per scenario, one per Pi. The Pi binary must come from the `aarch64` job of the same tree as the client.
+**This replaces the Pis as the 0.2.0 gate (decided, owner 2026-11-11).** `linux-check` `suite=arm64-remote` (and `all`) runs this suite, `--scale full --predict always`, from the runner's own client against the static aarch64 build behind the Pis' gate on the same runner (`docs/m1/pi.md` "On GitHub's arm64 runner"). Results on GitHub: no complete run yet: 43249521186 (on `b68f7ed`) stopped on the runner's `XDG_CONFIG_HOME` reaching the `fil-test` login, fixed in `4121d47`; 43253859121 (on `4121d47`) was running when this was written. The first complete run's go here, one column for the runner, in the table's shape below. **Validated locally** (2026-11-12, `main` at `84b277e` plus this branch, the runner's setup in a throwaway systemd container in the Mac's aarch64 VM; `docs/m1/pi.md`): `predict_secret`, `predict_alt`, `predict_paste`, `predict_reconnect`, `predict_resize` and `predict_takeover` pass, with zero visible mispredictions and no reserved character; `predict_shell` passed for bash and zsh and failed for fish in every run, one `contradicted` misprediction each time: fish's named residual (plan §2.5, decided, owner 2026-11-11), which the scenario now accepts (below). The Mac has no fish, so this was the first real-PTY run that showed it. One run of three also showed one `hidden` for bash: a known residual of 0.2.0, a late echo after the grace tick, fixed in 0.2.1 (#91's `Core::expire` change), accepted at most once per run (`BASH_LATE_ECHO`). Every M1 and M2 scenario passed with `--predict always` (`fwd_ports_view` on a rerun after the last setup fix).
+
+### The Pis (optional)
+
+> **Optional since 2026-11-11** (the owner dropped the Pis as a 0.2.0 gate). PI-TBD stays until someone runs them: two rows per scenario, one per Pi. The Pi binary must come from the `aarch64` job of the same tree as the client.
 
 Run: PI-TBD (commit, date, Pi binary sha256).
 
@@ -83,8 +87,8 @@ Run: PI-TBD (commit, date, Pi binary sha256).
 
 ### Done-when on the drop-in suite
 
-| Done-when | This Mac | The Pis |
+| Done-when | This Mac | The arm64 remote (the Pis optional) |
 |---|---|---|
-| 1: no secret written (the reserved-alphabet check) | holds | PI-TBD |
-| 2: no visible misprediction in the prediction scenarios | holds | PI-TBD |
-| 5: every M1 and M2 scenario passes with prediction on | holds for `always` (`git_tools` aside: the locale, above); `adaptive` with injected latency is covered only by the seven prediction scenarios here, not by an M1/M2 re-run through the relay | PI-TBD |
+| 1: no secret written (the reserved-alphabet check) | holds | pending the first `suite=arm64-remote` run |
+| 2: no visible misprediction in the prediction scenarios | holds | pending the first `suite=arm64-remote` run |
+| 5: every M1 and M2 scenario passes with prediction on | holds for `always` (`git_tools` aside: the locale, above); `adaptive` with injected latency is covered only by the seven prediction scenarios here, not by an M1/M2 re-run through the relay | pending the first `suite=arm64-remote` run |

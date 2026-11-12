@@ -26,6 +26,8 @@ New in 0.2.0. Over a slow link, every key you type takes a round trip before it 
 
 **What it predicts.** Printable characters (ASCII and Latin-script characters) at a shell or REPL prompt, Backspace over what you just typed, and the left and right arrows (and Ctrl-B, Ctrl-F) within what you just typed. It never predicts Enter, Tab completion, history, Ctrl-R, Ctrl-U, Ctrl-W or other control keys, never draws anything that would wrap a line or scroll the screen, and stays off in full-screen programs that use the alternate screen (vim, less, htop, tmux). Your keys go to the host exactly as they would without prediction.
 
+**A known limit in 0.2.0** (to be fixed in 0.2.1). Once something interrupts the run of guesses, prediction stays off until your typing slows below about one key per round trip: about 7 keys a second at a 150 ms round trip and 2.5 at 400 ms, slower than many people type. What interrupts it: Enter, Tab, Ctrl-W, a Backspace while keys are still on their way to the host, reaching the end of the line, and fish's or zsh's autosuggestions. Within a line that starts with nothing in flight, prediction works. This limit never shows anything wrong: fil just does not guess, and you see your keys when the host echoes them, as over ssh. The measurements are in [the latency cells](../m3/latency.md#coverage-at-long-round-trips-the-known-limit-020-ships-with).
+
 **Turning it off.** In [`config.toml`](config.md#predict), for one host or for all:
 
 ```text

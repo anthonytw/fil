@@ -326,7 +326,7 @@ Within the budget, and the damage harvest costs `cat` nothing measurable (P2's "
 
 **Follow-up (not P2's file):** `fil-client`'s `Display::open_gates` still builds a whole `TermState` to read the cursor (`overlay.view(0).shadow.cursor`). It runs for questions and the offline confirmation, not per key; once `Overlay` exposes the view's cursor it can read that instead (E1a or the sweep).
 
-**Still to measure (done-when 7):** GitHub's Linux x86_64 and arm64 runners, which V1 measures with the Pis (`linux-check`; the bench needs no PTY and runs as is: `cargo bench -p fil-predict --bench budget`).
+**Still to measure (done-when 7):** GitHub's Linux x86_64 and arm64 runners. Since 2026-11-12 `linux-check` runs the bench (it needs no PTY: `cargo bench -p fil-predict --bench budget`) in `suite=all`, in the `full-scale` job (x86_64) and the `arm64-remote` job (arm64), and prints it in the step summary; no run has recorded it yet. The numbers above are also from before P1's predictor and the sweep's epoch changes, so the Mac wants a fresh measurement on the same tree.
 
 ## 9. T1 part 2: the prediction suites and the independent classifier
 

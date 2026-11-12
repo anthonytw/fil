@@ -11,15 +11,17 @@
 #                      [--github REMOTE] [--tap DIR] [--vm NAME]
 #
 #   (default)      fetch `origin` and `github` (no tags), bind the state to VERSION and HEAD, take
-#                  the lock, detect every step, record the identifiers found (the mirror commit,
+#                  the lock, detect every step, record the identifiers found (GitHub's commit,
 #                  run ids, the tag object) in the state, run the preflight for the next step and
 #                  the ones after it, at a terminal unlock the keys the remaining steps need (one
 #                  block, release-keys.sh unlock --ttl), then do the next step's action and the ones
 #                  after it, through finish:
-#                    mirror      [confirmation] a commit signed by the owner (git commit-tree -S) with
-#                                the release commit's exact tree on top of GitHub's main, pushed there
+#                    mirror      [confirmation] GitHub's main fast-forwarded to the release commit R
+#                                itself (git push github R:refs/heads/main, never forced); done when R
+#                                is on GitHub's main already (agents push it); refused when GitHub's
+#                                main has commits R lacks
 #                    dry-run     dispatch release.yml, and linux-check and macos-check with suite=all
-#                                (ref = the mirror commit), on GitHub's main; the run ids (from the URL
+#                                (ref = R), on GitHub's main (which must be R); the run ids (from the URL
 #                                gh prints, else the new run on the commit) are recorded at once, and
 #                                every run is waited for (Ctrl-C is safe: a re-run re-attaches). A run
 #                                that failed: at a terminal, the command offers `gh run rerun --failed`.
@@ -31,11 +33,11 @@
 #                                those runs and attempts (--status: "done (waived)"). Without a
 #                                terminal that decision pauses the run (exit 2). A running run the
 #                                state lost is attached to only if it is this release's (triggered by
-#                                the gh user, not older than the mirror commit)
-#                    dry-verify  release-verify --dry-run --from-run RUN --ref G (the VM rebuild); its
+#                                the gh user, not older than the release commit)
+#                    dry-verify  release-verify --dry-run --from-run RUN --ref R (the VM rebuild); its
 #                                success is recorded in the state (a local result)
 #                    tag         [confirmation, again in every run that did not confirm `tag` itself:
-#                                the answer is never stored] the tag vV on the mirror commit, signed
+#                                the answer is never stored] the tag vV on the release commit, signed
 #                                with the release key's .pub through the agent (local name always vV-gh:
 #                                vV belongs to Gitea's marker; a vV-gh made by an earlier run is reused),
 #                                checked with verify-tag.sh, pushed to refs/tags/vV
@@ -273,7 +275,7 @@ tree_of() { rg rev-parse -q --verify "$1^{tree}" 2> /dev/null || true; }
 has_commit() { [ -n "$1" ] && rg cat-file -e "$1^{commit}" 2> /dev/null; }
 
 # ---- the state file
-STATE_KEYS="version release_commit github_commit dry_run checks_linux checks_macos checks_waived dry_verify tag_object tag_run verify_published brew_tested"
+STATE_KEYS="version release_commit bound_at github_commit dry_run checks_linux checks_macos checks_waived dry_verify tag_object tag_run verify_published brew_tested"
 # st_get KEY: the value of the last KEY= line ("" if none).
 st_get() {
   [ -f "$STATE" ] || return 0
@@ -412,7 +414,11 @@ pred_macos_all() {
 }
 pred_tag_run() { rv_has "$1" "workflowName release" && rv_has "$1" "event push" && rv_has "$1" "headSha $G" && rv_has "$1" "job success publish"; }
 # run_ours ID: a dispatched run that is this release's: triggered by the gh user running the command
-# and created no earlier than the mirror commit (5 minutes of clock slack). The workflows' inputs are
+# and created no earlier than the state was bound to the release commit (bound_at, 5 minutes of clock
+# slack; R can sit on GitHub's main for days before the release, so R's own commit time would let an
+# older run in, of another `ref` input, which GitHub does not report). A run sets BOUND_AT before its
+# first detection (a new or reset state: now); without it (--status of a state that has none) no
+# listed run is this release's. The workflows' inputs are
 # not reported, so a run found by listing, not dispatched and recorded by the command, needs this.
 # 0 yes, 1 no, 2 GitHub could not be asked.
 GH_USER=''
@@ -421,7 +427,8 @@ run_ours() {
   [ -n "$GH_USER" ] || GH_USER=$(gh_read api user --jq .login) || return 2
   [ -n "$GH_USER" ] || return 2
   out=$(gh_read api "repos/$repo/actions/runs/$1" --jq '[.triggering_actor.login // "", .created_at // ""] | @tsv') || return 2
-  gt=$(rg show -s --format=%ct "$G" 2> /dev/null) || return 2
+  gt=${BOUND_AT:-$(st_num bound_at)}
+  is_num "$gt" || return 1
   printf '%s\n' "$out" | python3 -I -c 'import datetime, sys
 user, gt = sys.argv[1], int(sys.argv[2])
 f = (sys.stdin.read().rstrip("\n").split("\t") + ["", ""])[:2]
@@ -597,9 +604,36 @@ read_tag() {
   fi
 }
 
+# main_trust: MAIN_BAD is why GitHub's main, past R, cannot be trusted ("" when it can, or when it
+# is R, behind R, or not read). The tag and every verification read .github/release-signers from
+# GitHub's main, and any account that may push main can fast-forward it, so a commit there past R
+# must be one of Gitea's main (reviewed there) and must leave release-signers exactly as R has it.
+MAIN_BAD=''
+main_trust() {
+  MAIN_BAD=''
+  [ -n "$GMAIN" ] && [ "$GMAIN" != "$R" ] || return 0
+  if ! has_commit "$GMAIN"; then
+    MAIN_BAD="$github's main ($(short "$GMAIN")) is not in the clone: git fetch $github"
+    return 1
+  fi
+  rg merge-base --is-ancestor "$R" "$GMAIN" || return 0
+  if ! rg merge-base --is-ancestor "$GMAIN" "refs/remotes/$origin/main" 2> /dev/null; then
+    MAIN_BAD="$github's main ($(short "$GMAIN")) is past the release commit with commits Gitea's main ($origin/main) lacks: they must reach Gitea's main first (a PR there)"
+  elif [ "$(rg rev-parse -q --verify "$GMAIN:.github/release-signers" 2> /dev/null || true)" != "$(rg rev-parse -q --verify "$R:.github/release-signers" 2> /dev/null || true)" ]; then
+    MAIN_BAD="$github's main ($(short "$GMAIN")) has a .github/release-signers that differs from the release commit's: the tag and the verifications read it from main"
+  fi
+  [ -z "$MAIN_BAD" ]
+}
+
+# The mirror is done when the release commit R itself is on GitHub's main (main is R, or moved on
+# past it): G is then R. Agents fast-forward GitHub's main to Gitea's after each merge batch, so R is
+# often there before the release starts. MIRROR is ff (main is an ancestor of R: the step
+# fast-forwards it), diverged (main has commits R lacks: refused, never forced) or untrusted (past R,
+# but not as main_trust wants it: refused) when not done. With a good tag, G is the commit it names
+# (R, or a legacy mirror commit with R's tree); otherwise G is R.
+MIRROR=''
 det_mirror() {
-  local sg
-  sg=$(st_hex github_commit)
+  MIRROR=''
   if [ "$TAG_OK" = 1 ]; then
     G=$TAG_COMMIT
     NOTE="G $(short "$G"): the tag names it, and its tree is the release commit's"
@@ -613,21 +647,25 @@ det_mirror() {
     UNKNOWN=1 NOTE="$github's main ($(short "$GMAIN")) is not in the clone: git fetch $github"
     return 1
   fi
-  if [ -n "$sg" ] && has_commit "$sg" && [ "$(tree_of "$sg")" = "$(tree_of "$R")" ] && rg merge-base --is-ancestor "$sg" "$GMAIN"; then
-    G=$sg
-    NOTE="G $(short "$G") (recorded): on GitHub's main, with the release commit's tree"
+  if [ "$GMAIN" = "$R" ]; then
+    G=$R
+    NOTE="$github's main is the release commit $(short "$R")"
     return 0
   fi
-  if ! has_commit "$GMAIN"; then
-    UNKNOWN=1 NOTE="$github's main ($(short "$GMAIN")) is not in the clone: git fetch $github"
+  if rg merge-base --is-ancestor "$R" "$GMAIN"; then
+    if [ -n "$MAIN_BAD" ]; then
+      MIRROR=untrusted NOTE=$MAIN_BAD
+      return 1
+    fi
+    G=$R
+    NOTE="the release commit $(short "$R") is on $github's main, which has moved on to $(short "$GMAIN")"
+    return 0
+  fi
+  if rg merge-base --is-ancestor "$GMAIN" "$R"; then
+    MIRROR=ff NOTE="$github's main ($(short "$GMAIN")) is behind the release commit: a fast-forward pushes it"
     return 1
   fi
-  if [ "$(tree_of "$GMAIN")" = "$(tree_of "$R")" ]; then
-    G=$GMAIN
-    NOTE="G $(short "$G"): $github/main has the release commit's tree"
-    return 0
-  fi
-  NOTE="$github/main ($(short "$GMAIN")) does not have the release commit's tree"
+  MIRROR=diverged NOTE="$github's main ($(short "$GMAIN")) has commits the release commit lacks: it cannot be fast-forwarded"
   return 1
 }
 
@@ -656,7 +694,7 @@ WAIVED=''
 det_dry_run() {
   local rc miss='' id
   WAIVED=''
-  [ -n "$G" ] || { NOTE="needs the mirror commit (step mirror)"; return 1; }
+  [ -n "$G" ] || { NOTE="needs the release commit on GitHub's main (step mirror)"; return 1; }
   rc=0; DRY_RUN=$(find_run pred_dry "$(st_num dry_run)" release.yml workflow_dispatch "$G") || rc=$?
   [ $rc != 2 ] || { UNKNOWN=1 NOTE="cannot ask GitHub for the runs: $(gh_err)"; return 1; }
   rc=0; CHECKS_LINUX=$(find_run pred_linux_all "$(st_num checks_linux)" linux-check.yml workflow_dispatch "$G") || rc=$?
@@ -694,7 +732,7 @@ det_dry_verify() {
     NOTE="needs the dry run and both suite=all checks green or waived (step dry-run)"
     return 1
   fi
-  NOTE="no recorded release-verify --dry-run of run $DRY_RUN at the mirror commit"
+  NOTE="no recorded release-verify --dry-run of run $DRY_RUN at the release commit"
   [ -z "$rec" ] || NOTE="$NOTE (the state records '$rec', for another run or commit)"
   return 1
 }
@@ -985,6 +1023,7 @@ detect_all() {
   rm -f "$scratch"/run-* "$scratch/assets" "$scratch/release"
   rm -rf "$scratch/dl" "$scratch/gpghome" "$scratch/sums" "$scratch/brew"
   GMAIN=$(rg ls-remote "$github" refs/heads/main 2> /dev/null | awk '{ print $1 }') || GMAIN=''
+  main_trust || true
   read_tag
   [ "$TAG_OK" = 0 ] || read_release
   for s in $PF_STEPS; do
@@ -1039,7 +1078,8 @@ print_status() {
   if [ -f "$STATE" ]; then echo "  state: $STATE"; else echo "  state: none yet ($STATE)"; fi
   [ -z "$sr" ] || [ "$sr" = "$(rg rev-parse -q --verify 'HEAD^{commit}' 2> /dev/null || true)" ] \
     || echo "  WARNING: the state is bound to $sr, but HEAD is $(rg rev-parse -q --verify HEAD 2> /dev/null || echo none): the steps below are for the bound commit"
-  [ -z "$G" ] || echo "  mirror commit (GitHub): $G"
+  [ -z "$G" ] || [ "$G" = "$R" ] || echo "  tagged commit (GitHub): $G"
+  [ -z "$MAIN_BAD" ] || echo "  WARNING: $MAIN_BAD"
   held=$(cat "$LOCK/pid" 2> /dev/null || true)
   if [ -n "$held" ] && kill -0 "$held" 2> /dev/null; then echo "  a release run (pid $held) is running now"; fi
   for ((i = 1; i <= NSTEPS; i++)); do
@@ -1076,14 +1116,12 @@ known_fix() {
   local m=${vm:-${FIL_VM:-fil}}
   case $1 in
     mirror)
-      if log_has 'GH006|GH013|protected branch|rule violation|ruleset'; then
-        echo "GitHub refused the push to main: push as $PF_OWNER, whose admin bypass of the main ruleset allows it (ssh -T git@github.com must say Hi $PF_OWNER; the bypass list is in the repository's Settings, Rules)"
-      elif log_has 'non-fast-forward|fetch first|stale info'; then
-        echo "GitHub's main moved since the fetch: run it again (it fetches, and makes the mirror commit on the new main)"
+      if log_has 'non-fast-forward|fetch first|stale info'; then
+        echo "GitHub's main moved since the fetch to a commit the release commit lacks: run it again (it fetches, and refuses if main has commits Gitea's main does not)"
+      elif log_has 'GH006|GH013|protected branch|rule violation|ruleset'; then
+        echo "GitHub's main ruleset refused a fast-forward push: it should block only deletion and non-fast-forward pushes (the repository's Settings, Rules); push as $PF_OWNER (ssh -T git@github.com must say Hi $PF_OWNER)"
       elif log_has 'permission denied \(publickey\)|could not read from remote'; then
         echo "ssh-add your GitHub key (ssh -T git@github.com must say Hi $PF_OWNER)"
-      elif log_has 'failed to sign|no private key found|agent refused|could not sign|signing failed|incorrect passphrase|ssh-keygen.*(error|failed)'; then
-        echo "git cannot sign the commit: ssh-add the key that git config user.signingkey names"
       fi
       ;;
     dry-run)
@@ -1228,27 +1266,50 @@ act_candidate() {
     "fix it on Gitea (a PR to main), then run it from the new main; there is no tag yet, so $AGAIN --reset-state rebinds the state to the new commit"
 }
 
+# mirror_refuse WHAT: GitHub's main is not one the mirror fast-forwards (the preflight refuses these
+# at the start; this is for a main that moved during the confirmation).
+mirror_refuse() {
+  echo "$github's main $GMAIN, the release commit $R: $1" >> "$STEP_LOG"
+  step_fail "$1; the mirror only fast-forwards GitHub's main to the release commit (it never forces)" \
+    "find out what they are (git fetch $github; git log $R..$github/main) and who pushed them; they must reach Gitea's main first (a PR there), then release from the new main ($AGAIN --reset-state rebinds, there is no tag yet)"
+}
 act_mirror() {
-  local g point=tag t
+  local point=tag n now
   step_log mirror
   [ "$confirm_each" = 0 ] || point=mirror
-  t=$(tree_of "$R")
-  set -- "step 2 mirror: a commit signed by you with the exact tree $(short "$t") of the release commit $(short "$R"), on top of GitHub's main $(short "$GMAIN"), pushed to main of github.com/$repo: public history, which GitHub keeps" \
+  # (a main that is diverged or untrusted at the start never gets here: the preflight's github-main
+  # check refuses it; main is judged again after the confirmation, below)
+  n=$(rg rev-list --count "$GMAIN..$R")
+  set -- "step 2 mirror: GitHub's main fast-forwarded from $(short "$GMAIN") to the release commit $(short "$R") (new commits: $n), pushed to github.com/$repo: public history, which GitHub keeps" \
     "its changes to GitHub's main: $(rg diff --shortstat "$GMAIN" "$R" | sed 's/^ *//')"
   if [ "$point" = tag ]; then
-    set -- "$@" "step 5 tag (this answer covers it too): the tag $TAG on that commit, signed with the release key; the tag ruleset forbids moving or deleting it, so a bad tag means a new version" \
+    set -- "$@" "step 5 tag (this answer covers it too): the tag $TAG on the release commit, signed with the release key; the tag ruleset forbids moving or deleting it, so a bad tag means a new version" \
       "between the two: the dry run, the suite=all checks and the dry run's verification, each of which stops the release on its own"
   else
     set -- "$@" "(--confirm-each: the tag is asked for on its own, at step 5)"
   fi
   confirm "$point" "$@"
-  # LC_ALL=C: known_fix reads git's English messages
-  g=$(LC_ALL=C rg commit-tree -S "$R^{tree}" -p "$GMAIN" -m "fil $V" 2>> "$STEP_LOG") || step_fail "git commit-tree -S could not make or sign the mirror commit"
-  rg cat-file commit "$g" | grep -q '^gpgsig ' || step_fail "git commit-tree -S made an unsigned commit ($g)" "check git config gpg.format and user.signingkey"
-  echo "the mirror commit: $g (tree $t, parent $GMAIN)" >> "$STEP_LOG"
-  log "pushing the mirror commit $(short "$g") to $github's main"
-  LC_ALL=C rg push "$github" "$g:refs/heads/main" >> "$STEP_LOG" 2>&1 || step_fail "git push $github $(short "$g"):main failed"
-  st_set github_commit "$g"
+  # Main may have moved while the question waited: it is read again, and only a main that is still
+  # an ancestor of R is fast-forwarded. A main at R or past it (the agents pushed it) needs nothing
+  # (main_trust and the next detection judge a main past R); any other is refused.
+  now=$(rg ls-remote "$github" refs/heads/main 2> /dev/null | awk '{ print $1 }') || now=''
+  [ -n "$now" ] || step_fail "cannot read main on '$github' after the confirmation" "run it again"
+  has_commit "$now" || rg fetch -q --no-tags "$github" 2>> "$STEP_LOG" || true
+  has_commit "$now" || step_fail "$github's main moved to $(short "$now") during the confirmation, and it cannot be fetched" "run it again"
+  if [ "$now" = "$R" ] || rg merge-base --is-ancestor "$R" "$now"; then
+    echo "$github's main is $now now, which has the release commit $R: nothing to push" >> "$STEP_LOG"
+    log "$github's main moved to $(short "$now") during the confirmation, and has the release commit: nothing to push"
+    # the tag step verifies against refs/remotes/$github/main, which must have caught up
+    rg fetch -q --no-tags "$github" 2>> "$STEP_LOG" || step_fail "git fetch $github failed" "run it again"
+    return 0
+  fi
+  rg merge-base --is-ancestor "$now" "$R" \
+    || { GMAIN=$now; mirror_refuse "GitHub's main moved during the confirmation to $(short "$now"), which the release commit does not contain"; }
+  # A plain push, never forced: GitHub takes it only as a fast-forward of what main is then (a move in
+  # the last moment to a commit R lacks is refused by git). LC_ALL=C: known_fix reads git's English.
+  log "fast-forwarding $github's main to the release commit $(short "$R")"
+  echo "git push $github $R:refs/heads/main (main was $GMAIN)" >> "$STEP_LOG"
+  LC_ALL=C rg push "$github" "$R:refs/heads/main" >> "$STEP_LOG" 2>&1 || step_fail "git push $github $(short "$R"):main failed"
 }
 
 # The dry run's three runs: release.yml, and linux-check and macos-check with suite=all.
@@ -1287,7 +1348,7 @@ dr_class() {
   while read -r id st concl; do
     is_num "$id" || continue
     [ "$st" != completed ] || continue
-    # only this release's: a run someone else dispatched, or one older than the mirror commit, may
+    # only this release's: a run someone else dispatched, or one older than the release commit, may
     # test other inputs (suite, ref)
     rc=0
     run_ours "$id" || rc=$?
@@ -1304,8 +1365,8 @@ dr_dispatch() {
   local -a args=(--ref main)
   [ "$wf" = release.yml ] || args+=(-f suite=all -f "ref=$G")
   now=$(rg ls-remote "$github" refs/heads/main 2> /dev/null | awk '{ print $1 }') || now=''
-  [ "$now" = "$G" ] || step_fail "GitHub's main is ${now:-unreadable}, not the mirror commit $(short "$G"): a dispatch on main would test another commit" \
-    "find out who pushed it (git fetch $github; git log $github/main); the dry run needs main at the mirror commit"
+  [ "$now" = "$G" ] || step_fail "GitHub's main is ${now:-unreadable}, not the release commit $(short "$G"): a dispatch on main would test another commit (release.yml's dry run builds main's head)" \
+    "find out who pushed it (git fetch $github; git log $G..$github/main): GitHub's main must stay at the release commit until the dry run is dispatched, so hold the agents' pushes of main; if main moved on with merges of Gitea's main, release its new head instead (git checkout it; $AGAIN --reset-state rebinds, there is no tag yet)"
   run_ids "$wf" workflow_dispatch "$G" > "$scratch/before" || step_fail "cannot ask GitHub for the runs of $wf: $(gh_err)"
   echo "gh workflow run $wf --repo $repo ${args[*]}" >> "$STEP_LOG"
   if ! out=$("$GH" workflow run "$wf" --repo "$repo" "${args[@]}" 2>&1); then
@@ -1511,7 +1572,7 @@ act_tag() {
   case " $CONFIRMED " in
     *" tag "*) echo "the tag confirmation was given in this run" >> "$STEP_LOG" ;;
     *)
-      set -- "step 5 tag: the tag $TAG on the mirror commit $(short "$G") (tree $(short "$t"), the release commit $(short "$R")'s), signed with the release key ($RELEASE_PUB), pushed to github.com/$repo; the tag ruleset forbids moving or deleting it, so a bad tag means a new version" \
+      set -- "step 5 tag: the tag $TAG on the release commit $(short "$G") (tree $(short "$t")), signed with the release key ($RELEASE_PUB), pushed to github.com/$repo; the tag ruleset forbids moving or deleting it, so a bad tag means a new version" \
         "it starts release.yml on the tag, which makes the draft release (step 6)"
       [ -z "$(st_get checks_waived)" ] || set -- "$@" "the red suite=all checks you waived: $(st_get checks_waived)"
       confirm tag "$@"
@@ -2045,7 +2106,7 @@ act_finish() {
   {
     echo "release: fil $V is released"
     echo "  release commit   $R"
-    echo "  mirror commit    $G"
+    [ "$G" = "$R" ] || echo "  tagged commit    $G"
     echo "  tag              $TAG (tag object $(st_get tag_object))"
     [ -z "$(st_num dry_run)" ] || echo "  dry run          $(run_url "$(st_num dry_run)")"
     [ -z "$(st_num tag_run)" ] || echo "  tag's run        $(run_url "$(st_num tag_run)")"
@@ -2113,7 +2174,8 @@ if [ -n "$sr" ] && [ "$sr" != "$R" ]; then
     "git checkout $sr"
 fi
 
-# record_found: the identifiers the detections found, into the state.
+# record_found: the identifiers the detections found, into the state. github_commit (the commit on
+# GitHub's main the release is, G) is a record for whoever reads the state: no detection reads it.
 record_found() {
   [ -z "$G" ] || st_set github_commit "$G"
   [ -z "$DRY_RUN" ] || st_set dry_run "$DRY_RUN"
@@ -2122,12 +2184,25 @@ record_found() {
   [ "$TAG_OK" = 0 ] || st_set tag_object "$TAG_OBJ"
   [ -z "$TAG_RUN" ] || st_set tag_run "$TAG_RUN"
 }
+# main_stop: GitHub's main is past R and not to be trusted (main_trust): nothing that reads the
+# signers on main may go on (from the tag on; before it, step mirror refuses it). Before hard_stop: a
+# tag that fails against an untrusted signers file is not burned.
+main_stop() {
+  [ -n "$MAIN_BAD" ] && [ "$NEXT" -gt "$(step_no mirror)" ] || return 0
+  LAST_DONE=$((NEXT - 1))
+  report FAILED "$NEXT" "$MAIN_BAD" "find out who pushed GitHub's main (git fetch $github; git log $R..$github/main); a commit only GitHub has must reach Gitea's main first, and a change of the signers needs a new release commit; then run it again"
+}
 hard_stop() {
   [ -n "$HARD_STEP" ] || return 0
   LAST_DONE=$((HARD_STEP - 1))
   report FAILED "$HARD_STEP" "$HARD" "this version is burned: bump to the next patch version (a PR on Gitea: just set-version), and release that"
 }
 
+# The window for runs found by listing opens when the state is bound (run_ours): now, for a new or
+# reset state, so no run from before this release's first run counts. Written to the state below,
+# once the detection has not refused the checkout.
+BOUND_AT=$(st_num bound_at)
+[ -n "$BOUND_AT" ] || BOUND_AT=$(date -u +%s)
 detect_all
 if [ "$TAG_STATE" = mismatch ]; then
   LAST_DONE=0
@@ -2135,7 +2210,9 @@ if [ "$TAG_STATE" = mismatch ]; then
 fi
 st_set version "$V"
 st_set release_commit "$R"
+st_set bound_at "$BOUND_AT"
 record_found
+main_stop
 hard_stop
 # --from STEP: every step before it must be done (by the command or by hand).
 if [ -n "$from" ]; then
@@ -2202,6 +2279,7 @@ while :; do
   # this step is redone: it reads as it really is from now on
   REDO_LEFT=$(printf '%s\n' $REDO_LEFT | grep -vx -- "$name" | tr '\n' ' ' || true)
   detect_all
+  main_stop
   hard_stop
   record_found
   if [ "$NEXT" -le "$prev" ]; then

@@ -64,7 +64,7 @@ PF_STEPS="candidate mirror dry-run dry-verify tag tag-run verify-presign sign-ma
 pf_step_checks() {
   case $1 in
     candidate) echo "version lockfiles" ;;
-    mirror) echo "github-main gh github-ssh commit-signing release-key" ;;
+    mirror) echo "github-main gh github-ssh release-key" ;;
     dry-run) echo "gh" ;;
     dry-verify) echo "docker vm" ;;
     tag) echo "tag-free tag-ruleset crates-env release-key github-ssh gh" ;;
@@ -76,7 +76,7 @@ pf_step_checks() {
     upload | publish | verify-published) echo "gh" ;;
     verify-signed) echo "gh docker vm" ;;
     crates) echo "gh crates-env" ;;
-    brew) echo "github-ssh" ;;
+    brew) echo "github-ssh commit-signing" ;;
     finish) echo "" ;;
     *) return 1 ;;
   esac
@@ -368,7 +368,7 @@ pf_check_lockfiles() {
 }
 
 pf_check_github_main() {
-  local r g extra
+  local r g
   r=$(pf_r)
   g=$(pf_git ls-remote --exit-code "$PF_GITHUB" refs/heads/main 2> /dev/null | awk '{ print $1 }') || g=''
   if [ -z "$g" ]; then
@@ -380,14 +380,37 @@ pf_check_github_main() {
     return 1
   fi
   PF_G=$g
-  if [ "$(pf_git rev-parse "$g^{tree}")" = "$(pf_git rev-parse "$r^{tree}")" ]; then
-    pf_ok "$PF_GITHUB/main ($g) has the release commit's tree: the mirror commit is made"
+  if [ "$g" = "$r" ]; then
+    pf_ok "$PF_GITHUB/main is the release commit ($r): step mirror is done"
     return 0
   fi
-  pf_note "$PF_GITHUB/main ($g) differs from the release commit: step mirror makes the mirror commit"
-  extra=$(pf_git diff --name-only --diff-filter=D "$g" "$r" | head -n 5 | tr '\n' ' ')
-  [ -z "$extra" ] || pf_warn "$PF_GITHUB/main has files the release commit lacks, which the mirror commit drops: ${extra% }"
-  return 0
+  if pf_git merge-base --is-ancestor "$r" "$g"; then
+    pf_main_trusted "$r" "$g" || return 1
+    pf_warn "$PF_GITHUB/main ($g) has moved on past the release commit $r: step mirror is done, but the dry run (step dry-run) dispatches on main and needs main at the release commit; hold the pushes of GitHub's main until it is dispatched, or release main's head"
+    return 0
+  fi
+  if pf_git merge-base --is-ancestor "$g" "$r"; then
+    pf_note "$PF_GITHUB/main ($g) is behind the release commit (new commits: $(pf_git rev-list --count "$g..$r")): step mirror fast-forwards it"
+    return 0
+  fi
+  pf_fail "$PF_GITHUB/main ($g) is not an ancestor of the release commit $r: it has commits Gitea's main lacks, and step mirror only fast-forwards (it never forces)" "GitHub's main pushed from outside Gitea" \
+    "see what they are (git log $r..$PF_GITHUB/main); they must reach Gitea's main first (a PR there), then release from the new main"
+  return 1
+}
+# pf_main_trusted R G: G (GitHub's main, past R) is on Gitea's main and has R's release-signers, byte for
+# byte: the tag and every verification read the signers from GitHub's main, which any account that
+# may push it can fast-forward. Fails (pf_fail) if not.
+pf_main_trusted() {
+  if ! pf_git merge-base --is-ancestor "$2" "refs/remotes/$PF_ORIGIN/main" 2> /dev/null; then
+    pf_fail "$PF_GITHUB/main ($2) is past the release commit with commits $PF_ORIGIN/main lacks: the signers on it are not Gitea's" "GitHub's main pushed from outside Gitea" \
+      "see what they are (git fetch $PF_ORIGIN $PF_GITHUB; git log $PF_ORIGIN/main..$PF_GITHUB/main); they must reach Gitea's main first (a PR there)"
+    return 1
+  fi
+  if [ "$(pf_git rev-parse -q --verify "$2:.github/release-signers" 2> /dev/null || true)" != "$(pf_git rev-parse -q --verify "$1:.github/release-signers" 2> /dev/null || true)" ]; then
+    pf_fail "$PF_GITHUB/main ($2) has a .github/release-signers that differs from the release commit's: the tag and the verifications read it from main" "rotated or lost release key" \
+      "a change of the release signers needs a new release commit (a PR on Gitea, then release that commit)"
+    return 1
+  fi
 }
 # github/main: what the github-main check read, else the clone's remote-tracking ref (no network).
 pf_g() { [ -n "$PF_G" ] || PF_G=$(pf_git rev-parse -q --verify "refs/remotes/$PF_GITHUB/main^{commit}" 2> /dev/null || true); echo "$PF_G"; }
@@ -443,7 +466,7 @@ pf_check_commit_signing() {
     pf_fail "git commit-tree -S made an unsigned commit" - "check git config user.signingkey and gpg.format"
     return 1
   fi
-  pf_ok "git signs commits (the mirror commit)"
+  pf_ok "git signs commits (the tap's formula commit, step brew)"
 }
 
 pf_check_crates_env() {
@@ -604,10 +627,13 @@ pf_check_release_key() {
   for where in R G; do
     if [ "$where" = G ]; then
       [ -n "$g" ] || { pf_note "github/main not read: the release key is checked on the release commit only"; break; }
-      if [ "$(pf_git rev-parse "$g^{tree}")" != "$(pf_git rev-parse "$r^{tree}")" ]; then
-        pf_note "github/main is not mirrored yet: the mirror commit carries the release commit's release-signers"
+      # verify-tag.sh reads the signers on GitHub's main: R's own once main is R or behind it (the
+      # mirror makes it R), the later commit's once main has moved on past R
+      if [ "$g" = "$r" ] || ! pf_git merge-base --is-ancestor "$r" "$g" 2> /dev/null; then
         break
       fi
+      # past R: main must be Gitea's and keep R's file (pf_main_trusted), not merely list the key
+      pf_main_trusted "$r" "$g" || { bad=1; break; }
     fi
     pf_git show "$([ "$where" = R ] && echo "$r" || echo "$g"):.github/release-signers" > "$s" 2> /dev/null || : > "$s"
     ns=" $(pf_signer_namespaces "$s" "$key" | tr '\n' ' ')"

@@ -385,6 +385,7 @@ pf_check_github_main() {
     return 0
   fi
   if pf_git merge-base --is-ancestor "$r" "$g"; then
+    pf_main_trusted "$r" "$g" || return 1
     pf_warn "$PF_GITHUB/main ($g) has moved on past the release commit $r: step mirror is done, but the dry run (step dry-run) dispatches on main and needs main at the release commit; hold the pushes of GitHub's main until it is dispatched, or release main's head"
     return 0
   fi
@@ -395,6 +396,21 @@ pf_check_github_main() {
   pf_fail "$PF_GITHUB/main ($g) is not an ancestor of the release commit $r: it has commits Gitea's main lacks, and step mirror only fast-forwards (it never forces)" "GitHub's main pushed from outside Gitea" \
     "see what they are (git log $r..$PF_GITHUB/main); they must reach Gitea's main first (a PR there), then release from the new main"
   return 1
+}
+# pf_main_trusted R G: G (GitHub's main, past R) is on Gitea's main and has R's release-signers, byte for
+# byte: the tag and every verification read the signers from GitHub's main, which any account that
+# may push it can fast-forward. Fails (pf_fail) if not.
+pf_main_trusted() {
+  if ! pf_git merge-base --is-ancestor "$2" "refs/remotes/$PF_ORIGIN/main" 2> /dev/null; then
+    pf_fail "$PF_GITHUB/main ($2) is past the release commit with commits $PF_ORIGIN/main lacks: the signers on it are not Gitea's" "GitHub's main pushed from outside Gitea" \
+      "see what they are (git fetch $PF_ORIGIN $PF_GITHUB; git log $PF_ORIGIN/main..$PF_GITHUB/main); they must reach Gitea's main first (a PR there)"
+    return 1
+  fi
+  if [ "$(pf_git rev-parse -q --verify "$2:.github/release-signers" 2> /dev/null || true)" != "$(pf_git rev-parse -q --verify "$1:.github/release-signers" 2> /dev/null || true)" ]; then
+    pf_fail "$PF_GITHUB/main ($2) has a .github/release-signers that differs from the release commit's: the tag and the verifications read it from main" "rotated or lost release key" \
+      "a change of the release signers needs a new release commit (a PR on Gitea, then release that commit)"
+    return 1
+  fi
 }
 # github/main: what the github-main check read, else the clone's remote-tracking ref (no network).
 pf_g() { [ -n "$PF_G" ] || PF_G=$(pf_git rev-parse -q --verify "refs/remotes/$PF_GITHUB/main^{commit}" 2> /dev/null || true); echo "$PF_G"; }
@@ -616,6 +632,8 @@ pf_check_release_key() {
       if [ "$g" = "$r" ] || ! pf_git merge-base --is-ancestor "$r" "$g" 2> /dev/null; then
         break
       fi
+      # past R: main must be Gitea's and keep R's file (pf_main_trusted), not merely list the key
+      pf_main_trusted "$r" "$g" || { bad=1; break; }
     fi
     pf_git show "$([ "$where" = R ] && echo "$r" || echo "$g"):.github/release-signers" > "$s" 2> /dev/null || : > "$s"
     ns=" $(pf_signer_namespaces "$s" "$key" | tr '\n' ' ')"

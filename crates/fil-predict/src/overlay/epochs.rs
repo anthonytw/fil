@@ -13,7 +13,7 @@
 //! Every switch in [`Guards`] that belongs to a rule here is read where the rule is applied, so
 //! the tests can show each one is needed (`tests/hazards.rs`, `tests/mutants.rs`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use fil_term::Size;
@@ -37,6 +37,10 @@ pub const MAX_OUTSTANDING: usize = 1024;
 /// The most cuts of one server-output chunk at which the written guesses' cells are looked at
 /// ([`Core::glimpse`]); past it the rest of the chunk is fed whole.
 pub const MAX_CUTS: usize = 16;
+/// The typed keys remembered for [`Core::glimpse`]'s walk: a guess with more keys typed after it
+/// is not explained by any of them, and its cell is left to the shadow after the chunk, as
+/// without the cuts. So the cap can only cost a confirmation, never add one.
+pub const TYPED: usize = 64;
 
 /// What the core counts (`docs/m3/plan.md` §2.5). Counts only: no glyph, cell or key.
 ///
@@ -261,6 +265,21 @@ pub(crate) enum Cut {
     Move,
 }
 
+/// How a typed key moves a line editor's cursor, as [`Core::glimpse`] follows it from a guess.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// A printable character: drawn at the cursor, which then moves one right.
+    Char,
+    /// A Backspace: the cursor moves one left and the character there is erased.
+    Back,
+    /// A one-character move (`KeyClass::Left`, `Right`): touches no cell.
+    Left,
+    Right,
+    /// Anything else (Enter, Tab, another boundary key, a pasted key): the cursor is not followed
+    /// past it.
+    Stop,
+}
+
 /// A written guess's cell during one server-output chunk cut at its scrolls, erases and
 /// cursor moves ([`Core::glimpse`]).
 #[derive(Clone, Copy)]
@@ -268,6 +287,9 @@ struct Glimpse {
     at: InputPos,
     /// Its key's index in `keys`, valid while the chunk is cut (nothing changes the keys then).
     i: usize,
+    /// A key typed after it draws or erases its cell ([`Core::touched_later`]), so the chunk may
+    /// overwrite its echo in place with that key's.
+    touched: bool,
     /// The cell's text when the chunk began, as a hash, and its attributes.
     start: u64,
     start_attrs: Option<Attrs>,
@@ -389,13 +411,9 @@ pub(crate) struct Core {
     /// The written guesses' cells as the current server-output chunk was cut ([`Glimpse`]);
     /// empty outside one.
     glimpses: Vec<Glimpse>,
-    /// Where the latest typed key that is not a printable character starts (a Backspace, a
-    /// move, Enter or another boundary key): a guess before it may have its echo overwritten
-    /// in place by that key's own echo ([`Core::glimpse`]).
-    edit_key: Option<InputPos>,
-    /// Where the latest typed key of any kind starts: a Backspace's guess before it may have its
-    /// blank overwritten by that key's echo, as the Backspace leaves the cursor on its cell.
-    last_key: Option<InputPos>,
+    /// The latest typed keys, at most [`TYPED`], each where it starts and how it moves the
+    /// cursor: what may overwrite an earlier guess's echo in place ([`Core::touched_later`]).
+    typed: VecDeque<(InputPos, Step)>,
     /// The overlay is handling a server-output chunk: a written guess retired there as a
     /// misprediction while its cell is blank is held ([`Held`]).
     pub in_server: bool,
@@ -442,8 +460,7 @@ impl Core {
             held: Vec::new(),
             holds: (0, 0),
             glimpses: Vec::new(),
-            edit_key: None,
-            last_key: None,
+            typed: VecDeque::new(),
             in_server: false,
             echoed_at: Vec::new(),
             kept_echoed_at: Vec::new(),
@@ -1063,8 +1080,9 @@ impl Core {
         self.kept_echoed_at.clear();
         self.awaiting_ack = None;
         self.acked = 0;
-        self.edit_key = None;
-        self.last_key = None;
+        // Cleared only here: a guess is followed from its own key's offset on, so an old entry
+        // can only be mistaken for a later key once the offsets start again.
+        self.typed.clear();
     }
 
     pub fn has_deferred(&self) -> bool {
@@ -1314,16 +1332,72 @@ impl Core {
     // the bucket of a written guess settled in this chunk, and that a guess whose echo a cut
     // saw is settled at the end of the chunk (`Core::settle_glimpsed`).
 
-    /// A typed key: remembers the latest one, and the latest that is not a printable
-    /// character, whose echo may overwrite an earlier guess's in place.
+    /// A typed key, remembered for [`Core::touched_later`]; a pasted key is noted as a
+    /// [`KeyClass::Boundary`].
     pub fn note_key(&mut self, at: InputPos, class: KeyClass) {
-        if class == KeyClass::Release {
-            return;
+        let step = match class {
+            KeyClass::Release => return,
+            KeyClass::Printable(_) => Step::Char,
+            KeyClass::Backspace => Step::Back,
+            KeyClass::Left => Step::Left,
+            KeyClass::Right => Step::Right,
+            KeyClass::PasteStart | KeyClass::PasteEnd | KeyClass::Boundary => Step::Stop,
+        };
+        if self.typed.len() == TYPED {
+            self.typed.pop_front();
         }
-        self.last_key = Some(at);
-        if !matches!(class, KeyClass::Printable(_)) {
-            self.edit_key = Some(at);
+        self.typed.push_back((at, step));
+    }
+
+    /// Whether a key typed after the guess of the key at `at` (of `class`) draws or erases the
+    /// guess's cell, following a line editor's cursor in characters from the start of the line
+    /// as the record knows it (after the latest boundary key before the guess, or the oldest key
+    /// kept). A character typed at or left of the cell draws it (an insert redraws the rest of
+    /// the line: the key after a Backspace, an insert after a Left), and so does a Backspace from
+    /// at most one right of it (`n` Backspaces erase the `n` characters before them; one further
+    /// left shifts the rest over it). A move alone draws nothing, and nothing past a boundary key
+    /// counts: Enter's echo is CR LF, which overwrites nothing.
+    ///
+    /// A Left or a Backspace stops at the start of that line, where readline's are no-ops: the
+    /// cursor can only be at or right of where the line's known part starts, so stopping there
+    /// keeps the walk's cursor no further left than readline's. A Right at the line's end is not
+    /// stopped, since the end is not known (`docs/m3/plan.md` §2.5).
+    fn touched_later(&self, at: InputPos, class: KeyClass) -> bool {
+        let Some(p) = self.typed.iter().position(|&(a, _)| a == at) else {
+            return false;
+        };
+        let start = self
+            .typed
+            .range(..p)
+            .rposition(|&(_, s)| s == Step::Stop)
+            .map_or(0, |i| i + 1);
+        // The cursor, in characters right of where the line's known part starts.
+        let mut cur: u64 = 0;
+        for &(_, step) in self.typed.range(start..p) {
+            match step {
+                Step::Char | Step::Right => cur += 1,
+                Step::Back | Step::Left => cur = cur.saturating_sub(1),
+                Step::Stop => {} // none after `start`
+            }
         }
+        // The guess's cell: a Backspace leaves the cursor on its blank, a character one past it.
+        let cell = if class == KeyClass::Backspace {
+            cur = cur.saturating_sub(1);
+            cur
+        } else {
+            cur += 1;
+            cur - 1
+        };
+        for &(_, step) in self.typed.range(p + 1..) {
+            match step {
+                Step::Char if cur <= cell => return true,
+                Step::Back if cur > 0 && cur <= cell + 1 => return true,
+                Step::Char | Step::Right => cur += 1,
+                Step::Back | Step::Left => cur = cur.saturating_sub(1),
+                Step::Stop => return false,
+            }
+        }
+        false
     }
 
     /// A written glyph guess is pending: a chunk with a cut is worth cutting.
@@ -1353,6 +1427,7 @@ impl Core {
             self.glimpses.push(Glimpse {
                 at: k.at,
                 i,
+                touched: self.touched_later(k.at, k.class),
                 start: cell_hash(cell.map_or("", |c| c.text)),
                 start_attrs: cell.map(|c| c.attrs),
                 seen: None,
@@ -1367,12 +1442,13 @@ impl Core {
     /// - Its own glyph, in other text or other attributes than the cell had when the chunk
     ///   began (fish's typed character over its gray suggestion of it), is its echo. Before a
     ///   scroll, shift, erase or screen switch that decides it: the program then removes it
-    ///   wholesale. Before a cursor move it decides only if a later typed key can explain an
-    ///   overwrite in place: one that is not a printable character (a Backspace's `\b \b`, an
-    ///   insert's shifted rest after a Left), or for a Backspace's blank, which leaves the
-    ///   cursor on its cell, any key (`\b \be`). Otherwise it stays open (`x\b*`, a masking
-    ///   prompt, and `x\r$ a*`, a redraw: one frame on the terminal, so the user never saw the
-    ///   program's `x`, only the guess replaced).
+    ///   wholesale. Before a cursor move it decides only if a key typed after it draws or erases
+    ///   its cell, so that key's echo can explain an overwrite in place
+    ///   ([`Core::touched_later`]): the Backspace that erases it (`\b \b`), the character an
+    ///   insert after a Left draws over it (`q\x1b[Dwq`), the next character over a Backspace's
+    ///   blank (`\b \be`). Otherwise it stays open (`x\b*`, a masking prompt, and `x\r$ a*`, a
+    ///   redraw, with Enter or a Left typed after it or not: one frame on the terminal, so the
+    ///   user never saw the program's `x`, only the guess replaced).
     /// - Other text decides it as another glyph.
     /// - A cell the chunk has not drawn (a typed space over a blank) stays open.
     ///
@@ -1394,12 +1470,7 @@ impl Core {
             };
             let cell = v.cell(*row, *col);
             let other_text = cell_hash(cell.map_or("", |c| c.text)) != x.start;
-            let later = if self.keys[x.i].class == KeyClass::Backspace {
-                self.last_key
-            } else {
-                self.edit_key
-            };
-            let explained = cut == Cut::Wipe || later.is_some_and(|e| e > x.at);
+            let explained = cut == Cut::Wipe || x.touched;
             match cell.filter(|c| c.text == text_of(*glyph)) {
                 Some(c) if (other_text || Some(c.attrs) != x.start_attrs) && explained => {
                     x.seen = Some(Some(c.attrs));

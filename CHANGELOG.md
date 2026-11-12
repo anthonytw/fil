@@ -4,9 +4,33 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+The coming 0.2.0. It adds predictive local echo, on by default.
+
 ### Added
 
-- The `predict` setting (`off`, `adaptive` or `always`), in `[defaults]` and `[host.NAME]`, and `--predict MODE` for one run, over the file. The default is `adaptive`: guesses of the echo are shown only when the round trip is long enough for them to help. `fil config show` shows it with its source.
+- **Predictive echo**, as in mosh: while you type at a shell or REPL prompt over a slow link, fil draws the characters it expects the host to echo, and replaces them with what the host sends. It predicts printable characters, Backspace over what you just typed and the left and right arrows; never Enter, Tab, history or other control keys, never a wrap or a scroll, nothing in full-screen programs (the alternate screen) and nothing pasted. Nothing is predicted once fil has seen a password prompt; four rare cases that can still draw typed keys are accepted and documented in the guide's "Predictive echo" section and on the security and privacy page.
+- The `predict` setting (`off`, `adaptive` or `always`), in `[defaults]` and `[host.NAME]`, and `--predict MODE` for one run, over the file. The default is `adaptive`: guesses are shown only when the round trip is above about 30 ms or for 30 s after an echo that took more than 250 ms, and underlined while the round trip is above about 80 ms or in those 30 s. `fil config show` shows it with its source.
+- `SECURITY.md`: how to report a vulnerability privately.
+
+### Changed
+
+- `remote = "auto"` (the default) now runs the install bootstrap first, on one ssh login: it starts the copy fil installed (under `~/.local/share/fil`), then `~/.local/bin/fil`, then a `fil` of this wire on the host's `PATH`, or else offers an install. Behind a forced command that allows only `fil server --stdio`, it retries that once. A login shell's raw "command not found" line for `fil` is replaced by fil's own message, and fil no longer suggests adding `remote = "installed"` after an install; `installed` still works and is no longer needed.
+- `fil install` on a host that already has a `fil` of this wire on its `PATH` says so and installs nothing.
+- The guide and the security and privacy page say that fil does not hide keystroke timing on the network, and that with `predict` at `adaptive` or `always` (even on a fast link) the daemon's echo acknowledgments repeat it in the traffic from the host; `off` is not a timing protection.
+
+### Fixed
+
+- `fil install` to a host whose login ends at once (a forced command that prints nothing) says why, instead of "Broken pipe".
+- `fil kill` on a host where fil cannot read the process table returns once the session's processes have ended, instead of waiting out its whole grace period.
+- `fil ls` reads a refusal that arrived before its request was sent, instead of failing on the send.
+- A connection that arrives just after a forward's listener is paused stays queued for later instead of being taken.
+- The daemon drops closed QUIC connections instead of keeping them.
+- The daemon takes its socket-directory lock on the directory it checked, not on a second lookup of the same path.
+
+### Security
+
+- A program on the host that writes an endless OSC string (a title, a link, a clipboard write) no longer grows the daemon's or the client's memory without bound: such strings are dropped past 1 MiB, or 4 KiB for titles and links.
+- The release signing key and the package signing key were replaced on 2026-11-08, and the old package key is published as revoked; the fingerprints are in the README.
 
 ## [0.1.0] - 2026-11-07
 

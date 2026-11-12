@@ -1024,6 +1024,8 @@ impl Overlay {
                 let cut = kend > maybe_marker && !matches!(key, KeyEvent::Escape);
                 let pasted = in_paste || cut || o.marks.get(mark).is_some_and(overlaps);
                 if pasted {
+                    // Not followed by `Core::touched_later`: a paste's echo may be anywhere.
+                    o.core.note_key(kat, KeyClass::Boundary);
                     if !skipping {
                         o.core.end(Why::Unpredicted, Some(&st), now);
                     }

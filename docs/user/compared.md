@@ -12,7 +12,7 @@ fil does not replace ssh: it is run **over** ssh. It logs in with your `ssh`, so
 | Needs a service on the host | sshd | a system-wide `etserver` on TCP 2022 | `mosh-server`, per user | tmux | nothing: one program you run as yourself |
 | Needs root to set up | no | yes | no | no | no |
 | Panes, windows, tabs | no | no | no | yes | no: your terminal already does that |
-| Predictive local echo | no | no | yes | no | not in 0.1.0; planned for 0.2.0 |
+| Predictive local echo | no | no | yes | no | yes, from 0.2.0 (0.1.0 has none) |
 
 ## Against ssh
 
@@ -26,7 +26,7 @@ ET also reconnects and keeps native scrollback, and has forwarding. fil adds ses
 
 ## Against mosh
 
-mosh is excellent on lossy links and does predictive echo. It keeps the screen in sync rather than the byte stream, so you can't use your terminal's own scrollback, and it has no port forwarding. fil keeps native scrollback and forwards, and has the same UDP range (60000-61000) by default. fil does not speak mosh's protocol, and 0.1.0 has no predictive echo.
+mosh is excellent on lossy links and does predictive echo. It keeps the screen in sync rather than the byte stream, so you can't use your terminal's own scrollback, and it has no port forwarding. fil keeps native scrollback and forwards, and has the same UDP range (60000-61000) by default. fil does not speak mosh's protocol. From 0.2.0 fil has predictive echo too, modeled on mosh's and on by default for slow links, with the same underline for guesses on a long round trip; see [predictive echo](README.md#predictive-echo). Like mosh's, it does not hide the timing of your keystrokes on the network ([security and privacy](security-privacy.md)).
 
 ## Against tmux or screen
 

@@ -393,9 +393,15 @@ screen compared the mode against a DECSC made on it, the tracker kept origin mod
 terminal turned it off, and the paint ended with a `CSI ? 6 h` that left it on. The tracker now
 keeps a save per screen, plus the single save tmux keeps for both screens (measured on 3.8), and a
 restore brings back only what the two models agree on; the rest is unknown and blocks painting.
-`?47` and `?1047` (which the shadow ignores) leave the screen unknown, images and double-size lines
-taint only their own screen, and a restore that kitty would use to bring back DECAWM leaves
-autowrap unknown.
+`?47` and `?1047` (which the shadow ignores) leave the screen unknown, and since what a program
+draws there lands on the shadow's primary screen but the terminal's alternate one, both screens
+count as tainted until cleared (`CSI 2 J` on a known screen, or entering the `?1049` screen, which
+every terminal clears). The tracker follows the shadow's own screen apart from the terminal's (only
+`?1049` and RIS move alacritty), and a RIS sent from the alternate screen leaves the screen unknown
+and the primary screen tainted, since tmux stays on the alternate screen and keeps the old primary
+one. Images and double-size lines taint only their own screen. A restore that kitty would use to
+bring back DECAWM leaves autowrap unknown, and one of a saved shift other than G0 leaves the
+charsets unknown (WezTerm always invokes G0).
 
 Known limit: a resize erases against the old geometry, as for predictions. For a pinned status
 this matters when the window gets *narrower* while something is drawn: a reflowing terminal re-wraps
@@ -404,3 +410,12 @@ fragments the erase cannot reach. The
 client therefore keeps status lines short (40 columns, unpadded), `Display::resize` reports when
 the window narrowed while something was drawn, and the client then starts the next attach from a
 snapshot (the scrollback keeps the re-wrapped fragments; the screen is repaired).
+
+Known limit: `?47` and `?1047`. The `alacritty_terminal` shadow does not switch screens on them, so
+after a program uses them the shadow's screen differs from the terminal's, and the tracker blocks
+painting (status line and predictions) until a clear on a known screen. Modern `TERM`s use `?1049`
+for smcup/rmcup, but `TERM=putty`, `rxvt`, `Eterm` and `xterm-r6` use `?47`: under those, every
+full-screen program (`less`, `vim`) leaves fil without a status line or predictions until the next
+`clear` (their rmcup's own `CSI 2 J` runs while the screen is still unknown, so it does not count).
+The real fix, modeling `?47`/`?1047` in `fil-term`'s alacritty backend as `be_vt100` does, is a
+follow-up.

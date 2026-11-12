@@ -80,12 +80,23 @@ fn scenario(sc: Scenario) {
     let mut cut_keys = 0u64;
     let mut cut = [Mispredicted::default(), Mispredicted::default()];
     let mut cut_written = [0u64; 2];
+    // Every program again with consecutive writes joined into one chunk (`Writes::Joined`, a
+    // stress model: it joins more than the daemon does), judged at its bar like whole writes
+    // (BUGS-3). Fish only on `Mispredicted::ending`: its named residual (`docs/m3/plan.md`
+    // done-when 2, decided, owner 2026-11-11, for the cut modes) shows there as `hidden` too.
+    let mut joined_written = 0u64;
+    let mut joined = Mispredicted::default();
+    let mut joined_keys = 0u64;
+    let fish = sc == Scenario::Fish;
     for b in backends() {
         for hostile in [false, true] {
-            // Fish keeps one guess in flight and the wide-character scenarios rarely paint: a few
-            // more seeds, so a pass has painted something.
+            // Fish keeps one guess in flight and the wide-character scenarios rarely paint: more
+            // seeds, so a pass has painted something. Fish's default predictor wrote nothing at
+            // 19 of 50 seed bases with 6 seeds; with 32 the chance is about 0.5% per base, and
+            // the faithful bar's `written > 0` (below) says so if it happens (BUGS-4).
             let n = match sc {
-                Scenario::Fish | Scenario::WideChars | Scenario::Mixed => seeds().max(6),
+                Scenario::Fish => seeds().max(32),
+                Scenario::WideChars | Scenario::Mixed => seeds().max(6),
                 _ => seeds(),
             };
             for seed in base()..base() + n {
@@ -146,10 +157,47 @@ fn scenario(sc: Scenario) {
             }
         }
     }
+    // The joined runs, at more seeds: their batches delay the echo, so less is written.
+    for b in backends() {
+        for seed in base()..base() + seeds().max(8) {
+            let mut cfg = SimConfig::new(sc, seed, b.name);
+            cfg.keys = if sc == Scenario::Mixed { 150 } else { 50 };
+            cfg.writes = Writes::Joined;
+            cfg.run.bar = (!fish).then_some(sc.category());
+            let out = run(&cfg);
+            let m = out.predict.mispredicted;
+            assert!(
+                !fish || m.ending() == 0,
+                "{} / fish / joined writes / seed {seed}: {m:?}",
+                b.name
+            );
+            if let Some(f) = out.failure {
+                let min = shrink(&out.trace, &cfg.run);
+                panic!(
+                    "{} / {} / joined writes / seed {seed}: {:?}\n{}\nminimal trace:\n{}",
+                    b.name,
+                    sc.name(),
+                    f.violation.kind,
+                    f.violation.detail,
+                    min.to_rust()
+                );
+            }
+            joined_keys += cfg.keys as u64;
+            joined_written += out.predict.written;
+            add(&mut joined, &m);
+        }
+    }
     // A pass that never painted would prove nothing.
     assert!(
         stats.painted_flushes > 0,
         "{}: no flush ever left a prediction painted",
+        sc.name()
+    );
+    // Nor would a zero-misprediction bar the default predictor met by writing nothing: the
+    // painted flushes above count the hostile predictor's too (BUGS-4).
+    assert!(
+        !barred || written > 0,
+        "{}: the default predictor wrote nothing, so its bar proves nothing",
         sc.name()
     );
     // The soak's report (`-- --nocapture`): the adversarial bar is a rate.
@@ -160,6 +208,21 @@ fn scenario(sc: Scenario) {
         sc.category(),
         mispredicted as f64 * 1000.0 / keys.max(1) as f64,
         kinds(&by_kind, keys)
+    );
+    // The joined runs too: a judged pass with nothing written proves nothing (review pr87 M1).
+    assert!(
+        !barred || joined_written > 0,
+        "{}: the default predictor wrote nothing with joined writes",
+        sc.name()
+    );
+    println!(
+        "soak {:<14} {:<11} keys {joined_keys:>7} joined writes, written {joined_written:>7} \
+         mispredicted {:>5} ({:.2} per 1,000 keys: {})",
+        sc.name(),
+        if fish { "(ending 0)" } else { "(judged)" },
+        joined.total(),
+        joined.total() as f64 * 1000.0 / joined_keys.max(1) as f64,
+        kinds(&joined, joined_keys)
     );
     if barred {
         for ((m, w), writes) in cut
@@ -225,11 +288,15 @@ scenarios! {
 ///   cell its own earlier guess still holds, which is where such a late echo lands, so it is
 ///   shown with a predictor that appends at its own cursor without that care (the quiet hostile
 ///   one): more of its runs fail with the rule off than with it on.
+///
+/// It holds with consecutive writes joined into one chunk too (`Writes::Joined`, a stress model
+/// of joining), where an echo typed ahead arrives with the command's output and the next
+/// prompt, which scroll it away (BUGS-3).
 #[test]
 fn faithful_commands_at_150_ms_show_no_visible_misprediction() {
     use fil_predict::overlay::Guards;
     use fil_predict::sim::HostileCfg;
-    let run_all = |guards: Guards, plain: bool| {
+    let run_with = |guards: Guards, plain: bool, writes: Writes| {
         let mut failures = 0;
         let mut written = 0;
         for b in backends() {
@@ -240,6 +307,7 @@ fn faithful_commands_at_150_ms_show_no_visible_misprediction() {
                 cfg.jitter = std::time::Duration::from_millis(5);
                 cfg.run.bar = Some(Category::Faithful);
                 cfg.run.guards = guards;
+                cfg.writes = writes;
                 if plain {
                     cfg.run.kind = PredictorKind::Hostile(HostileCfg::quiet(seed));
                 }
@@ -259,9 +327,13 @@ fn faithful_commands_at_150_ms_show_no_visible_misprediction() {
         }
         (failures, written)
     };
+    let run_all = |guards: Guards, plain: bool| run_with(guards, plain, Writes::Whole);
     let (failures, written) = run_all(Guards::ALL, false);
     assert_eq!(failures, 0, "visible mispredictions with every guard on");
     assert!(written > 0, "nothing was ever written");
+    let (failures, written) = run_with(Guards::ALL, false, Writes::Joined);
+    assert_eq!(failures, 0, "visible mispredictions with joined writes");
+    assert!(written > 0, "nothing was ever written with joined writes");
     let mut g = Guards::ALL;
     g.disable("keep_on_boundary");
     assert!(

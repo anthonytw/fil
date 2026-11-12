@@ -802,16 +802,35 @@ pub enum Writes {
     /// Cut at arbitrary bytes, so escape sequences and UTF-8 characters arrive split (the
     /// client's tracker must cope with any split).
     Arbitrary,
+    /// A stress model of joining: each write whole, and consecutive writes joined into one
+    /// chunk. A batch opens with the first write and is sent a uniform 0 to [`BATCH`] later,
+    /// with every write made meanwhile, so an echo typed ahead arrives with the command's output
+    /// and the next prompt. An `EchoAck` made meanwhile goes after the batch; a mode report sends
+    /// the batch first. It joins more than the daemon does: the daemon has no timer, its batch
+    /// (`OutputBatch` in `fil-session/src/core.rs`) is whatever accumulated while it was busy,
+    /// and joining comes mostly from PTY reads coalescing. It also delays output by up to
+    /// [`BATCH`], so fewer guesses are written than with whole writes. Not modeled: the daemon's
+    /// cuts at a mode-change offset or a 16 KiB frame.
+    Joined,
 }
 
+/// The longest a [`Writes::Joined`] batch stays open.
+pub const BATCH: Duration = Duration::from_millis(100);
+
 impl Writes {
-    pub const ALL: [Writes; 3] = [Writes::Whole, Writes::Boundaries, Writes::Arbitrary];
+    pub const ALL: [Writes; 4] = [
+        Writes::Whole,
+        Writes::Boundaries,
+        Writes::Arbitrary,
+        Writes::Joined,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Writes::Whole => "whole",
             Writes::Boundaries => "boundaries",
             Writes::Arbitrary => "arbitrary",
+            Writes::Joined => "joined",
         }
     }
 }
@@ -1023,6 +1042,8 @@ enum Q {
     /// Output the remote sends later than it takes the key (SlowEcho).
     Later(Vec<Msg>),
     ToClientAck(InputPos),
+    /// A [`Writes::Joined`] batch is due (its number).
+    Flush(u64),
 }
 
 pub struct SimOutcome {
@@ -1047,7 +1068,7 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
     let mut link = Link {
         one_way: micros(cfg.one_way),
         jitter: micros(cfg.jitter),
-        max_chunk: if cfg.writes == Writes::Whole {
+        max_chunk: if matches!(cfg.writes, Writes::Whole | Writes::Joined) {
             u64::MAX / 2
         } else {
             cfg.max_chunk as u64
@@ -1057,6 +1078,9 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
         boundaries: cfg.writes == Writes::Boundaries,
         boundary: fil_term::Boundary::new(),
         tail: Vec::new(),
+        joined: cfg.writes == Writes::Joined,
+        batch: None,
+        batches: 0,
     };
 
     let first = remote.setup();
@@ -1137,6 +1161,7 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
                 let out = remote.spontaneous();
                 link.deliver(&mut q, &mut rng, now, out);
             }
+            Q::Flush(n) => link.flush(&mut q, &mut rng, now, n),
             Q::ToClient(b) => d.apply(at, Ev::Server(b)),
             Q::Pty(m) => d.apply(at, Ev::Pty(m)),
             Q::Tick => {
@@ -1198,6 +1223,11 @@ struct Link {
     boundary: fil_term::Boundary,
     /// The bytes of a half sequence, held back until it completes.
     tail: Vec<u8>,
+    /// [`Writes::Joined`]: writes are batched.
+    joined: bool,
+    /// The open batch: its number, its bytes and the acks made while it was open.
+    batch: Option<(u64, Vec<u8>, Vec<InputPos>)>,
+    batches: u64,
 }
 
 impl Link {
@@ -1205,8 +1235,49 @@ impl Link {
         self.one_way + rng.below(self.jitter + 1)
     }
 
+    /// Sends the open batch `n` (if it is still open): its bytes as one chunk, then its acks.
+    fn flush(&mut self, q: &mut Queue, rng: &mut Rng, now: u64, n: u64) {
+        if !self.batch.as_ref().is_some_and(|b| b.0 == n) {
+            return;
+        }
+        let (_, bytes, acks) = self.batch.take().expect("open");
+        let mut t = (now + self.delay(rng)).max(self.last_s2c);
+        if !bytes.is_empty() {
+            q.put(t, Q::ToClient(bytes));
+            t += 50;
+        }
+        for a in acks {
+            q.put(t, Q::ToClientAck(a));
+            t += 1;
+        }
+        self.last_s2c = t;
+    }
+
     fn deliver(&mut self, q: &mut Queue, rng: &mut Rng, now: u64, msgs: Vec<Msg>) {
         for m in msgs {
+            if self.joined {
+                match m {
+                    Msg::Bytes(b) => {
+                        let batch = self.batch.get_or_insert_with(|| {
+                            self.batches += 1;
+                            q.put(now + rng.below(micros(BATCH) + 1), Q::Flush(self.batches));
+                            (self.batches, Vec::new(), Vec::new())
+                        });
+                        batch.1.extend_from_slice(&b);
+                        continue;
+                    }
+                    Msg::Ack(n) if self.batch.is_some() => {
+                        self.batch.as_mut().expect("open").2.push(n);
+                        continue;
+                    }
+                    Msg::Pty(_) => {
+                        if let Some(n) = self.batch.as_ref().map(|b| b.0) {
+                            self.flush(q, rng, now, n);
+                        }
+                    }
+                    Msg::Ack(_) => {}
+                }
+            }
             match m {
                 Msg::Bytes(b) => {
                     let mut t = (now + self.delay(rng)).max(self.last_s2c);

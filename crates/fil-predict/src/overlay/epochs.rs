@@ -34,6 +34,9 @@ pub const EXPIRY: Duration = Duration::from_secs(10);
 pub const IDLE: Duration = Duration::from_secs(1);
 /// Outstanding guesses, past which keys are not predicted (rule 8).
 pub const MAX_OUTSTANDING: usize = 1024;
+/// The most cuts of one server-output chunk at which the written guesses' cells are looked at
+/// ([`Core::glimpse`]); past it the rest of the chunk is fed whole.
+pub const MAX_CUTS: usize = 16;
 
 /// What the core counts (`docs/m3/plan.md` §2.5). Counts only: no glyph, cell or key.
 ///
@@ -248,6 +251,32 @@ struct Held {
     by_ack: bool,
 }
 
+/// What a cut of a server-output chunk falls before (`overlay::next_cut`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cut {
+    /// A scroll, a shift, an erase or a screen switch: what the program removes wholesale, and
+    /// what may move other content into a guessed cell.
+    Wipe,
+    /// A cursor move (BS, CR, `CSI A` to `H`, ...): what an overwrite in place starts with.
+    Move,
+}
+
+/// A written guess's cell during one server-output chunk cut at its scrolls, erases and
+/// cursor moves ([`Core::glimpse`]).
+#[derive(Clone, Copy)]
+struct Glimpse {
+    at: InputPos,
+    /// Its key's index in `keys`, valid while the chunk is cut (nothing changes the keys then).
+    i: usize,
+    /// The cell's text when the chunk began, as a hash, and its attributes.
+    start: u64,
+    start_attrs: Option<Attrs>,
+    /// Decided: the chunk drew the guess's own glyph in the cell (with these attributes) before
+    /// anything could take it away unexplained; or `None`: it drew other text first, or a
+    /// scroll, shift or erase came before any draw.
+    seen: Option<Option<Attrs>>,
+}
+
 // No `Debug`: it holds guessed glyphs (docs/m3/plan.md §4.3).
 #[derive(Clone)]
 struct Key {
@@ -357,6 +386,16 @@ pub(crate) struct Core {
     held: Vec<Held>,
     /// Holds made, and holds since settled in their `bucket` ([`Core::ending_seen`]).
     holds: (u64, u64),
+    /// The written guesses' cells as the current server-output chunk was cut ([`Glimpse`]);
+    /// empty outside one.
+    glimpses: Vec<Glimpse>,
+    /// Where the latest typed key that is not a printable character starts (a Backspace, a
+    /// move, Enter or another boundary key): a guess before it may have its echo overwritten
+    /// in place by that key's own echo ([`Core::glimpse`]).
+    edit_key: Option<InputPos>,
+    /// Where the latest typed key of any kind starts: a Backspace's guess before it may have its
+    /// blank overwritten by that key's echo, as the Backspace leaves the cursor on its cell.
+    last_key: Option<InputPos>,
     /// The overlay is handling a server-output chunk: a written guess retired there as a
     /// misprediction while its cell is blank is held ([`Held`]).
     pub in_server: bool,
@@ -402,6 +441,9 @@ impl Core {
             stats: PredictStats::default(),
             held: Vec::new(),
             holds: (0, 0),
+            glimpses: Vec::new(),
+            edit_key: None,
+            last_key: None,
             in_server: false,
             echoed_at: Vec::new(),
             kept_echoed_at: Vec::new(),
@@ -1021,6 +1063,8 @@ impl Core {
         self.kept_echoed_at.clear();
         self.awaiting_ack = None;
         self.acked = 0;
+        self.edit_key = None;
+        self.last_key = None;
     }
 
     pub fn has_deferred(&self) -> bool {
@@ -1030,7 +1074,7 @@ impl Core {
     /// Classifies what a snapshot dropped, against the shadow after it has landed.
     pub fn classify_deferred(&mut self, v: &dyn ScreenView, now: Time) {
         for (at, sent, g) in std::mem::take(&mut self.deferred) {
-            let outcome = self.outcome(&g, Why::Lifecycle(WithdrawReason::Snapshot), Some(v));
+            let outcome = self.outcome(&g, None, Why::Lifecycle(WithdrawReason::Snapshot), Some(v));
             self.count(&g, outcome, false);
             self.settled.push(Settled {
                 at,
@@ -1041,17 +1085,35 @@ impl Core {
         }
     }
 
-    fn outcome(&self, g: &Guess, why: Why, v: Option<&dyn ScreenView>) -> Outcome {
+    /// How a guess settled for `why` is classified: against the shadow, or, for the written
+    /// guess of the key at `at` whose cell no longer shows its glyph, against what the cell first
+    /// changed to in this chunk before a scroll or an erase ([`Core::glimpse`]).
+    fn outcome(
+        &self,
+        g: &Guess,
+        at: Option<InputPos>,
+        why: Why,
+        v: Option<&dyn ScreenView>,
+    ) -> Outcome {
         let GKind::Glyph {
             row, col, glyph, ..
         } = &g.kind
         else {
             return Outcome::Confirmed;
         };
+        // What a cut saw the echo draw comes first: the shadow after the chunk may show what a
+        // later scroll, erase or redraw in the same chunk left there.
+        let glimpsed = at.and_then(|at| {
+            self.glimpses
+                .iter()
+                .find(|x| x.at == at)
+                .and_then(|x| x.seen.flatten())
+        });
         let cell = v.and_then(|v| v.cell(*row, *col));
-        let shown = cell.filter(|c| c.text == text_of(*glyph));
+        let shown =
+            glimpsed.or_else(|| cell.filter(|c| c.text == text_of(*glyph)).map(|c| c.attrs));
         let confirm = || match (shown, g.pen) {
-            (Some(c), Some(pen)) if c.attrs != pen => Outcome::Restyled,
+            (Some(attrs), Some(pen)) if attrs != pen => Outcome::Restyled,
             _ => Outcome::Confirmed,
         };
         match why {
@@ -1149,7 +1211,7 @@ impl Core {
         let Some(g) = self.keys[i].guess.clone() else {
             return;
         };
-        let outcome = self.outcome(&g, why, v);
+        let outcome = self.outcome(&g, Some(self.keys[i].at), why, v);
         if let Some(h) = self.hold(&g, outcome, by_ack, v) {
             self.held.push(h);
             self.holds.0 += 1;
@@ -1237,6 +1299,147 @@ impl Core {
 
     pub fn has_held(&self) -> bool {
         !self.held.is_empty()
+    }
+
+    // ---- a chunk cut at its scrolls, erases and moves (BUGS-3) -----------------------
+    //
+    // The echo of keys typed ahead can come in one chunk with what scrolls or clears it away
+    // (the command's output, the next prompt, `clear`, a full-screen program), or with a later
+    // key's echo that overwrites it in place (a Backspace's `\b \b`, an insert's shifted rest).
+    // Classified against the shadow after the chunk, a written guess the echo drew correctly
+    // would count as a misprediction. So while written guesses are pending, the overlay feeds
+    // the shadow such a chunk in pieces, cut before each scroll, shift, erase, screen switch or
+    // cursor move (`overlay::next_cut`), and shows the core the written guesses' cells at each
+    // cut. This changes no rule: the chunk is still checked whole, as before. What changes is
+    // the bucket of a written guess settled in this chunk, and that a guess whose echo a cut
+    // saw is settled at the end of the chunk (`Core::settle_glimpsed`).
+
+    /// A typed key: remembers the latest one, and the latest that is not a printable
+    /// character, whose echo may overwrite an earlier guess's in place.
+    pub fn note_key(&mut self, at: InputPos, class: KeyClass) {
+        if class == KeyClass::Release {
+            return;
+        }
+        self.last_key = Some(at);
+        if !matches!(class, KeyClass::Printable(_)) {
+            self.edit_key = Some(at);
+        }
+    }
+
+    /// A written glyph guess is pending: a chunk with a cut is worth cutting.
+    pub fn has_written_pending(&self) -> bool {
+        self.keys.iter().any(|k| {
+            matches!(&k.guess, Some(g) if g.state == GState::Pending
+                && g.written
+                && matches!(g.kind, GKind::Glyph { .. }))
+        })
+    }
+
+    /// Before a chunk that will be cut: each pending written guess's cell as it stands. False
+    /// when there is none.
+    pub fn begin_glimpses(&mut self, v: &dyn ScreenView) -> bool {
+        self.glimpses.clear();
+        for (i, k) in self.keys.iter().enumerate() {
+            let Some(Guess {
+                kind: GKind::Glyph { row, col, .. },
+                state: GState::Pending,
+                written: true,
+                ..
+            }) = &k.guess
+            else {
+                continue;
+            };
+            let cell = v.cell(*row, *col);
+            self.glimpses.push(Glimpse {
+                at: k.at,
+                i,
+                start: cell_hash(cell.map_or("", |c| c.text)),
+                start_attrs: cell.map(|c| c.attrs),
+                seen: None,
+            });
+        }
+        !self.glimpses.is_empty()
+    }
+
+    /// At a cut, before what `cut` names: each undecided guess is decided by what the chunk has
+    /// drawn in its cell so far.
+    ///
+    /// - Its own glyph, in other text or other attributes than the cell had when the chunk
+    ///   began (fish's typed character over its gray suggestion of it), is its echo. Before a
+    ///   scroll, shift, erase or screen switch that decides it: the program then removes it
+    ///   wholesale. Before a cursor move it decides only if a later typed key can explain an
+    ///   overwrite in place: one that is not a printable character (a Backspace's `\b \b`, an
+    ///   insert's shifted rest after a Left), or for a Backspace's blank, which leaves the
+    ///   cursor on its cell, any key (`\b \be`). Otherwise it stays open (`x\b*`, a masking
+    ///   prompt, and `x\r$ a*`, a redraw: one frame on the terminal, so the user never saw the
+    ///   program's `x`, only the guess replaced).
+    /// - Other text decides it as another glyph.
+    /// - A cell the chunk has not drawn (a typed space over a blank) stays open.
+    ///
+    /// Before a scroll, shift, erase or screen switch every glimpse still open is then closed
+    /// undecided: what that moves into a guessed cell is not a draw. An undecided guess is left
+    /// to the shadow after the chunk, as without the cuts. False once every guess is decided.
+    pub fn glimpse(&mut self, v: &dyn ScreenView, cut: Cut) -> bool {
+        for x in self.glimpses.iter_mut().filter(|x| x.seen.is_none()) {
+            let Some(Guess {
+                kind: GKind::Glyph {
+                    row, col, glyph, ..
+                },
+                state: GState::Pending,
+                ..
+            }) = self.keys.get(x.i).and_then(|k| k.guess.as_ref())
+            else {
+                x.seen = Some(None);
+                continue;
+            };
+            let cell = v.cell(*row, *col);
+            let other_text = cell_hash(cell.map_or("", |c| c.text)) != x.start;
+            let later = if self.keys[x.i].class == KeyClass::Backspace {
+                self.last_key
+            } else {
+                self.edit_key
+            };
+            let explained = cut == Cut::Wipe || later.is_some_and(|e| e > x.at);
+            match cell.filter(|c| c.text == text_of(*glyph)) {
+                Some(c) if (other_text || Some(c.attrs) != x.start_attrs) && explained => {
+                    x.seen = Some(Some(c.attrs));
+                }
+                Some(_) => {}
+                None if other_text => x.seen = Some(None),
+                None => {}
+            }
+            if cut == Cut::Wipe && x.seen.is_none() {
+                x.seen = Some(None);
+            }
+        }
+        self.glimpses.iter().any(|x| x.seen.is_none())
+    }
+
+    /// After the chunk's checks: a guess a cut saw its echo draw that is still pending is
+    /// confirmed, its echo came. The checks leave one pending when the same chunk then changed
+    /// its cell again (a Backspace's `\b \b` the predictor did not guess) or took the cursor back
+    /// before its key (an insert's shifted rest): left pending, it would stay drawn over the cell
+    /// the program changed, and the cell's next glyph would contradict it. It only retires a
+    /// guess: no epoch is confirmed by it and nothing new is written. It is retired, not
+    /// confirmed through [`Core::confirm_as`], so it adds no cursor to `echoed_at`: a later chunk
+    /// can find less explained than it would have, never more (at worst it ends the epoch).
+    pub fn settle_glimpsed(&mut self, v: &dyn ScreenView, now: Time) {
+        for j in 0..self.glimpses.len() {
+            let x = self.glimpses[j];
+            if !matches!(x.seen, Some(Some(_))) {
+                continue;
+            }
+            if let Some(i) = self.keys.iter().position(|k| k.at == x.at)
+                && self.is_pending(i)
+            {
+                self.retire(i, Why::Confirm, Some(v), now);
+            }
+        }
+    }
+
+    /// The chunk is handled: the cuts' observations are for it only.
+    pub fn end_glimpses(&mut self) {
+        self.glimpses.clear();
     }
 
     /// Settles the held guesses whose cell now shows a glyph: `hidden` if it is their own.

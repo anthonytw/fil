@@ -1971,3 +1971,259 @@ fn typed_spaces_forged_as_glyphs_do_not_lengthen_the_chain() {
     );
     assert!(!t.painted(), "`d` stayed");
 }
+
+// ---- BUGS-3: an echo in the same chunk as a scroll or a clear -----------------------------
+
+/// `$ a` typed, echoed and acknowledged from `t0`: a confirmed epoch.
+fn confirmed_at(t: &mut T, t0: u64) {
+    t.server(b"$ ", t0);
+    t.key(b"a", t0 + 10);
+    t.server(b"a", t0 + 120);
+    t.ack(t0 + 170);
+}
+
+/// `ls` typed and written, Enter typed before any echo (the guesses are kept, rule 3), then the
+/// echo, the command's output and the next prompt in one chunk, as the daemon batches queued
+/// reads: the echo drew both guesses before `after` scrolled or cleared them away, so both are
+/// confirmed, none mispredicted.
+fn typed_ahead(t: &mut T, after: &[u8]) {
+    let mut chunk = b"ls\r".to_vec();
+    chunk.extend_from_slice(after);
+    let s = typed_ahead_chunk(t, &chunk);
+    assert_eq!(s.mispredicted.total(), 0, "{s:?}");
+    assert_eq!(s.confirmed + s.restyled, 2, "{s:?}");
+    assert!(!t.painted());
+}
+
+/// `l`, `s` and Enter typed and the guesses written, then `chunk`: the counts after it.
+fn typed_ahead_chunk(t: &mut T, chunk: &[u8]) -> fil_predict::overlay::PredictStats {
+    t.key(b"l", 300);
+    t.key(b"s", 330);
+    t.key(b"\r", 360);
+    assert_eq!(t.o.stats().written, 2, "both guesses were written");
+    t.server(chunk, 470);
+    t.ack(520);
+    t.o.stats()
+}
+
+fn tall(rows: u16) -> T {
+    T::with(
+        Box::new(MoshPredictor::default()),
+        Guards::ALL,
+        Size { cols: 40, rows },
+    )
+}
+
+#[test]
+fn an_echo_scrolled_away_in_its_own_chunk_is_confirmed() {
+    // 40x3, the prompt on the bottom row: the LF after the echo scrolls.
+    let mut t = T::with(
+        Box::new(MoshPredictor::default()),
+        Guards::ALL,
+        Size { cols: 40, rows: 3 },
+    );
+    t.server(b"\r\n\r\n", 0);
+    confirmed_at(&mut t, 10);
+    typed_ahead(&mut t, b"\nfile1 file2\r\n$ ");
+}
+
+#[test]
+fn an_echo_cleared_in_its_own_chunk_is_confirmed() {
+    // `clear` typed ahead of its echo.
+    let mut t = T::new();
+    confirmed_at(&mut t, 0);
+    typed_ahead(&mut t, b"\n\x1b[H\x1b[2J$ ");
+}
+
+#[test]
+fn an_echo_followed_by_the_alternate_screen_in_its_own_chunk_is_confirmed() {
+    // `vim` typed ahead: the echo's chunk switches to the alternate screen, which the cells are
+    // then read from; the first cut is the LF, the switch is the one after it.
+    let mut t = T::new();
+    confirmed_at(&mut t, 0);
+    typed_ahead(&mut t, b"\x1b[?1049h\x1b[H\x1b[2J~\r\n~");
+    let mut t = T::new();
+    confirmed_at(&mut t, 0);
+    typed_ahead(&mut t, b"\n\x1b[?1049h\x1b[H\x1b[2J~\r\n~");
+}
+
+/// The cut only decides a guess whose cell changed: one the program drew wrong and then cleared
+/// in the same chunk is still a misprediction.
+#[test]
+fn a_wrong_echo_cleared_in_its_own_chunk_is_still_a_misprediction() {
+    let mut t = T::new();
+    confirmed_at(&mut t, 0);
+    t.key(b"l", 300);
+    t.key(b"s", 330);
+    t.key(b"\r", 360);
+    t.server(b"LS\r\n\x1b[H\x1b[2J$ ", 470);
+    t.ack(520);
+    let s = t.o.stats();
+    assert_eq!(s.confirmed + s.restyled, 0, "{s:?}");
+    assert_eq!(s.mispredicted.total(), 2, "{s:?}");
+}
+
+// The cut kinds (review pr87 S1, S2) and the rules the glimpse keeps (S3).
+
+/// A masking prompt answers the typed `x` with `x\b*` in one write, and a line editor redraws
+/// with `x\r$ a*`: one frame on the terminal, so the user saw the predicted `x` replaced by `*`.
+/// A cursor-move cut with no later key to explain the overwrite decides nothing: contradicted,
+/// as without the cuts.
+#[test]
+fn an_echo_overwritten_in_place_with_no_key_to_explain_it_stays_contradicted() {
+    for chunk in [&b"x\x08*"[..], b"x\r$ a*"] {
+        let mut t = T::trusted();
+        assert!(!t.key(b"x", 200).paint.is_empty());
+        t.server(chunk, 300);
+        let s = t.o.stats();
+        assert_eq!(
+            (s.mispredicted.contradicted, s.confirmed),
+            (1, 0),
+            "{:?}: {s:?}",
+            chunk.escape_ascii()
+        );
+    }
+}
+
+/// The overwrite a later key explains: `x` and a Backspace the predictor does not guess, echoed
+/// `x\b \b` in one chunk; `q`, Left and `w` (an insert), echoed `q\x1b[Dwq\x1b[1D`. The guess's
+/// echo came, so it is confirmed and taken off at once (`Core::settle_glimpsed`), not left drawn
+/// over the cell the program changed until a later glyph contradicts it.
+#[test]
+fn an_echo_a_later_key_overwrites_in_the_same_chunk_is_confirmed() {
+    let mut t = fixed(vec![(0, 2), (0, 3)]);
+    t.confirm(); // `$ a`, the guess at (0, 2)
+    assert!(!t.key(b"x", 200).paint.is_empty(), "x not written");
+    t.key(b"\x7f", 210); // not guessed: the fixed cells are used up
+    t.server(b"x\x08 \x08", 300);
+    let s = t.o.stats();
+    assert_eq!((s.confirmed, s.mispredicted.total()), (1, 0), "{s:?}");
+    assert!(!t.painted(), "x stayed drawn over the erased cell");
+
+    let mut t = fixed(vec![(0, 2), (0, 3)]);
+    t.confirm();
+    assert!(!t.key(b"q", 200).paint.is_empty(), "q not written");
+    t.key(b"\x1b[D", 210);
+    t.key(b"w", 220);
+    t.server(b"q\x1b[Dwq\x1b[1D", 300);
+    let s = t.o.stats();
+    assert_eq!((s.confirmed, s.mispredicted.total()), (1, 0), "{s:?}");
+}
+
+/// A Backspace leaves the cursor on its blank's cell, so any later key may overwrite it there:
+/// `\b \be`, the Backspace's echo and the next key's in one chunk, confirms the blank. A typed
+/// character's echo overwritten in place is explained only by a later key that is not a
+/// printable character: `x\b*` with `y` typed after it is still contradicted.
+#[test]
+fn a_backspace_blank_overwritten_by_the_next_key_is_confirmed() {
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 3)]);
+    t.confirm(); // `$ a`, cursor (0, 3)
+    t.key(b"b", 200);
+    t.server(b"b", 250);
+    assert!(
+        !t.key(b"\x7f", 300).paint.is_empty(),
+        "the blank not written"
+    );
+    t.key(b"e", 310); // not guessed: the fixed cells are used up
+    t.server(b"\x08 \x08e", 400);
+    let s = t.o.stats();
+    assert_eq!((s.confirmed, s.mispredicted.total()), (2, 0), "{s:?}");
+
+    let mut t = fixed(vec![(0, 2), (0, 3)]);
+    t.confirm();
+    assert!(!t.key(b"x", 200).paint.is_empty());
+    t.key(b"y", 210);
+    t.server(b"x\x08*", 300);
+    let s = t.o.stats();
+    assert_eq!((s.confirmed, s.mispredicted.contradicted), (0, 1), "{s:?}");
+}
+
+/// Content a scroll, shift or erase moves into a guessed cell is not a draw: an unechoed `q`,
+/// and a `q` one row down pulled into its cell by a delete-line before a clear, is `ended`.
+#[test]
+fn content_shifted_into_a_guessed_cell_is_not_its_echo() {
+    let mut t = T::new();
+    t.server(b"\r\n   q\x1b[1;1H", 0);
+    t.confirm(); // `$ a`, cursor (0, 3)
+    assert!(!t.key(b"q", 200).paint.is_empty());
+    t.server(b"\x1b[M\x1b[2J", 300);
+    let s = t.o.stats();
+    assert_eq!((s.mispredicted.ended, s.confirmed), (1, 0), "{s:?}");
+}
+
+/// The first thing the chunk draws in the cell decides: a wrong `X`, then the right `l` over it,
+/// then a clear, is still a misprediction.
+#[test]
+fn the_first_glyph_the_chunk_draws_decides() {
+    let mut t = T::new();
+    confirmed_at(&mut t, 0);
+    let s = typed_ahead_chunk(&mut t, b"X\x08l\r\n\x1b[H\x1b[2J$ ");
+    assert_eq!(
+        (s.confirmed + s.restyled, s.mispredicted.total()),
+        (0, 2),
+        "{s:?}"
+    );
+}
+
+/// A cell already showing the guess's glyph that the chunk does not redraw proves nothing: with
+/// no echo, then a clear, the guesses are mispredicted, as without the cuts. The same text in other
+/// attributes is a draw (fish's typed character over its gray suggestion of it).
+#[test]
+fn an_unchanged_cell_is_not_an_echo_but_a_restyled_one_is() {
+    // The fixed predictor: the default one does not guess over a cell showing the glyph.
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 4)]);
+    t.confirm();
+    t.server(b"ls\x1b[2D", 150);
+    let s = typed_ahead_chunk(&mut t, b"\r\n\x1b[H\x1b[2J$ ");
+    assert_eq!(
+        (s.confirmed, s.mispredicted.total()),
+        (0, 2),
+        "unchanged: {s:?}"
+    );
+
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 4)]);
+    t.confirm();
+    t.server(b"\x1b[90mls\x1b[m\x1b[2D", 150); // fish's suggestion
+    let s = typed_ahead_chunk(&mut t, b"ls\x1b[K\r\n\x1b[H\x1b[2J$ ");
+    assert_eq!(
+        (s.confirmed + s.restyled, s.mispredicted.total()),
+        (2, 0),
+        "over the suggestion: {s:?}"
+    );
+}
+
+/// The scroll and erase cuts each decide on their own: `ls` then a bare LF scroll (no CR before
+/// it), and `ls` then a clear before any cursor move.
+#[test]
+fn a_scroll_or_an_erase_alone_is_a_cut() {
+    let mut t = tall(3);
+    t.server(b"\r\n\r\n", 0);
+    confirmed_at(&mut t, 10);
+    let s = typed_ahead_chunk(&mut t, b"ls\nfile1\n$ ");
+    assert_eq!((s.confirmed, s.mispredicted.total()), (2, 0), "LF: {s:?}");
+    let mut t = T::new();
+    confirmed_at(&mut t, 0);
+    let s = typed_ahead_chunk(&mut t, b"ls\x1b[2J\x1b[H$ ");
+    assert_eq!((s.confirmed, s.mispredicted.total()), (2, 0), "ED: {s:?}");
+}
+
+/// Cursor moves before the echo are cuts that see nothing yet: the echo is still seen at a later
+/// cut. Past 16 cuts the rest of the chunk is fed whole, and the shadow after it decides, as
+/// without the cuts.
+#[test]
+fn cuts_go_on_past_moves_before_the_echo_up_to_sixteen() {
+    let mut t = T::new();
+    confirmed_at(&mut t, 0);
+    let s = typed_ahead_chunk(&mut t, b"\x1b[1C\x1b[1Dls\r\n\x1b[H\x1b[2J$ ");
+    assert_eq!((s.confirmed, s.mispredicted.total()), (2, 0), "{s:?}");
+    let mut chunk = b"\x1b[1C\x1b[1D".repeat(9);
+    chunk.extend_from_slice(b"ls\r\n\x1b[H\x1b[2J$ ");
+    let mut t = T::new();
+    confirmed_at(&mut t, 0);
+    let s = typed_ahead_chunk(&mut t, &chunk);
+    assert_eq!(
+        (s.confirmed, s.mispredicted.ended),
+        (0, 2),
+        "past the cuts: {s:?}"
+    );
+}

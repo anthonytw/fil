@@ -41,7 +41,7 @@ use fil_term::snapshot::{sanitize, sgr};
 use fil_term::{Backend, Capabilities, Emulator, Screen, Size, TermState};
 use unicode_width::UnicodeWidthChar;
 
-use epochs::{Cells, Core, Why};
+use epochs::{Cells, Core, Cut, MAX_CUTS, Why};
 
 /// A cell the overlay wants to draw: the character and how.
 type Wanted = (char, CellStyle);
@@ -854,7 +854,31 @@ impl Overlay {
         f.server = bytes.to_vec();
         let sync_before = o.tracker.sync_output();
         let rest_before = o.tracker.at_rest();
-        shadow.feed(bytes);
+        // While written guesses are pending, a chunk that scrolls or erases is fed in pieces cut
+        // before each scroll or erase, and the core sees the written cells at each cut (BUGS-3,
+        // `Core::glimpse`); otherwise (the flood path among them) it is fed whole.
+        let mut fed = 0;
+        let mut cut = None;
+        if o.core.has_written_pending() {
+            // From the first byte: a scroll or a shift that starts the chunk closes the glimpses
+            // before it can move anything into a guessed cell.
+            cut = next_cut(bytes, 0);
+            if cut.is_some() && !o.core.begin_glimpses(&Shadow::new(&**shadow)) {
+                cut = None;
+            }
+        }
+        if cut.is_some() {
+            for _ in 0..MAX_CUTS {
+                let Some((c, kind)) = cut else { break };
+                shadow.feed(&bytes[fed..c]);
+                fed = c;
+                if !o.core.glimpse(&Shadow::new(&**shadow), kind) {
+                    break;
+                }
+                cut = next_cut(bytes, c + 1);
+            }
+        }
+        shadow.feed(&bytes[fed..]);
         let _ = shadow.take_replies(); // the user's terminal answers queries
         o.tracker.feed(bytes);
         if o.tracker.take_paste_change() {
@@ -882,6 +906,7 @@ impl Overlay {
                 o.core.expire(&st, now);
                 o.core.check_skipped(&st, now);
                 o.core.on_chunk(&st, now);
+                o.core.settle_glimpsed(&st, now);
                 if o.core.has_pending() {
                     let edits = o.predictor.on_output(&o.ctx(&st, now));
                     o.core.apply_edits(edits, &st, now);
@@ -911,6 +936,7 @@ impl Overlay {
         } else {
             f.bracket = Bracket::Parts;
         }
+        o.core.end_glimpses();
         f
     }
 
@@ -1012,6 +1038,7 @@ impl Overlay {
                 continue;
             }
             o.core.before_key(&st, now);
+            o.core.note_key(kat, class);
             o.core.last_activity = Some(now);
             if !allowed {
                 // The password rule or the alternate screen: the key is not predicted.
@@ -1762,6 +1789,119 @@ impl Out {
         }
         if g.cursor_visibility && ctx.visible {
             self.put("\x1b[?25h");
+        }
+    }
+}
+
+/// Where, at or after `from`, the next cut of a server-output chunk falls (BUGS-3), and what it
+/// falls before ([`Cut`]):
+///
+/// - [`Cut::Wipe`], what can take a glyph the chunk drew off its cell wholesale, or move other
+///   content into it. Scrolls and shifts: LF, VT and FF (at the bottom margin; every one is
+///   cut, a cut the link could make too), IND, NEL, RI, `CSI S`, `T`, `L`, `M`, `P`, `@`.
+///   Erases: `CSI J`, `K`, `X`, RIS, DECALN. Screen switches: `?47`, `?1047`, `?1049`, DECCOLM
+///   (`?3`).
+/// - [`Cut::Move`], the cursor moves an overwrite in place starts with: BS, CR, `CSI A` to `H`,
+///   `f`, `d`, `` ` ``, `u`, and DECRC.
+///
+/// Context-free: a sequence the chunk only ends is not seen, which only loses a cut, and a
+/// control inside a string payload makes a spurious one, which only spends the budget.
+pub(crate) fn next_cut(bytes: &[u8], from: usize) -> Option<(usize, Cut)> {
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x0a..=0x0c => return Some((i, Cut::Wipe)),
+            0x08 | 0x0d => return Some((i, Cut::Move)),
+            0x1b => match bytes.get(i + 1) {
+                Some(b'c' | b'D' | b'E' | b'M') => return Some((i, Cut::Wipe)),
+                Some(b'8') => return Some((i, Cut::Move)),
+                Some(b'#') if bytes.get(i + 2) == Some(&b'8') => return Some((i, Cut::Wipe)),
+                Some(b'[') => {
+                    let mut j = i + 2;
+                    let private = bytes.get(j) == Some(&b'?');
+                    let marked = bytes.get(j).is_some_and(|b| (0x3c..=0x3f).contains(b));
+                    let params = j;
+                    while bytes.get(j).is_some_and(|b| (0x30..=0x3f).contains(b)) {
+                        j += 1;
+                    }
+                    let inter = j;
+                    while bytes.get(j).is_some_and(|b| (0x20..=0x2f).contains(b)) {
+                        j += 1;
+                    }
+                    let &fin = bytes.get(j)?;
+                    let plain = inter == j && !marked;
+                    let screen = || {
+                        bytes[params + 1..inter]
+                            .split(|&b| b == b';')
+                            .any(|p| matches!(p, b"47" | b"1047" | b"1049" | b"3"))
+                    };
+                    let hit = match fin {
+                        b'J' | b'K' | b'P' | b'X' | b'@' | b'S' | b'T' | b'L' | b'M' if plain => {
+                            Some(Cut::Wipe)
+                        }
+                        b'h' | b'l' if inter == j && private && screen() => Some(Cut::Wipe),
+                        b'A'..=b'H' | b'f' | b'd' | b'`' | b'u' if plain => Some(Cut::Move),
+                        _ => None,
+                    };
+                    if let Some(kind) = hit {
+                        return Some((i, kind));
+                    }
+                    i = j;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod cut_tests {
+    use super::{Cut, next_cut};
+
+    #[test]
+    fn cuts_fall_before_scrolls_erases_and_moves_only() {
+        use Cut::{Move, Wipe};
+        for (bytes, from, want) in [
+            (&b"ls\r\nfile\r\n"[..], 1, Some((2, Move))),
+            (b"ls\r\nfile\r\n", 3, Some((3, Wipe))),
+            (b"ls\r\nfile\r\n", 4, Some((8, Move))),
+            (b"f\x08 \x08", 1, Some((1, Move))),
+            (b"f\x08 \x08", 2, Some((3, Move))),
+            (b"ab\x1b[K", 1, Some((2, Wipe))),
+            (b"ab\x1b[P", 1, Some((2, Wipe))),
+            (b"ab\x1b[2@", 1, Some((2, Wipe))),
+            (b"ab\x1b[H\x1b[2J$ ", 1, Some((2, Move))),
+            (b"ab\x1b[H\x1b[2J$ ", 3, Some((5, Wipe))),
+            (b"q\x1b[Dwq\x1b[1D", 1, Some((1, Move))),
+            (b"q\x1b[Dwq\x1b[1D", 2, Some((6, Move))),
+            (b"ab\x1b8", 1, Some((2, Move))),
+            (b"ab\x1b[J", 1, Some((2, Wipe))),
+            (b"ab\x1b[4J", 1, Some((2, Wipe))),
+            (b"ab\x1b[?1049h", 1, Some((2, Wipe))),
+            (b"ab\x1b[?25;47h", 1, Some((2, Wipe))),
+            (b"ab\x1bc", 1, Some((2, Wipe))),
+            (b"ab\x1bM", 1, Some((2, Wipe))),
+            (b"ab\x1b[M", 1, Some((2, Wipe))),
+            (b"ab\x1b[2S", 1, Some((2, Wipe))),
+            // Not cuts: the pen, other modes, a save, kitty's `CSI > u`, a sequence cut short.
+            (
+                b"ab\x1b[32mc\x1b[m\x1b[?25h\x1b[?2004h\x1b7\x1b[s\x1b[>1u",
+                1,
+                None,
+            ),
+            (b"ab\x1b[?104", 1, None),
+            (b"\nab", 0, Some((0, Wipe))),
+            (b"\nab", 1, None),
+        ] {
+            assert_eq!(
+                next_cut(bytes, from),
+                want,
+                "{:?} from {from}",
+                bytes.escape_ascii()
+            );
         }
     }
 }

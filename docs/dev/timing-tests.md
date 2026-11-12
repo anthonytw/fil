@@ -73,6 +73,7 @@ disturbed samples. All of these are named `wallclock_*`.
 | `forward` (fil-session) `forward_floods_do_not_slow_the_terminal` | echo < 1 s | T | passes |
 | `agent` (fil-session) `refused_at_once_while_detached` | < 50 ms | T | passes; Stalls |
 | `catch_up_order` x2 | takeover < 200 ms; first output < 1.5 s | T | passes |
+| `netcut` (drop-in example) `*_held_for_the_delay_each_way` x2 | each way: in one of 3 runs, median <= 30 + 10 ms and IQR <= 3 ms (never < 30 ms, also checked per PR by the untimed `*_never_early` pair) | T (separates a relay that rounds its hold to a 10 ms tick, IQR about 5 ms, from three thread wake-ups) | IQR 0.02 to 0.1 ms locally; 3.4 to 6.8 ms on Intel macOS beside the rest of the suite |
 | `repaint` x2 | repaint within 1.4 s / 1.5 s of the request | T | passes |
 | `log_blocking` `a_hung_log_file_does_not_stop_the_daemon` | mean call <= 200 us, p99 < 50 ms, max < 1 s | T (the log never blocks the daemon) | passes; Stalls |
 | `ports::probe` x3 | no probe < 50 ms; < per_port budget + 100 ms | T (the budget itself is P) | passes; Stalls on the first |

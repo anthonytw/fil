@@ -408,6 +408,11 @@ mod tests {
     /// A loaded machine can deschedule any of the threads for milliseconds; it rarely does so to
     /// the median of all three runs (the pattern of `fil-daemon/tests/log_blocking.rs`).
     const RUNS: usize = 3;
+    // The two delay-bound tests are named `wallclock_*` (docs/dev/timing-tests.md): their medians
+    // and spreads are elapsed time, and beside the rest of the suite on macos-check's x86_64
+    // runner (suite=all, run 43191751255) every run's IQR was 3.4 to 6.8 ms from contention
+    // alone. They run alone, in `just test-wallclock`; an untimed variant of each (order,
+    // delivery, nothing early) runs per PR.
 
     /// One run's one-way delays: (up, down), one per sample, in the order sent.
     type Run = (Vec<Duration>, Vec<Duration>);
@@ -442,17 +447,23 @@ mod tests {
             })
             .collect();
         eprintln!("netcut {what}: delay {DELAY:?}, medians of {SAMPLES} samples: {summary:?}");
-        for (up, down) in runs {
-            let early = up.iter().chain(down).min().unwrap();
-            assert!(
-                *early >= DELAY,
-                "{what}: a sample took {early:?} < {DELAY:?}"
-            );
+        for r in runs {
+            never_early(what, r);
         }
         assert!(
             runs.iter().any(within),
             "{what}: no run had both medians within {WITHIN:?} over {DELAY:?} and spreads within \
                  {SPREAD:?}: {summary:?}"
+        );
+    }
+
+    /// No byte or datagram of the run came through in less than the delay (one that skipped the
+    /// queue). Load only ever makes a sample later, so this holds on any machine.
+    fn never_early(what: &str, (up, down): &Run) {
+        let early = up.iter().chain(down).min().unwrap();
+        assert!(
+            *early >= DELAY,
+            "{what}: a sample took {early:?} < {DELAY:?}"
         );
     }
 
@@ -490,75 +501,88 @@ mod tests {
 
     impl Times {
         fn one_way(self) -> Run {
-            let up = (0..SAMPLES)
-                .map(|i| self.at_host[i] - self.sent[i])
-                .collect();
-            let down = (0..SAMPLES)
-                .map(|i| self.back[i] - self.at_host[i])
-                .collect();
+            let n = self.sent.len();
+            let up = (0..n).map(|i| self.at_host[i] - self.sent[i]).collect();
+            let down = (0..n).map(|i| self.back[i] - self.at_host[i]).collect();
             (up, down)
         }
     }
 
-    #[test]
-    fn tcp_bytes_are_held_for_the_delay_each_way() {
+    /// The TCP relay with [`DELAY`] set, and its host.
+    fn tcp_cut() -> (Cut, std::net::TcpListener) {
         let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let cut = Cut::start_to(host.local_addr().unwrap(), Vec::new()).unwrap();
         cut.set_delay(DELAY);
-        let all = runs(|| {
-            let mut c = std::net::TcpStream::connect(("127.0.0.1", cut.tcp_port)).unwrap();
-            c.set_nodelay(true).unwrap();
-            let (mut h, _) = host.accept().unwrap();
-            h.set_nodelay(true).unwrap();
-            let mut reader = c.try_clone().unwrap();
-            std::thread::scope(|sc| {
-                // The host: every byte back at once, stamped when it was read.
-                let at_host = sc.spawn(move || {
-                    let mut at = Vec::new();
-                    let mut buf = [0u8; 64];
-                    while at.len() < SAMPLES {
-                        let n = h.read(&mut buf).unwrap();
-                        assert!(n > 0, "the relay closed the connection");
-                        let t = Clock::now();
-                        h.write_all(&buf[..n]).unwrap();
-                        at.extend(std::iter::repeat_n(t, n));
-                    }
-                    at
-                });
-                let back = sc.spawn(move || {
-                    let mut at = Vec::new();
-                    let mut buf = [0u8; 64];
-                    while at.len() < SAMPLES {
-                        let n = reader.read(&mut buf).unwrap();
-                        assert!(n > 0, "the relay closed the connection");
-                        let t = Clock::now();
-                        // In order, nothing lost or added: TCP's bytes are the indices.
-                        for (k, b) in buf[..n].iter().enumerate() {
-                            assert_eq!(usize::from(*b), at.len() + k);
-                        }
-                        at.extend(std::iter::repeat_n(t, n));
-                    }
-                    at
-                });
-                let mut sent = Vec::new();
-                for i in 0..SAMPLES {
-                    sent.push(Clock::now());
-                    c.write_all(&[i as u8]).unwrap();
-                    std::thread::sleep(Duration::from_millis(5));
+        (cut, host)
+    }
+
+    /// One TCP run of `samples` bytes through `cut` to `host` and back, checking order.
+    fn tcp_run(cut: &Cut, host: &std::net::TcpListener, samples: usize) -> Run {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", cut.tcp_port)).unwrap();
+        c.set_nodelay(true).unwrap();
+        let (mut h, _) = host.accept().unwrap();
+        h.set_nodelay(true).unwrap();
+        let mut reader = c.try_clone().unwrap();
+        std::thread::scope(|sc| {
+            // The host: every byte back at once, stamped when it was read.
+            let at_host = sc.spawn(move || {
+                let mut at = Vec::new();
+                let mut buf = [0u8; 64];
+                while at.len() < samples {
+                    let n = h.read(&mut buf).unwrap();
+                    assert!(n > 0, "the relay closed the connection");
+                    let t = Clock::now();
+                    h.write_all(&buf[..n]).unwrap();
+                    at.extend(std::iter::repeat_n(t, n));
                 }
-                Times {
-                    sent,
-                    at_host: at_host.join().unwrap(),
-                    back: back.join().unwrap(),
+                at
+            });
+            let back = sc.spawn(move || {
+                let mut at = Vec::new();
+                let mut buf = [0u8; 64];
+                while at.len() < samples {
+                    let n = reader.read(&mut buf).unwrap();
+                    assert!(n > 0, "the relay closed the connection");
+                    let t = Clock::now();
+                    // In order, nothing lost or added: TCP's bytes are the indices.
+                    for (k, b) in buf[..n].iter().enumerate() {
+                        assert_eq!(usize::from(*b), at.len() + k);
+                    }
+                    at.extend(std::iter::repeat_n(t, n));
                 }
-                .one_way()
-            })
-        });
-        judge("tcp", &all);
+                at
+            });
+            let mut sent = Vec::new();
+            for i in 0..samples {
+                sent.push(Clock::now());
+                c.write_all(&[i as u8]).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Times {
+                sent,
+                at_host: at_host.join().unwrap(),
+                back: back.join().unwrap(),
+            }
+            .one_way()
+        })
+    }
+
+    /// Per PR: a few bytes each way come through in order and none early. The timing bounds are
+    /// the wall-clock test's below.
+    #[test]
+    fn tcp_bytes_come_through_in_order_and_never_early() {
+        let (cut, host) = tcp_cut();
+        never_early("tcp", &tcp_run(&cut, &host, 10));
     }
 
     #[test]
-    fn udp_datagrams_are_held_for_the_delay_each_way() {
+    fn wallclock_tcp_bytes_are_held_for_the_delay_each_way() {
+        let (cut, host) = tcp_cut();
+        judge("tcp", &runs(|| tcp_run(&cut, &host, SAMPLES)));
+    }
+
+    /// The UDP relay with [`DELAY`] set, its host, and the port it relays.
+    fn udp_cut() -> (Cut, std::net::UdpSocket, u16) {
         let host = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         // A TCP side is always there; nothing connects to it here.
         let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -571,49 +595,66 @@ mod tests {
         let port = *cut.udp.iter().next().unwrap();
         assert!(cut.covers(port));
         cut.set_delay(DELAY);
-        let all = runs(|| {
-            let c = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            c.connect(("127.0.0.1", port)).unwrap();
-            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            std::thread::scope(|sc| {
-                let host = &host;
-                let at_host = sc.spawn(move || {
-                    let mut at = vec![None; SAMPLES];
-                    let mut buf = [0u8; 16];
-                    for _ in 0..SAMPLES {
-                        let (n, from) = host.recv_from(&mut buf).unwrap();
-                        let t = Clock::now();
-                        host.send_to(&buf[..n], from).unwrap();
-                        at[usize::from(buf[0])] = Some(t);
-                    }
-                    at.into_iter().map(Option::unwrap).collect::<Vec<_>>()
-                });
-                let reader = c.try_clone().unwrap();
-                let back = sc.spawn(move || {
-                    let mut at = vec![None; SAMPLES];
-                    let mut buf = [0u8; 16];
-                    for _ in 0..SAMPLES {
-                        reader.recv(&mut buf).unwrap();
-                        at[usize::from(buf[0])] = Some(Clock::now());
-                    }
-                    at.into_iter().map(Option::unwrap).collect::<Vec<_>>()
-                });
-                let mut sent = Vec::new();
-                for i in 0..SAMPLES {
-                    sent.push(Clock::now());
-                    c.send(&[i as u8]).unwrap();
-                    std::thread::sleep(Duration::from_millis(5));
+        (cut, host, port)
+    }
+
+    /// One UDP run of `samples` datagrams through `port` to `host` and back, each delivered.
+    fn udp_run(host: &std::net::UdpSocket, port: u16, samples: usize) -> Run {
+        let c = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        c.connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        std::thread::scope(|sc| {
+            let host = &host;
+            let at_host = sc.spawn(move || {
+                let mut at = vec![None; samples];
+                let mut buf = [0u8; 16];
+                for _ in 0..samples {
+                    let (n, from) = host.recv_from(&mut buf).unwrap();
+                    let t = Clock::now();
+                    host.send_to(&buf[..n], from).unwrap();
+                    at[usize::from(buf[0])] = Some(t);
                 }
-                Times {
-                    sent,
-                    at_host: at_host.join().unwrap(),
-                    back: back.join().unwrap(),
+                at.into_iter().map(Option::unwrap).collect::<Vec<_>>()
+            });
+            let reader = c.try_clone().unwrap();
+            let back = sc.spawn(move || {
+                let mut at = vec![None; samples];
+                let mut buf = [0u8; 16];
+                for _ in 0..samples {
+                    reader.recv(&mut buf).unwrap();
+                    at[usize::from(buf[0])] = Some(Clock::now());
                 }
-                .one_way()
-            })
-        });
-        judge("udp", &all);
+                at.into_iter().map(Option::unwrap).collect::<Vec<_>>()
+            });
+            let mut sent = Vec::new();
+            for i in 0..samples {
+                sent.push(Clock::now());
+                c.send(&[i as u8]).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Times {
+                sent,
+                at_host: at_host.join().unwrap(),
+                back: back.join().unwrap(),
+            }
+            .one_way()
+        })
+    }
+
+    /// Per PR: a few datagrams each way are delivered and none early. The timing bounds are the
+    /// wall-clock test's below.
+    #[test]
+    fn udp_datagrams_come_through_and_never_early() {
+        let (cut, host, port) = udp_cut();
+        never_early("udp", &udp_run(&host, port, 10));
+        assert_eq!(cut.queue_dropped(), 0);
+    }
+
+    #[test]
+    fn wallclock_udp_datagrams_are_held_for_the_delay_each_way() {
+        let (cut, host, port) = udp_cut();
+        judge("udp", &runs(|| udp_run(&host, port, SAMPLES)));
         assert_eq!(cut.queue_dropped(), 0);
     }
 

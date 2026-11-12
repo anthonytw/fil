@@ -25,6 +25,8 @@ workspace = true
 alacritty_terminal = { version = "0.26", default-features = false, optional = true }
 vt100 = { version = "0.18", optional = true }
 vte = { version = "0.15", optional = true }
+# The OSC cap scans for ESC as vte does (src/osc_cap.rs).
+memchr = "2"
 
 [dev-dependencies]
 portable-pty = "0.9"

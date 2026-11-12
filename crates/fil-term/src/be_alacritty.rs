@@ -79,6 +79,7 @@ use crate::model::{
     MouseEncoding, MouseTracking, PrimaryScreen, SavedCursor, Size, TermState, Underline,
     default_tab_stops,
 };
+use crate::osc_cap::OscCap;
 use crate::sniff::{Action, RegionTracker};
 use crate::view::{CellView, Screen, Stamps, ascii_str};
 use crate::{Backend, Capabilities, Emulator};
@@ -166,6 +167,8 @@ impl From<Size> for Dims {
 struct Alacritty {
     term: RefCell<Term<Shared>>,
     parser: Processor,
+    /// Bounds the OSC strings the parsers buffer (`crate::osc_cap`).
+    cap: OscCap,
     shared: Shared,
     region: RegionTracker,
     size: Size,
@@ -192,6 +195,7 @@ impl Alacritty {
         let mut a = Alacritty {
             term: RefCell::new(term),
             parser: Processor::new(),
+            cap: OscCap::new(),
             shared,
             region: RegionTracker::new(size.rows, false, true),
             size,
@@ -310,6 +314,8 @@ impl Emulator for Alacritty {
     }
 
     fn feed(&mut self, bytes: &[u8]) {
+        let bytes = self.cap.filter(bytes);
+        let bytes = &*bytes;
         let mut done = 0;
         for (end, action) in self.region.feed(bytes) {
             self.parser.advance(self.term.get_mut(), &bytes[done..end]);

@@ -49,6 +49,8 @@ pub(crate) type ConnId = u64;
 /// How long the unfinished end of an escape sequence is waited for before it is let through
 /// anyway (a clipboard write or an image can be long; garbage can be endless).
 const MAX_TAIL: usize = 1024 * 1024;
+// The emulator and the query scanner drop an OSC longer than this (`fil_term::osc_cap`).
+const _: () = assert!(MAX_TAIL == fil_term::osc_cap::MAX_OSC);
 /// How often the process tree is recorded (Tree scope only).
 const TRACK_INTERVAL: Duration = Duration::from_secs(5);
 /// Most entries of PTY mode history kept. The history is pruned to the log's range first (a

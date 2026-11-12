@@ -29,6 +29,7 @@ use crate::model::{
     Attrs, Cell, Charsets, Color, Cursor, CursorShape, Hyperlink, Line, Modes, MouseEncoding,
     MouseTracking, Size, TermState,
 };
+use crate::osc_cap::OscCap;
 use crate::sniff::{Action, RegionTracker};
 use crate::view::{CellView, Screen, Stamps};
 use crate::{Backend, Capabilities, Emulator};
@@ -154,6 +155,8 @@ struct Vt100 {
     stamps: Stamps,
     touch_parser: vte::Parser,
     touch: Touch,
+    /// Bounds the OSC strings the parsers buffer (`crate::osc_cap`).
+    cap: OscCap,
     /// The modes as [`Screen::modes`] reports them, refreshed by the first view after a change.
     modes: RefCell<Modes>,
     modes_stale: StdCell<bool>,
@@ -181,6 +184,7 @@ impl Vt100 {
             stamps: Stamps::new(size.rows),
             touch_parser: vte::Parser::new(),
             touch: Touch::default(),
+            cap: OscCap::new(),
             modes: RefCell::new(Modes::default()),
             modes_stale: StdCell::new(true),
         }
@@ -293,6 +297,8 @@ impl Emulator for Vt100 {
     /// it. A run of printable characters writes only the cursor's row if it cannot reach the
     /// last column's wrap; anything else that could wrap or scroll counts as writing every row.
     fn feed(&mut self, bytes: &[u8]) {
+        let bytes = self.cap.filter(bytes);
+        let bytes = &*bytes;
         let actions = self.region.feed(bytes);
         let cols = usize::from(self.size.cols);
         let mut f = Feeder {

@@ -581,6 +581,7 @@ name = "fil-term"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "memchr",
  "portable-pty",
  "vt100",
  "vte",

@@ -52,8 +52,6 @@ fn listening_here(port: u16) -> bool {
     .is_ok()
 }
 
-/// A command typed in the session; its output (with the echo) and its exit status, read with a
-/// marker only the shell computes.
 /// The IPv4 address this machine would send from to reach `host` (an address or a name), if it is
 /// not a loopback one: the address of this machine on the host's network.
 fn route_source(host: &str) -> Option<String> {
@@ -66,6 +64,8 @@ fn route_source(host: &str) -> Option<String> {
     (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
 }
 
+/// A command typed in the session; its output (with the echo) and its exit status, read with a
+/// marker only the shell computes.
 pub fn sess_status(c: &mut Client, cmd: &str) -> Result<(String, i32), String> {
     let out = c.run(&format!("{cmd}; echo \"RC$((6*7))=$?\""), CMD_TIMEOUT)?;
     let rc = out

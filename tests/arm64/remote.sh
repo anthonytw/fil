@@ -63,7 +63,11 @@ stop_ns_sshd() {
 # The host's network: the namespace, the veth pair, and an sshd of its own in it (the system's
 # configuration, the drop-in included, listening on the host's address only).
 start_ns() {
-  if ! ip netns list | grep -qw "$NS"; then
+  # Captured first, as below: under pipefail, `cmd | grep -q` fails when grep exits before cmd
+  # has written.
+  local have
+  have=$(ip netns list)
+  if ! grep -qw "$NS" <<< "$have"; then
     ip netns add "$NS"
     ip link add fil-here type veth peer name fil-host
     ip link set fil-host netns "$NS"
@@ -165,14 +169,15 @@ EOF
 }
 
 install_bins() {
-  local dir=${1:?install DIR} b sha
+  local dir=${1:?install DIR} b sha kind
   for b in fil fwdprobe; do
     [[ -f $dir/$b && -f $dir/$b.sha256 ]] || die "$dir/$b or its .sha256 is missing"
     sha=$(cut -d' ' -f1 "$dir/$b.sha256")
     (cd "$dir" && sha256sum -c "$b.sha256" > /dev/null) || die "$dir/$b does not match its .sha256"
     # A static aarch64 binary, as on the Pis: the remote side is the release target's build.
-    file "$dir/$b" | grep -Eq 'ELF 64-bit.*ARM aarch64.*(statically linked|static-pie linked)' ||
-      die "$dir/$b is not a static aarch64 ELF: $(file -b "$dir/$b")"
+    kind=$(file -b "$dir/$b")
+    grep -Eq 'ELF 64-bit.*ARM aarch64.*(statically linked|static-pie linked)' <<< "$kind" ||
+      die "$dir/$b is not a static aarch64 ELF: $kind"
     ssh -o BatchMode=yes "$TARGET" install "$b" "$sha" < "$dir/$b"
   done
   ssh -o BatchMode=yes "$TARGET" run fil --version

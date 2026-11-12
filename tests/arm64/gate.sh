@@ -44,6 +44,9 @@ done
 # The same for the session bus, which the gate's `systemctl --user` and fil's `systemd-run --user
 # --scope` reach: this account's own, never one handed down from the machine.
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+# And a plain system PATH: the image's /etc/environment also puts the runner user's own tool
+# directories on every login's PATH, and a Pi's account has none of them.
+export PATH=/usr/local/bin:/usr/bin:/bin
 
 case "$verb" in
   fil)

@@ -139,6 +139,9 @@ jobs:
       - name: The prediction performance budget on this runner (docs/m3/plan.md §2.10, done-when 7)
         if: ${{ !cancelled() }}
         run: |
+          # Without pipefail tee's status would win: a bench that fails to build or panics must
+          # fail the step, not leave an empty summary.
+          set -o pipefail
           cargo bench --locked -p fil-predict --bench budget | tee target/budget.txt
           { echo "### Prediction budget (\`cargo bench -p fil-predict --bench budget\`, $(uname -m))"; echo '```'; cat target/budget.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
@@ -304,6 +307,9 @@ jobs:
       - name: The prediction performance budget on this runner (docs/m3/plan.md §2.10, done-when 7)
         if: ${{ !cancelled() }}
         run: |
+          # Without pipefail tee's status would win: a bench that fails to build or panics must
+          # fail the step, not leave an empty summary.
+          set -o pipefail
           cargo bench --locked -p fil-predict --bench budget | tee target/budget.txt
           { echo "### Prediction budget (\`cargo bench -p fil-predict --bench budget\`, $(uname -m))"; echo '```'; cat target/budget.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: The remote side's logs

@@ -10,7 +10,9 @@ fil is a remote shell for development over SSH that keeps your place:
 - **Connects directly over QUIC**, or over a plain SSH pipe when UDP is blocked, and moves between the two by itself.
 - **Needs no root and no service** on the host: one program, run as you. It respects the host admin's sshd forwarding settings.
 
-It has no panes: your terminal already does that. Predictive local echo, as in mosh, is planned for 0.2.0; 0.1.0 does not have it.
+- **Shows what you type before the host echoes it**, as mosh does, when the round trip is long enough for that to help. This predictive local echo is on by default (`predict = "adaptive"`) from 0.2.0.
+
+It has no panes: your terminal already does that.
 
 ## Install
 
@@ -44,7 +46,20 @@ Check these fingerprints against the copies in the repository before you trust a
 
 ## Status
 
-fil is approaching its first release, 0.1.0: an ssh/et drop-in. The client, the daemon, sessions that survive a reconnect or a takeover, both transports, port forwards, `fil ports`, the agent relay, server policy, and installing over ssh work. The design and the milestones are in [DESIGN.md](DESIGN.md) (§15); the changes are in [CHANGELOG.md](CHANGELOG.md).
+fil 0.1.0, the first release, is an ssh/et drop-in: the client, the daemon, sessions that survive a reconnect or a takeover, both transports, port forwards, `fil ports`, the agent relay, server policy, and installing over ssh. The next release, 0.2.0, is in progress and adds predictive local echo. The design and the milestones are in [DESIGN.md](DESIGN.md) (§15); the changes are in [CHANGELOG.md](CHANGELOG.md).
+
+### Predictive echo (0.2.0)
+
+While you type at a shell prompt, fil can draw the characters it expects the host to echo before the echo arrives, and replaces them with what the host really sends. `predict = "adaptive"`, the default, shows these guesses only when the round trip is above about 30 ms or for 30 s after an echo that took more than 250 ms, and underlines them while the round trip is above about 80 ms or in those 30 s. `predict = "always"` shows them at any round trip, and `predict = "off"` turns prediction off; set it in [`config.toml`](docs/user/config.md#predict), per host or for all, or for one run with `--predict off|adaptive|always`.
+
+What it does not do:
+
+- It predicts printable characters (ASCII and Latin-script characters), Backspace over what you just typed, and the left and right arrows within it. It never predicts Enter, Tab completion, history, other control keys, or anything that would wrap a line or scroll the screen.
+- It stays off in full-screen programs that use the alternate screen (vim, less, htop, tmux), and for pasted text.
+- Nothing is predicted once fil knows the host is at a password prompt. Four rare cases can still show typed keys, such as a password typed ahead of its prompt; they are listed in the [guide](docs/user/README.md#predictive-echo), and `predict = "off"` for a host is the way out.
+- Your keys go to the host as they would without it; what changes is your screen. With `predict` at `adaptive` or `always`, even on a fast link where no guess is shown, the host also acknowledges each stretch of typed input, which the [security and privacy](docs/user/security-privacy.md) page covers.
+
+The goal and the measurements are in [`docs/m3/plan.md`](docs/m3/plan.md). In its scripted soak (1,000 seeds, output delivered as the daemon delivers it), programs that echo what you type show no visible misprediction, with one accepted exception for fish; some of the other measurements are still to be made.
 
 PR numbers (#NN) in docs and comments refer to the repository's earlier history, which is archived.
 

@@ -2,7 +2,7 @@
 
 fil is a remote shell for development over SSH. It keeps your place: the connection can drop, your laptop can sleep or change networks, and your shell, its output and your port forwards are still there when you come back. This guide is for people who use fil and for the admins of the hosts they use it on.
 
-This is the guide for **0.1.0**. fil 0.1.0 is an ssh/et drop-in without predictive echo; that feature is planned for 0.2.0.
+This is the guide for **0.2.0**, which adds [predictive echo](#predictive-echo) to the ssh/et drop-in that 0.1.0 was. Where something is new in 0.2.0, the page says so.
 
 ## Start here
 
@@ -15,7 +15,36 @@ This is the guide for **0.1.0**. fil 0.1.0 is an ssh/et drop-in without predicti
 - [Reconnects and transports](transports.md): the ssh pipe, direct QUIC over UDP, and what a firewall changes.
 - [Forwards and `fil ports`](forwards.md): `-L`, `-R`, `-D`, and the view of what each session holds.
 - [The agent](agent.md): relaying your ssh-agent to a session, and what that risks.
+- [Predictive echo](#predictive-echo), below: what you see while you type over a slow link.
 - [fil compared with ssh, ET and mosh](compared.md).
+
+## Predictive echo
+
+New in 0.2.0. Over a slow link, every key you type takes a round trip before it appears, because the host echoes it. fil can draw the character in your terminal at once, as a guess, and replace it with what the host really sends when that arrives, as mosh does.
+
+**What you see.** With the default, `predict = "adaptive"`, fil guesses only when the round trip is above about 30 ms (and stops below about 20 ms), so on a fast link you see no difference. For 30 s after an echo that took more than 250 ms from its key, it shows guesses even on a fast link. While the round trip is above about 80 ms, or in those 30 s, the guesses are **underlined**, so you can tell them from what the host has confirmed; the underline goes when the echo arrives. On a link in between, guesses are drawn plain. A guess that turns out wrong is replaced by what the host sent, usually within one round trip.
+
+**What it predicts.** Printable characters (ASCII and Latin-script characters) at a shell or REPL prompt, Backspace over what you just typed, and the left and right arrows (and Ctrl-B, Ctrl-F) within what you just typed. It never predicts Enter, Tab completion, history, Ctrl-R, Ctrl-U, Ctrl-W or other control keys, never draws anything that would wrap a line or scroll the screen, and stays off in full-screen programs that use the alternate screen (vim, less, htop, tmux). Your keys go to the host exactly as they would without prediction.
+
+**Turning it off.** In [`config.toml`](config.md#predict), for one host or for all:
+
+```text
+[host.devbox]
+predict = "off"
+```
+
+or for one run, `fil devbox --predict off`. `predict = "always"` shows guesses at any round trip. `fil config show devbox` shows the setting in effect and where it came from.
+
+**Password prompts.** Nothing is predicted while the host's terminal is at a password prompt (the mode `sudo`, `ssh`, `passwd`, `read -s` and `getpass` use: canonical, with echo off), and anything already drawn is taken back when fil learns of the prompt. Four rare cases can still draw keys you type; they were accepted as the price of predicting in shells, whose line editors turn echo off too:
+
+1. A raw-mode program that starts reading a secret on an ordinary key, without changing the terminal mode or drawing a prompt first. The keys typed before fil sees that they are not echoed are drawn: about one round trip and 50 ms.
+2. A password typed ahead of its prompt, such as `sleep 3; read -s` with the password typed during the `sleep`. The keys typed in the round trip before fil learns of the prompt are drawn.
+3. Output that equals the typed keys, such as an asterisk mask's `*` when you type `*`, or a PIN prompt that echoes `1` for a typed `1`: fil takes it as an echo.
+4. A secret prompt drawn only to the right of the cursor, or only by changing colors or other attributes, or drawn and erased again before fil looks.
+
+A guess once drawn has reached your terminal, its scrollback and anything recording or sharing your screen, even if fil erases it at once. If that matters on a host, set `predict = "off"` for it. The [security and privacy](security-privacy.md) page has the rest.
+
+**Pasting.** Pasted text is never predicted: it goes to the host as is, and you see it when the host echoes it. fil recognizes a paste by your terminal's bracketed-paste markers, or, when the program on the host has not turned bracketed paste on, by its size (a read of 64 bytes or more, and what follows it within a few milliseconds). After a paste, as after Enter, fil waits for the host to echo the first key you type before it shows guesses again.
 
 ## Configuration
 

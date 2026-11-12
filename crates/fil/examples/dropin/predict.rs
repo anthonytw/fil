@@ -78,6 +78,18 @@ impl Stats {
         self.sum("mispredicted.")
     }
 
+    /// Visible mispredictions of the reasons not in `accepted` (`contradicted`, `hidden`...).
+    pub fn mispredicted_but(&self, accepted: &[&str]) -> u64 {
+        self.0
+            .iter()
+            .filter(|(k, _)| {
+                k.strip_prefix("mispredicted.")
+                    .is_some_and(|r| !accepted.contains(&r))
+            })
+            .map(|(_, v)| v)
+            .sum()
+    }
+
     pub fn withdrawn(&self) -> u64 {
         self.sum("withdrawn.")
     }
@@ -475,13 +487,32 @@ fn end_quietly(ctx: &Ctx, host: &str, session: &str, mut c: Client) -> Result<St
     stats_of(&c)
 }
 
-/// The counts' bar for a client that typed into faithful programs: none visible.
-fn bar(notes: &mut Vec<String>, what: &str, s: &Stats, want_written: bool) {
-    if s.mispredicted() > 0 {
+/// The reasons of fish's named residual on the faithful bar (`docs/m3/plan.md` §2.5, "The named
+/// residual on the faithful bar", decided, owner 2026-11-11; #72): a repaint of fish's that reaches
+/// the client in pieces, cut between its echo and its autosuggestion, shows the suggestion's first
+/// letter over a guess for about one round trip (`contradicted`) or makes a kept guess blink out
+/// and back (`hidden`). Only those two reasons, and only for fish: any other reason of fish's, and
+/// every misprediction of the other shells, stays on the bar. The decision does not accept fish's
+/// mispredictions with whole writes; this scenario cannot tell a whole write from a cut one (the
+/// network decides), so that half of the rule is the sans-IO soak's (`tests/sim.rs`), which
+/// judges fish's whole writes at zero.
+pub const FISH_RESIDUAL: &[&str] = &["contradicted", "hidden"];
+
+/// The counts' bar for a client that typed into faithful programs: none visible, but the reasons
+/// in `accepted` (a named residual the owner accepted, [`FISH_RESIDUAL`]), which are reported.
+fn bar(notes: &mut Vec<String>, what: &str, s: &Stats, want_written: bool, accepted: &[&str]) {
+    let barred = s.mispredicted_but(accepted);
+    if barred > 0 {
         notes.push(format!(
-            "MISS: {what}: {} visible mispredictions ({})",
-            s.mispredicted(),
+            "MISS: {what}: {barred} visible mispredictions ({})",
             s.brief()
+        ));
+    }
+    let residual = s.mispredicted() - barred;
+    if residual > 0 {
+        notes.push(format!(
+            "{what}: {residual} visible mispredictions of its named residual ({}; accepted, plan §2.5, owner 2026-11-11)",
+            accepted.join(", ")
         ));
     }
     if want_written && s.get("written") == 0 {
@@ -563,7 +594,8 @@ pub fn predict_shell(ctx: &Ctx, host: &str) -> Res {
         quiet(&c, "after the long line")?;
         sh.run(&mut c, "cd; rm -rf $D")?;
         let s = end(c)?;
-        bar(&mut notes, sh.name(), &s, true);
+        let accepted = if sh == Sh::Fish { FISH_RESIDUAL } else { &[] };
+        bar(&mut notes, sh.name(), &s, true, accepted);
         notes.push(format!(
             "{}: the edit, the history recall, the completion and the long line ran exactly (asserted); no underline at the quiet points (asserted); {}",
             sh.name(),
@@ -668,7 +700,7 @@ pub fn predict_secret(ctx: &Ctx, host: &str) -> Res {
     }
     c.run("cd; rm -rf \"$D\"", CMD_TIMEOUT)?;
     let s = end(c)?;
-    bar(&mut notes, "secrets", &s, true);
+    bar(&mut notes, "secrets", &s, true, &[]);
     if s.get("mispredicted.password") > 0 {
         notes.push(format!(
             "MISS: {} guesses were retracted under the password rule: they had been shown",
@@ -818,7 +850,7 @@ pub fn predict_paste(ctx: &Ctx, host: &str) -> Res {
     quiet(&c, "after the unmarked paste")?;
     c.run("cd; rm -rf \"$D\"", CMD_TIMEOUT)?;
     let s = end(c)?;
-    bar(&mut notes, "paste", &s, true);
+    bar(&mut notes, "paste", &s, true, &[]);
     notes.push(format!(
         "{}: a bracketed and an unmarked paste: nothing shown within {} of either (asserted), both lines exact (asserted); {}",
         sh.name(),
@@ -897,7 +929,7 @@ pub fn predict_reconnect(ctx: &Ctx, host: &str) -> Res {
     ));
     c.run("cd; rm -rf \"$D\"", CMD_TIMEOUT)?;
     let s = end(c)?;
-    bar(&mut notes, "reconnect", &s, true);
+    bar(&mut notes, "reconnect", &s, true, &[]);
     notes.push(s.brief());
     Ok(notes)
 }
@@ -956,7 +988,7 @@ pub fn predict_resize(ctx: &Ctx, host: &str) -> Res {
     let mut f = f;
     f.roundtrip("PRSE", CMD_TIMEOUT)?;
     finish(f)?;
-    bar(&mut notes, "resize", &s, true);
+    bar(&mut notes, "resize", &s, true, &[]);
     if s.get("withdrawn.resize") == 0 {
         notes.push(format!(
             "MISS: the narrowing met no written guess (withdrawn.resize 0), so it tested nothing ({})",
@@ -1051,7 +1083,7 @@ pub fn predict_takeover(ctx: &Ctx, host: &str) -> Res {
     let mut f = f;
     f.roundtrip("PTKE", CMD_TIMEOUT)?;
     finish(f)?;
-    bar(&mut notes, "the first client", &s1, true);
+    bar(&mut notes, "the first client", &s1, true, &[]);
     if s1.get("withdrawn.takeover") == 0 {
         notes.push(format!(
             "MISS: no guess was showing at the takeover (withdrawn.takeover 0, the link held {}: past 5 s the link is declared down first), so the withdrawal was not tested ({})",
@@ -1059,7 +1091,7 @@ pub fn predict_takeover(ctx: &Ctx, host: &str) -> Res {
             s1.brief()
         ));
     }
-    bar(&mut notes, "the second client", &s2, false);
+    bar(&mut notes, "the second client", &s2, false, &[]);
     notes.push(format!(
         "taken over with the first client's link held {} (3 keys guessed meanwhile), after {typed} keys of the line; {} of them reached the session and ran (asserted: a prefix); first client exit 1, no underline at its question (asserted); the second's screen a fresh attach's (asserted); first: {}; second: {}",
         ms(held),
@@ -1085,6 +1117,38 @@ mod tests {
         assert_eq!(s.withdrawn(), 4);
         assert_eq!(s.get("rejected"), 0);
         assert!(s.brief().contains("[ended=2]"), "{}", s.brief());
+    }
+
+    #[test]
+    fn fish_is_judged_by_its_named_residual_and_nothing_wider() {
+        let line = |m: &str| {
+            format!(
+                "PredictStats {{ written: 9, mispredicted: Mispredicted {{ {m} }}, withdrawn: Withdrawn {{ exit: 0 }} }}"
+            )
+        };
+        let stats = |m: &str| parse_stats(&line(m)).unwrap();
+        let miss = |s: &Stats, accepted: &[&str]| {
+            let mut notes = Vec::new();
+            bar(&mut notes, "fish", s, true, accepted);
+            notes.iter().any(|n| n.starts_with("MISS: "))
+        };
+        let residual = stats("contradicted: 1, echo_ack: 0, ended: 0, hidden: 1");
+        // Accepted for fish, reported; a miss for any other shell.
+        assert!(!miss(&residual, FISH_RESIDUAL));
+        assert!(miss(&residual, &[]));
+        // Any other reason stays on the bar for fish too.
+        for other in ["ended", "echo_ack", "expired", "password", "withdrawn"] {
+            let s = stats(&format!("contradicted: 1, {other}: 1"));
+            assert!(miss(&s, FISH_RESIDUAL), "{other}");
+        }
+        let mut notes = Vec::new();
+        bar(&mut notes, "fish", &residual, true, FISH_RESIDUAL);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("2 visible mispredictions of its named residual")),
+            "{notes:?}"
+        );
     }
 
     #[test]

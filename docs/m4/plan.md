@@ -71,7 +71,7 @@ M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the
 2. **The release candidate passes:**
    - `linux-check -f suite=all`;
    - `macos-check`, on both architectures, with the macOS-remote job;
-   - the drop-in suite on both Pis, with the candidate's aarch64 binary;
+   - the drop-in suite against an arm64 remote with the candidate's aarch64 binary: `linux-check`'s `arm64-remote` job (in `suite=all` above), which replaced the Pis as this gate (owner, 2026-11-11; `docs/m1/pi.md`); a run on the Pis is optional;
    - the realnet `install` part.
 3. **The Linux binaries and archives are reproducible:** the two CI builds of the candidate give identical SHA-256s, and the owner's independent rebuild (`tests/release/just.sh release-verify`, in the VM) reproduces the binaries.
 4. **The docs are complete,** and the tests that tie the config reference and the man page to the code pass.
@@ -734,9 +734,9 @@ Each PR runs `just ci` and the package's tests with its mutation table, and gets
 | `tests/release/just.sh release-verify` | the VM (amd64 emulation) | the independent rebuild |
 | `just fuzz` campaign | the VM or a runner | FUZZ's targets, one hour each, during SWEEP |
 | `log_blocking`, `tmp_clean` | `just ci` | LOG's blocked writer; TMP's mechanism |
-| Pi drop-in with the release bits | the Pis | the M1 and M2 suites on the RC's own aarch64 binary |
+| Arm64 remote drop-in with the release bits | `linux-check` `arm64-remote` (GitHub's arm64 runner; the Pis optional since 2026-11-11) | `pi_e2e` and the M1, M2 and M3 drop-in suites on the RC's own aarch64 binary, behind the Pis' gate verbs |
 
-The Pis' test gate is a real forced command that allows only `fil server --stdio` and fixed verbs. So the RC's drop-in run there is also evidence that `remote = "auto"` keeps such gates working. For the same reason, `fil install` is tested in realnet and on macOS, not on the Pis.
+The Pis' test gate is a real forced command that allows only `fil server --stdio` and fixed verbs, and the `arm64-remote` job reproduces it (`tests/arm64/gate.sh`). So the RC's drop-in run there is also evidence that `remote = "auto"` keeps such gates working. For the same reason, `fil install` is tested in realnet and on macOS, not on the Pis.
 
 ### 6.3 CI budget
 
@@ -746,7 +746,7 @@ The repository is public, so the hosted runners cost nothing. Runs are still bat
 |---|---|---|
 | A | after MAC and REL merge | `macos-check` (all), a REL dry run |
 | B | after U1 and TMP merge | `linux-check -f suite=realnet` (with `install`), `macos-check -f suite=remote` |
-| C | the release candidate | `linux-check -f suite=all`, `macos-check` (all), a REL dry run, `release-verify`, the Pis |
+| C | the release candidate | `linux-check -f suite=all`, `macos-check` (all), a REL dry run, `release-verify`, the arm64 remote (`arm64-remote`, in linux-check's `all`; the Pis optional) |
 | D | after RECREATE | a REL dry run, `linux-check -f suite=check` |
 | E | the tag | `release.yml` |
 

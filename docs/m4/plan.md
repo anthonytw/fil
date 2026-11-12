@@ -728,7 +728,7 @@ Each PR runs `just ci` and the package's tests with its mutation table, and gets
 |---|---|---|
 | realnet `install` | `linux-check -f suite=realnet` and the VM | U1's shell matrix, the directory and failure cases, the end-to-end bundle |
 | realnet `sysd` additions | the same | TMP's systemd-tmpfiles case |
-| `macos-check` `check` | GitHub, Apple silicon and Intel | the gate, PTYs, harnesses, the reduced forward soak, `dropin --local` |
+| `macos-check` `check` | GitHub, Apple silicon and Intel | the gate, PTYs, harnesses, the reduced forward soak, `dropin --local` (since the test-suite sweep, 2026-11-11: Apple silicon per PR with the OS tests and a drop-in smoke run, Intel in `suite=all`, the reduced soak deleted; `docs/dev/timing-tests.md` "Tiers") |
 | `macos-check` `remote` | GitHub, Apple silicon | macOS as the remote, with the upgrade in place and TMP's `clean-tmps` case |
 | `release.yml` dry run | GitHub | the archives, the layout, reproducibility of binaries and archives, `release-check` |
 | `tests/release/just.sh release-verify` | the VM (amd64 emulation) | the independent rebuild |

@@ -587,3 +587,73 @@ async fn masking_depends_on_the_daemon_reporting_the_pty_mode() {
     assert!(rig.term.text().contains("hunter2"));
     // With the report, the same keys are masked (status.rs).
 }
+
+// ---- from the PR #17 review probes (tests/review.rs, folded in by the test-suite sweep) -------
+
+/// A log path that is a symlink, even to a 0600 file of the user's, is refused at the start, and
+/// the file it points to is never written (src/offline.rs opens with `NOFOLLOW`).
+#[tokio::test(start_paused = true)]
+async fn a_log_file_that_is_a_symlink_is_refused_and_its_target_untouched() {
+    let dir = tmp("symlink");
+    let target = dir.join("victim");
+    std::fs::write(&target, b"precious\n").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = dir.join("offline.log");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let rig = start(cfg_with(|c| {
+        c.offline.log = Some(OfflineLog::File(link.clone()))
+    }));
+    let err = rig.finish().await.unwrap_err();
+    assert!(matches!(err, ClientError::OfflineLog(_)), "{err}");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"precious\n",
+        "the symlink target was appended to"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Enter and the detach escape in one read (fast typing, a slow event loop, a paste that is not
+/// bracketed): the line before the escape is still sent.
+#[tokio::test(start_paused = true)]
+async fn enter_in_the_same_read_as_the_detach_escape_is_sent() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.type_str("ls\r~.");
+    let daemon = rig.daemon.clone();
+    let _ = rig.finish().await.unwrap();
+    assert_eq!(daemon.input().await, b"ls\r");
+}
+
+/// A confirmation that output from the daemon draws (after the light gates could not, the
+/// screen in insert mode): a `y` answers it and the queued line is sent once.
+#[tokio::test(start_paused = true)]
+async fn y_answers_a_confirmation_drawn_by_output() {
+    let mut cfg = config();
+    cfg.offline.confirm_after = Some(Duration::from_secs(1));
+    let daemon = FakeDaemon::new(4096);
+    let rig = start_with(daemon, cfg, 80, 24, "xterm-256color");
+    rig.attached().await;
+    rig.daemon.output(b"$ ").await;
+    settle().await;
+    offline(&rig).await;
+    let mut out = lines(0..400);
+    out.extend_from_slice(b"\x1b[4h");
+    rig.daemon.output_unsent(&out).await;
+    rig.type_str("ls\r");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    back(&rig, 2).await;
+    rig.daemon.output(b"\x1b[4l").await;
+    settle().await;
+    assert!(rig.term.text().contains("Send it?"), "{}", rig.term.text());
+    rig.answer("y").await;
+    settle().await;
+    let input = rig.daemon.input().await;
+    assert_eq!(
+        String::from_utf8_lossy(&input),
+        "ls\r",
+        "screen:\n{}",
+        rig.term.text()
+    );
+}

@@ -259,10 +259,8 @@ fn differential(b: &Backend, seeds: u64, split: bool) -> (u64, u64) {
 #[test]
 fn every_row_written_inside_a_chunk_moves_its_stamp_on_both_backends() {
     // `just predict-soak` runs more.
-    let seeds: u64 = std::env::var("FIL_STAMP_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(12);
+    // 12, or 200 at FIL_TEST_SCALE=full (`just predict-soak`'s size).
+    let seeds = fil_testkit::scale::pick("FIL_STAMP_SEEDS", 12, 200);
     for b in backends() {
         for split in [false, true] {
             let (changes, misses) = differential(&b, seeds, split);

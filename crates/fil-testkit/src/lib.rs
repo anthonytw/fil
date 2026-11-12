@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub mod agent;
 pub mod client;
+pub mod scale;
 pub mod timing;
 
 pub use client::Client;

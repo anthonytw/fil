@@ -1,4 +1,6 @@
-# Linux check, dispatched by hand. `suite=check` on the PR head is part of the merge gate (CLAUDE.md § Delivery).
+# Linux check, dispatched by hand. `suite=check` on the PR head is part of the merge gate (CLAUDE.md § Delivery),
+# and the coordinator dispatches it on `main` after each owner push there, which is what saves the
+# rust-cache every other run restores (save-if below). The tiers: docs/dev/timing-tests.md "Tiers".
 # Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|aarch64|latency|terminals|all`),
 # then `gh run watch`.
 #
@@ -16,7 +18,7 @@ on:
         required: false
         default: main
       suite:
-        description: "check (just ci and the on-demand harnesses), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the test Pis, docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem, and M3's prediction cells, docs/m3/plan.md §5.5; two jobs, never part of the others), terminals (fil's terminal writes replayed into real xterm, kitty, WezTerm and tmux under Xvfb and read back, docs/m3/terminals.md) or all (check, realnet, aarch64 and terminals)"
+        description: "check (just ci: lint and every test but the soaks at smoke size; the per-PR harnesses; the release scripts' tests in a parallel job), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (static fil binary for the test Pis, docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem, and M3's prediction cells, docs/m3/plan.md §5.5; two jobs, never part of the others), terminals (fil's terminal writes replayed into real xterm, kitty, WezTerm and tmux under Xvfb and read back, docs/m3/terminals.md) or all (check, realnet, aarch64, terminals, and every test at full size with the soaks)"
         type: choice
         options: [check, realnet, aarch64, latency, terminals, all]
         default: check
@@ -32,7 +34,11 @@ jobs:
   check:
     if: inputs.suite != 'realnet' && inputs.suite != 'aarch64' && inputs.suite != 'latency' && inputs.suite != 'terminals'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # About 7 min with main's cache, 9 cold (the test-suite sweep's estimate, 2026-11-11: `just ci`
+    # with the emulators optimized in tests and nextest, the harnesses in the `ci` profile). It
+    # took 26.7 of a 30 min limit when it also ran release-test and the netsim soak; those are the
+    # `release-test` job and `test-release` now. Twice the cold time.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -43,24 +49,90 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          tool: just@1.59.0,cargo-deny@0.20.2,cargo-about@0.9.3
+          tool: just@1.59.0,cargo-deny@0.20.2,cargo-about@0.9.3,cargo-nextest@0.9.149
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Restore always, save only from main: a run on any other ref must not seed a cache
-          # that a later run of main restores.
-          save-if: ${{ inputs.ref == 'main' }}
-      - name: just ci
+          # Restore always; save only from a dispatch on main that checks main (the coordinator's,
+          # after each owner push): a run on any other ref must not seed a cache that a later run
+          # of main restores, and a cache saved under another branch's ref would not be restored
+          # by the PR runs.
+          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
+      # The steps after `just ci` run even when an earlier one failed, so one run shows every red
+      # step; the job is red if any of them is.
+      - name: just ci (lint; logic and OS tests at smoke size, no soaks, no wall-clock tests)
         run: just ci
+      # Feature unification, which the profile does not change: the fat-LTO build of the same
+      # check is `shipped-no-test-hooks` (suite=all, `just ci-release`).
+      - name: The fil binary built on its own has no test hooks (ci profile)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --profile ci -p fil-shell --bins
+          just no-test-hooks target/ci/fil
+          target/ci/fil --version
       - name: Emulator fidelity harness
+        if: ${{ !cancelled() }}
         run: just fidelity --no-perf
-      - name: Link simulator soak
-        run: just netsim-soak
       - name: Prediction guard sweep
+        if: ${{ !cancelled() }}
         run: just predict-mutants
-      - name: Prediction PTY harness (real programs on Linux PTYs)
+      - name: Prediction PTY harness, smoke (real programs on Linux PTYs)
+        if: ${{ !cancelled() }}
         run: just predict-harness --seeds 2 --keys 60
       - name: Client terminal tests (raw mode, signals and window size on a Linux PTY)
+        if: ${{ !cancelled() }}
         run: just client-pty
+
+  release-test:
+    # The release scripts' own tests (`tests/release/just.sh release-test`: the workflow lint and
+    # its mutations, tag signers, release-check on synthetic releases, ...), 1,045 checks of bash,
+    # beside `check` rather than in it. Platform-independent but for the macOS signing fakes, which
+    # macos-check runs when a change touches the release paths. release.yml's own release-test job
+    # runs them again for a release.
+    if: inputs.suite == 'check' || inputs.suite == 'all'
+    runs-on: ubuntu-24.04
+    # About 11 min (632 s of release-test on 2026-11-11, with the setup). Twice that, rounded.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: just@1.59.0
+      - name: The release scripts' own tests
+        run: tests/release/just.sh release-test
+
+  full-scale:
+    # suite=all: every test at full size (FIL_TEST_SCALE=full), the `soak_` tests included
+    # (`just test-release`: the fil-predict, status and MUX soaks, channel churn at 20,000, the
+    # netsim soak, then fil-forward at 256 MiB and 20,000 connections one test at a time), on
+    # Linux, where the logic tests live. `just ci-release` runs the same on the Mac.
+    if: inputs.suite == 'all'
+    runs-on: ubuntu-24.04
+    # Not measured on a runner yet (an estimate). On the dev Mac (14 cores) the full-size pass took
+    # 17 min, most of it one test (the prior-ack rule at 200 seeds), and the forward soak 83 s;
+    # a 4-vCPU runner builds and runs slower.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: just@1.59.0,cargo-nextest@0.9.149
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Restore always, save only from main (see the check job).
+          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
+      - name: Every test at full size, the soaks included
+        run: just test-release
 
   realnet:
     # Tier 1 of the environment tests (docs/m1/realnet.md), on the real `fil` binary: real OpenSSH
@@ -101,7 +173,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Restore always, save only from main (see the check job).
-          save-if: ${{ inputs.ref == 'main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
       - name: Lint the harness scripts
         run: shellcheck -x -S warning tests/realnet/*.sh tests/realnet/docker/entrypoint.sh
       - name: Real-network suite (${{ matrix.part }})
@@ -198,7 +270,7 @@ jobs:
           # The exporter is its own workspace (tests/terminals/exporter). Restore always, save
           # only from main (see the check job).
           workspaces: tests/terminals/exporter
-          save-if: ${{ inputs.ref == 'main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cargo-deny@0.20.2

@@ -373,13 +373,10 @@ fn replies() {
 }
 
 /// Never panics, never holds more than `MAX_HANDSHAKE`, on random bytes and on random edits of
-/// valid requests. `FIL_SOCKS_SEEDS` scales it.
+/// valid requests. 50,000 inputs, or 500,000 at `FIL_TEST_SCALE=full`; `FIL_SOCKS_SEEDS` sets its own.
 #[test]
 fn random_bytes_never_panic() {
-    let seeds: u64 = std::env::var("FIL_SOCKS_SEEDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20_000);
+    let seeds = fil_testkit::scale::pick("FIL_SOCKS_SEEDS", 50_000, 500_000);
     let valid = [
         [v5(&[]), name5(b"example.org", 80)].concat(),
         [v5(&[]), connect5(4, &[0; 16], 80)].concat(),

@@ -21,12 +21,10 @@ fn base() -> u64 {
         .unwrap_or(0)
 }
 
-/// Seeds per scenario, backend and predictor. `FIL_PREDICT_SEEDS=300` for a soak.
+/// Seeds per scenario, backend and predictor: 2, or 200 at `FIL_TEST_SCALE=full`;
+/// `FIL_PREDICT_SEEDS=300` for a soak of your own.
 fn seeds() -> u64 {
-    std::env::var("FIL_PREDICT_SEEDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2)
+    fil_testkit::scale::pick("FIL_PREDICT_SEEDS", 2, 200)
 }
 
 /// Visible mispredictions by kind: `ended`, `contradicted`, the rest.

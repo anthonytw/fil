@@ -1,0 +1,83 @@
+# cargo-nextest profiles (the test-suite sweep, 2026-11-11; docs/dev/timing-tests.md "Tiers").
+# The recipes pick them: `just test` (default), `just test-os` (os), `just test-release` (release).
+#
+# Logic vs OS. A test of pure logic (parsers, the prediction engine, the emulators, the mux model,
+# link::mem and fil-netsim runs) behaves the same on every 64-bit little-endian target, so it runs
+# on Linux only (linux-check). A test that touches the OS (PTYs, signals, sockets, processes,
+# files, login shells) also runs on macOS (macos-check, `-P os`). A new test binary is logic
+# unless it is in fil-daemon, fil-session or fil-testbins (OS as a whole) or named in `os` below:
+# a missing one costs macOS coverage, not time, so add an OS binary here when you add it.
+#
+# Names. `wallclock_*` tests run alone (`just test-wallclock`, never beside other tests) and
+# `soak_*` tests only in the release suite (`just test-release`, at FIL_TEST_SCALE=full).
+
+[profile.default]
+default-filter = "not test(/(^|::)wallclock_/) and not test(/(^|::)soak_/)"
+# Report every failure in one run; the run still fails on any.
+fail-fast = false
+# A test still running after 60 s is reported as slow (nothing is killed: the tests bound their
+# own waits, and fil-forward's run under FIL_FORWARD_TEST_LIMIT).
+slow-timeout = { period = "60s" }
+# Each test runs in a process of its own here, so the in-process locks some tests take (fil-forward's
+# `heavy()`, channel_churn's `serial()`, fwdprobe's port pick) no longer keep them apart. These
+# groups do instead; see the overrides.
+[test-groups]
+loopback-burst = { max-threads = 1 }
+churn = { max-threads = 1 }
+fwdprobe = { max-threads = 1 }
+
+# Bursts of hundreds of loopback connections (the `heavy()` tests): nothing else runs beside
+# them, as listen queues (128 on macOS) and ephemeral ports are the whole machine's.
+[[profile.default.overrides]]
+filter = "binary_id(fil-forward::forward) and (test(/^concurrent_connections::/) or test(=a_socks_flood_does_not_stall_the_other_forwards))"
+test-group = "loopback-burst"
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = "binary_id(fil-transport::channel_churn)"
+test-group = "churn"
+
+[[profile.default.overrides]]
+filter = "binary_id(fil-testbins::fwdprobe)"
+test-group = "fwdprobe"
+
+# The OS tests (macos-check runs `just test-os`): the sweep report's classification, corrected by
+# #81's review. The library unit tests of fil-client (the offline log: flock, a FIFO, 0600 files,
+# rotation), fil-transport (RLIMIT_NOFILE, IPV6_V6ONLY, child processes), fil-forward (dual-stack
+# loopback binds, real TCP, ssh-keygen) and fil-shell (install: files, modes, symlinks, Unix
+# sockets), fil-client's `offline` (file modes, O_NOFOLLOW), fil-transport's `pipe` (process
+# groups), and the drop-in and Pi harnesses' own tests (real TCP and UDP delays, socket files)
+# touch the OS too.
+[profile.os]
+default-filter = """
+(
+    package(fil-daemon) or package(fil-session) or package(fil-testbins)
+    or binary_id(fil-client) or binary_id(fil-client::offline)
+    or binary_id(fil-transport) or binary_id(fil-transport::pipe)
+    or binary_id(fil-forward) or binary_id(fil-shell)
+    or binary_id(fil-shell::example/dropin) or binary_id(fil-shell::example/pi_e2e)
+    or binary_id(fil-transport::quic_udp) or binary_id(fil-transport::channel_churn)
+    or binary_id(fil-forward::forward) or binary_id(fil-forward::limits)
+    or binary_id(fil-forward::nobufs) or binary_id(fil-forward::pace)
+    or binary_id(fil-forward::wakeups) or binary_id(fil-forward::agent)
+    or binary_id(fil-forward::agent_constraints)
+    or binary_id(fil-client::tty_pty) or binary_id(fil-client::agent)
+    or binary_id(fil-client::forward) or binary_id(fil-client::forward_hostile)
+    or binary_id(fil-client::predict_e2e) or binary_id(fil-client::predict_stack)
+    or binary_id(fil-client::predict_suites)
+    or binary_id(fil-shell::binary) or binary_id(fil-shell::install)
+    or binary_id(fil-shell::install_finish) or binary_id(fil-shell::install_gc)
+    or binary_id(fil-shell::install_shells) or binary_id(fil-shell::remote_commands)
+    or binary_id(fil-shell::resize_e2e) or binary_id(fil-shell::revision)
+    or binary_id(fil-shell::session_cmds) or binary_id(fil-shell::trampoline)
+    or binary_id(fil-shell::tty_group) or binary_id(fil-shell::predict_flag)
+)
+and not test(/(^|::)wallclock_/) and not test(/(^|::)soak_/)
+"""
+
+# The release suite (`just test-release`, at FIL_TEST_SCALE=full): every test, `soak_*` included.
+# The recipe leaves out `wallclock_*` (they run alone, `just test-wallclock`) and runs fil-forward
+# one test at a time (its full sizes use up ephemeral ports and listen queues).
+[profile.release]
+default-filter = "all()"
+slow-timeout = { period = "300s" }

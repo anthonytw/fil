@@ -495,6 +495,7 @@ dependencies = [
  "fil-netsim",
  "fil-predict",
  "fil-term",
+ "fil-testkit",
  "nix",
  "portable-pty",
  "rustix",
@@ -509,6 +510,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "fil-netsim",
+ "fil-testkit",
  "fil-transport",
  "postcard",
  "rand",
@@ -623,6 +625,7 @@ dependencies = [
  "bytes",
  "fil-netsim",
  "fil-proto",
+ "fil-testkit",
  "fil-transport",
  "quinn",
  "quinn-proto",

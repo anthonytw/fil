@@ -19,8 +19,14 @@
 //! ```text
 //! dropin [--hosts pi1,pi2 | --local] [--only NAME[,NAME]] [--fil PATH] [--fwdprobe PATH]
 //!        [--verbose] [--list] [--require vim,less,...] [--allow-missing] [--allow-skip] [--strict]
-//!        [--predict off|adaptive|always]
+//!        [--predict off|adaptive|always] [--scale smoke|full]
 //! ```
+//!
+//! `--scale` (default: `FIL_TEST_SCALE`, else `smoke`; fil_testkit::scale): `smoke`, the per-PR
+//! run (macos-check), leaves out the scenarios in [`FULL_ONLY`] (stress, long idles, the
+//! prediction scenarios but `predict_secret`) and runs the sleeping-client scenarios with the 12 s
+//! auto variant only; `full`, before a release, runs everything, including the 45 s pipe sleeps
+//! past the liveness timeout. A scenario named in `--only` runs at either scale.
 //!
 //! `--predict MODE` gives every client `--predict MODE` (M3's V1: the M1 and M2 scenarios again
 //! with `always`, `docs/m3/dropin.md`); a client whose scenario sets its own mode keeps it. The
@@ -86,6 +92,8 @@ pub struct Ctx {
     pub require: Vec<String>,
     /// `--predict MODE` for every client that does not set its own (`--predict` on the driver).
     pub predict: Option<String>,
+    /// `--scale full`: the long variants too (the 45 s sleeps; see [`FULL_ONLY`]).
+    pub full: bool,
 }
 
 /// A private daemon for `--local`: `fil-daemon-dev --dir DIR relay` is the pipe command, so the
@@ -445,6 +453,22 @@ impl Local {
 
 type Scenario = fn(&Ctx, &str) -> common::Res;
 
+/// What a smoke run (`--scale smoke`, every PR) leaves out, by its cost (the test-suite sweep,
+/// 2026-11-11, arm64 seconds): the stress scenarios (`fwd_churn` 75, `fwd_bulk_typing` 36), the
+/// 90 s idle, and the prediction scenarios but `predict_secret`, the one that guards a secret
+/// rule (`predict_shell` 66, the rest 14 to 25 each). The full run, before a release, has them.
+const FULL_ONLY: &[&str] = &[
+    "idle",
+    "fwd_bulk_typing",
+    "fwd_churn",
+    "predict_shell",
+    "predict_alt",
+    "predict_paste",
+    "predict_reconnect",
+    "predict_resize",
+    "predict_takeover",
+];
+
 fn scenarios() -> Vec<(&'static str, Scenario)> {
     vec![
         ("tools", tools::tools),
@@ -520,7 +544,7 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... dropin [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--fwdprobe PATH] [--verbose] [--list]\n       dropin --local [--only NAME,..] [--fil PATH] [--verbose]   (a private daemon on this machine)\n       [--require vim,less,..] [--allow-missing] [--allow-skip] [--strict]\n       [--dump DIR]   (a client whose output sequence fails the check: its transcript goes to DIR)\n       [--predict off|adaptive|always]   (every client that sets no mode of its own)"
+        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... dropin [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--fwdprobe PATH] [--verbose] [--list]\n       dropin --local [--only NAME,..] [--fil PATH] [--verbose]   (a private daemon on this machine)\n       [--require vim,less,..] [--allow-missing] [--allow-skip] [--strict]\n       [--dump DIR]   (a client whose output sequence fails the check: its transcript goes to DIR)\n       [--predict off|adaptive|always]   (every client that sets no mode of its own)\n       [--scale smoke|full]   (default FIL_TEST_SCALE, else smoke: smoke leaves out the long scenarios)"
     );
     std::process::exit(2);
 }
@@ -551,6 +575,7 @@ fn main() {
     let mut allow_missing = false;
     let mut allow_skip = false;
     let mut predict: Option<String> = None;
+    let mut full = fil_testkit::scale::full();
     let mut require: Vec<String> = REQUIRED_TOOLS.iter().map(|s| s.to_string()).collect();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -572,6 +597,11 @@ fn main() {
                 }
                 predict = Some(m);
             }
+            "--scale" => match args.next().as_deref() {
+                Some("smoke") => full = false,
+                Some("full") => full = true,
+                _ => usage(),
+            },
             "--dump" => {
                 let dir = PathBuf::from(args.next().unwrap_or_else(|| usage()));
                 let _ = common::DUMP_DIR.set(dir);
@@ -584,6 +614,14 @@ fn main() {
             }
             _ => usage(),
         }
+    }
+    // Every name in FULL_ONLY must be a scenario, or a rename would quietly put it back in smoke.
+    if let Some(bad) = FULL_ONLY
+        .iter()
+        .find(|x| !scenarios().iter().any(|(n, _)| n == *x))
+    {
+        eprintln!("FULL_ONLY names \"{bad}\", which is not a scenario");
+        std::process::exit(2);
     }
     // A typo in --only must not give a green run that tested nothing.
     if let Some(o) = &only
@@ -644,7 +682,16 @@ fn main() {
         local: local_daemon,
         require,
         predict,
+        full,
     };
+    println!(
+        "scale: {}",
+        if full {
+            "full"
+        } else {
+            "smoke (FULL_ONLY scenarios left out, the 12 s sleep variants only)"
+        }
+    );
 
     let mut failures = 0;
     let mut table = Vec::new();
@@ -668,6 +715,9 @@ fn main() {
             if let Some(o) = &only
                 && !o.iter().any(|x| x == name)
             {
+                continue;
+            }
+            if only.is_none() && !full && FULL_ONLY.contains(&name) {
                 continue;
             }
             if let Err(e) = ctx.reset(host) {

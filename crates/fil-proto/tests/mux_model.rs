@@ -923,11 +923,9 @@ fn untag(b: Bytes) -> (ChannelId, Bytes) {
     (ChannelId(ch), b.slice(4..))
 }
 
+/// 24 seeds, or 5,000 at `FIL_TEST_SCALE=full` (`just mux-soak`'s size); `MUX_SEEDS` sets its own.
 fn seeds() -> u64 {
-    std::env::var("MUX_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24)
+    fil_testkit::scale::pick("MUX_SEEDS", 24, 5000)
 }
 
 /// One seed of the model, from start to the final drain.

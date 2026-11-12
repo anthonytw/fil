@@ -742,7 +742,9 @@ pub fn fwd_swap(ctx: &Ctx, host: &str) -> Res {
 
 pub fn fwd_sleep(ctx: &Ctx, host: &str) -> Res {
     let mut notes = Vec::new();
-    for (v, s) in [(Variant::Auto, 12), (Variant::Pipe, 45)] {
+    // The 45 s pipe variant only in a full run (`--scale full`), as in `client_sleep`.
+    let variants = [(Variant::Auto, 12), (Variant::Pipe, 45)];
+    for (v, s) in variants.into_iter().take(if ctx.full { 2 } else { 1 }) {
         let r = pair_through(
             ctx,
             host,

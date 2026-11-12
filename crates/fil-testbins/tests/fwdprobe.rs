@@ -70,8 +70,11 @@ fn run_raw(args: &[&str]) -> (String, i32) {
 /// Held while a test picks a port it needs to stay unused. Every server in this file binds an
 /// OS-assigned port, and only `Server::start` binds in this process, so a test that holds this
 /// lock from the moment it frees a port until its use of it is over cannot have it taken by
-/// another test (the OS hands out a free port, not a held one). Starting a server holds it
-/// until the server has said where it listens, so the bind is over by then.
+/// another test of this file (the OS hands out a free port, not a held one). Starting a server
+/// holds it until the server has said where it listens, so the bind is over by then. Under
+/// cargo-nextest each test is a process of its own, so the `fwdprobe` test group
+/// (.config/nextest.toml) keeps this file's tests apart instead; other binaries' tests still run
+/// beside them and bind ephemeral ports, so a freed port can, rarely, be taken by one of those.
 static PORT_PICK: Mutex<()> = Mutex::new(());
 
 fn port_pick() -> MutexGuard<'static, ()> {

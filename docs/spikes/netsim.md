@@ -83,7 +83,7 @@ All in `just ci` unless noted. `cargo test -p fil-netsim` runs in about 0.4 s af
 | `quic_survives_blackout_shorter_than_idle_timeout` | 4.5 s blackout, 5 s idle timeout: survives |
 | `quic_ends_on_blackout_longer_than_idle_timeout` | blackout with a 5 s idle timeout: `TimedOut` after 5 s, then a fresh handshake works |
 | `stream_echo_intact`, `stream_reset_mid_transfer_is_an_error` | the same echo over the stream link; a reset surfaces as `ConnectionReset` on read and write |
-| `soak_harsh_conditions_many_seeds` (`just netsim-soak`, ignored) | 25 seeds with 8% loss, 30 ms jitter, 10% reordering, 3% duplication, 6 rebinds and 3 blackouts per run; all intact, one handshake each (about 2 s real); the reorder knob is on in the soak |
+| `soak_harsh_conditions_many_seeds` (`just netsim-soak`; a `soak_` test, release suite only) | 25 seeds with 8% loss, 30 ms jitter, 10% reordering, 3% duplication, 6 rebinds and 3 blackouts per run; all intact, one handshake each (about 2 s real); the reorder knob is on in the soak |
 
 The client in the QUIC tests pins the server's exact self-signed certificate (made with `rcgen`)
 as its only trust anchor. No TOFU.

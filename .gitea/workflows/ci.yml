@@ -100,7 +100,11 @@ jobs:
             995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d cargo-deny-0.20.2-aarch64-unknown-linux-musl/cargo-deny
           get_tool $gh/EmbarkStudios/cargo-about/releases/download/0.9.3/cargo-about-0.9.3-aarch64-unknown-linux-musl.tar.gz \
             eb4d9ff6ebd2518152a8308729431a04b3836e71d2bd5ead7aea69f91a71162e cargo-about-0.9.3-aarch64-unknown-linux-musl/cargo-about
-          just --version; cargo deny --version; cargo about --version; python3 --version; nproc
+          # `just test` (in `just ci`) runs the tests with cargo-nextest (.config/nextest.toml).
+          # The hash is the one install-action's manifest pins for linux-check.
+          get_tool $gh/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-aarch64-unknown-linux-musl.tar.gz \
+            533c9b431c2bb1dcb216e02e474263db0cdcd556373b72cc34830fb417058a6b cargo-nextest
+          just --version; cargo deny --version; cargo about --version; cargo nextest --version; python3 --version; nproc
           echo "build directory: $CARGO_TARGET_DIR (${{ github.event_name }})"
       - name: "Skipped: tree identical to a green PR head; cargo deny only (see the push_skip step)"
         # The PR run may be old: the advisory database is fetched now, so a RustSec advisory

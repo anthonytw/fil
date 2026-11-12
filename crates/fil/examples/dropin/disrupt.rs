@@ -63,7 +63,10 @@ pub fn killed_ssh_midcommand(ctx: &Ctx, host: &str) -> Res {
 /// down, and the output must be complete and in order.
 pub fn client_sleep(ctx: &Ctx, host: &str) -> Res {
     let mut notes = Vec::new();
-    for (variant, stop_s, ticks) in [(Variant::Auto, 12u64, 100u32), (Variant::Pipe, 45, 280)] {
+    // The 45 s pipe variant sleeps past the liveness timeout; only a full run (`--scale full`)
+    // has it.
+    let variants = [(Variant::Auto, 12u64, 100u32), (Variant::Pipe, 45, 280)];
+    for (variant, stop_s, ticks) in variants.into_iter().take(if ctx.full { 2 } else { 1 }) {
         let name = format!("slp{}", variant.tag());
         let mut c = ctx.shell(host, variant, &name)?;
         thread::sleep(Duration::from_secs(2));

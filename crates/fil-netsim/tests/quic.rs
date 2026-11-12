@@ -375,12 +375,12 @@ async fn stream_reset_mid_transfer_is_an_error() {
     server_task.await.unwrap(); // the far end's echo loop also ends, with the same error
 }
 
-/// Many seeds, harsh conditions, everything at once. On demand: `just netsim-soak`.
+/// Many seeds, harsh conditions, everything at once. A `soak_` test: only the release suite runs
+/// it (`just test-release`, `.config/nextest.toml`), or `just netsim-soak`.
 ///
 /// The idle timeout is 30 s, not the 10 s this test first used: with rebinds a second or so
 /// apart the server can lose the client for longer than 10 s (see docs/spikes/netsim.md).
 #[tokio::test(start_paused = true)]
-#[ignore = "slow soak; run with `just netsim-soak`"]
 async fn soak_harsh_conditions_many_seeds() {
     for seed in 0..25u64 {
         let env = setup(

@@ -3,9 +3,17 @@
 # then `gh run watch`. Never runs on pull_request: the ref's build scripts and tests run on the
 # runner, and a fork's must not. No secrets are used.
 #
-# Two jobs (docs/m4/plan.md, MAC):
-#   check   the suites on macOS, on Apple silicon and on Intel: `just ci`, the PTY tests, the
-#           harnesses, a reduced forward soak, the drop-in suite against a private local daemon.
+# The coordinator also dispatches suite=check on `main` after each owner push there, which is what
+# saves the rust-cache every other run restores (save-if below).
+#
+# Jobs (docs/m4/plan.md, MAC; the tiers: docs/dev/timing-tests.md "Tiers"):
+#   check   the suites on macOS. suite=check (per PR) runs on Apple silicon only: clippy, the OS
+#           tests (`just test-os`; pure logic runs on Linux), a cross `cargo check` of the Intel
+#           build, the PTY tests, the prediction harness, the drop-in suite's smoke run against a
+#           private local daemon. suite=all runs on Apple silicon AND Intel: every test, the full
+#           drop-in suite and the shipped (fat-LTO) build's no-test-hooks check.
+#   release-test  the release scripts' own tests (the macOS signing fakes are macOS-only): per PR
+#           on Apple silicon when the change touches the release paths; suite=all on both.
 #   remote  macOS as the REMOTE host (DESIGN.md §16.9): the real `fil` served over a real ssh login
 #           to the runner itself (tests/macos/remote.sh, `just macos-remote`), once with a
 #           user-mode sshd and once with the system sshd. It includes the in-place-upgrade
@@ -41,7 +49,7 @@ on:
         required: false
         default: main
       suite:
-        description: "check (just ci and the on-demand harnesses, Apple silicon and Intel), remote (macOS as the remote host, over a real ssh login to the runner), brew (the Homebrew formula; needs release_run) or all"
+        description: "check (the per-PR macOS gate, Apple silicon only: OS tests, harnesses, drop-in smoke; all adds Intel and the full suites), remote (macOS as the remote host, over a real ssh login to the runner), brew (the Homebrew formula; needs release_run) or all"
         type: choice
         options: [all, check, remote, brew]
         default: all
@@ -62,19 +70,23 @@ jobs:
     if: inputs.suite == 'check' || inputs.suite == 'all'
     name: check (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
-    # Intel runners take 62-72 min for this job (cargo-about alone is built
-    # from source there, about 5 min), so 75 cut 2 of 5 runs mid-suite on
-    # 2026-11-10 with every test passing. arm64 takes about 45 min.
-    # Since the drop-in suite gained M3's prediction scenarios (#71), Intel
-    # takes 85-88 min and arm64 58-63; 105 cut two Intel runs in the local
-    # drop-in suite on 2026-11-11 with every test passing.
-    timeout-minutes: ${{ matrix.timeout }}
+    # suite=check (Apple silicon only): 19.5 min on the first GitHub run (#81's head, 37.5 min with
+    # the release scripts' tests, which are the `release-test` job now), plus about 8 with a cold
+    # cache. It took 58-63 min, and Intel 85-88 of 105, when both ran all of `just ci`, the
+    # reduced forward soak and the whole drop-in suite per PR. suite=all (every test, the full
+    # drop-in suite, the fat-LTO build) is not measured yet: the old limits less release-test.
+    timeout-minutes: ${{ inputs.suite == 'all' && matrix.timeout_all || matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { label: arm64, os: macos-15, timeout: 90 }
-          - { label: x86_64, os: macos-15-intel, timeout: 135 }
+        # Intel only in suite=all: no code here depends on the architecture (both are 64-bit little
+        # endian), and the arm64 job cross-checks that the Intel build compiles.
+        include: ${{ fromJSON(inputs.suite == 'all' && '[{"label":"arm64","os":"macos-15","timeout":40,"timeout_all":75},{"label":"x86_64","os":"macos-15-intel","timeout":40,"timeout_all":120}]' || '[{"label":"arm64","os":"macos-15","timeout":40,"timeout_all":75}]') }}
+    env:
+      # smoke per PR, full in suite=all: the drop-in suite's `--scale` (dropin.rs's FULL_ONLY).
+      DROPIN_SCALE: ${{ inputs.suite == 'all' && 'full' || 'smoke' }}
+      SUITE: ${{ inputs.suite }}
+      LABEL: ${{ matrix.label }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -85,20 +97,11 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          tool: just@1.59.0,cargo-deny@0.20.2
-      # cargo-about, for `just notices` in `just ci`: a pinned prebuilt binary where one exists, and
-      # built from crates.io (same version, locked) on Intel, which cargo-about ships no binary for.
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
-        if: matrix.label == 'arm64'
-        with:
-          tool: cargo-about@0.9.3
-      - name: cargo-about (built; no prebuilt binary for Intel macOS)
-        if: matrix.label == 'x86_64'
-        run: cargo install --locked cargo-about --version 0.9.3 --features cli
+          tool: just@1.59.0,cargo-nextest@0.9.149
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Restore always, save only from main (see linux-check).
-          save-if: ${{ inputs.ref == 'main' }}
+          # Restore always, save only from a dispatch on main that checks main (see linux-check).
+          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
       - name: Machine
         run: |
           sw_vers
@@ -107,28 +110,32 @@ jobs:
           xcodebuild -version || true
           ulimit -Sn; ulimit -Hn
           sysctl kern.ipc.somaxconn
-      # The steps after `just ci` run even when an earlier one failed, so one run shows every red
-      # step (each is a finding of its own); the job is red if any of them is.
-      - name: just ci
-        run: just ci
-      - name: The release binary has no test hooks
-        if: ${{ !cancelled() }}
+      # The steps run even when an earlier one failed, so one run shows every red step (each is a
+      # finding of its own); the job is red if any of them is. Platform-independent checks (deny,
+      # notices, fmt, the exporter lock, the workflow tests, release-deps, fidelity) run on Linux.
+      - name: Clippy (macOS code paths)
+        if: ${{ !cancelled() && matrix.label == 'arm64' }}
+        run: just clippy
+      - name: OS tests, smoke size (PTYs, signals, sockets, processes, login shells)
+        if: ${{ !cancelled() && inputs.suite == 'check' }}
+        run: just test-os
+      - name: Every test, smoke size
+        if: ${{ !cancelled() && inputs.suite == 'all' }}
+        run: just test
+      - name: The Intel build compiles (cross check)
+        if: ${{ !cancelled() && matrix.label == 'arm64' }}
         run: |
-          cargo build --release -p fil-shell --bins
-          just no-test-hooks target/release/fil
-          target/release/fil --version
+          rustup target add x86_64-apple-darwin
+          cargo check --target x86_64-apple-darwin -p fil-shell
+      - name: The release binary as shipped (fat LTO) has no test hooks
+        if: ${{ !cancelled() && inputs.suite == 'all' }}
+        run: just shipped-no-test-hooks
       - name: Client terminal tests (raw mode, signals and window size on a macOS PTY)
         if: ${{ !cancelled() }}
         run: just client-pty
-      - name: Emulator fidelity harness
-        if: ${{ !cancelled() }}
-        run: just fidelity --no-perf
-      - name: Prediction PTY harness (real programs on macOS PTYs)
+      - name: Prediction PTY harness, smoke (real programs on macOS PTYs)
         if: ${{ !cancelled() }}
         run: just predict-harness --seeds 2 --keys 60
-      - name: Forward soak, reduced (macOS's somaxconn is 128)
-        if: ${{ !cancelled() }}
-        run: just forward-soak 32 2000
       - name: Drop-in tools (htop; the rest ship with macOS)
         if: ${{ !cancelled() }}
         env:
@@ -142,11 +149,13 @@ jobs:
       - name: Login shell zsh, as on a Mac a person uses
         if: ${{ !cancelled() }}
         run: sudo dscl . -create "/Users/$USER" UserShell /bin/zsh && dscl . -read "/Users/$USER" UserShell
+      # smoke per PR (about 265 s: no stress, no 90 s idle, the 12 s sleep variants, predict_secret
+      # the one prediction scenario); full in suite=all (the 45 s sleeps too, about 15 min).
       - name: Drop-in suite, local (the daemon on macOS, real PTYs, no ssh)
         if: ${{ !cancelled() }}
         env:
           SHELL: /bin/zsh
-        run: just dropin --local
+        run: just dropin --local --scale "$DROPIN_SCALE"
       - name: Logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -156,6 +165,66 @@ jobs:
             ~/.local/state/fil
           if-no-files-found: ignore
           retention-days: 14
+
+  release-test:
+    # The release scripts' own tests on macOS (`tests/release/just.sh release-test`), for the part
+    # only macOS can run: the macOS signing fakes. A job of its own, beside `check`, so that it
+    # neither lengthens nor eats into `check`'s limit. suite=check: Apple silicon, and only when
+    # the change touches the release paths (otherwise the job ends after the paths step).
+    # suite=all: Apple silicon and Intel, always. linux-check's `release-test` job runs the
+    # platform-independent rest on every PR.
+    if: inputs.suite == 'check' || inputs.suite == 'all'
+    name: release-test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    # 18 min on Apple silicon and 28.5 on Intel (the test-suite sweep's data, 2026-11-11).
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.suite == 'all' && '[{"label":"arm64","os":"macos-15","timeout":35},{"label":"x86_64","os":"macos-15-intel","timeout":50}]' || '[{"label":"arm64","os":"macos-15","timeout":35}]') }}
+    env:
+      SUITE: ${{ inputs.suite }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          # The whole history, for the merge base the paths step diffs against (and selftest's
+          # own git cases).
+          fetch-depth: 0
+          persist-credentials: false
+      # The release paths: what CODEOWNERS owns as deciding a release, the justfile (selftest copies
+      # it), and the other files selftest.sh reads (crates/fil/Cargo.toml, the wire limits and
+      # golden, the fixed remote commands, README.md, LICENSE, THIRD-PARTY-NOTICES.md). A change
+      # elsewhere cannot change the macOS-only part of the result. `--no-renames`, so a file moved
+      # out of a release path is listed under its old name too.
+      - name: Does the change touch the release paths?
+        id: relpaths
+        run: |
+          run=true
+          if [ "$SUITE" = check ]; then
+            base=$(git merge-base HEAD origin/main 2>/dev/null || true)
+            if [ -n "$base" ]; then
+              changed=$(git diff --no-renames --name-only "$base" HEAD)
+              printf '%s\n' "$changed"
+              if ! printf '%s\n' "$changed" | grep -Eq '^(tests/release/|packaging/|docs/man/|\.github/|\.cargo/|Cargo\.toml$|Cross\.toml$|rust-toolchain|deny\.toml$|about\.(toml|hbs)$|flake\.(nix|lock)$|\.gitattributes$|justfile$|crates/fil/Cargo\.toml$|crates/fil-proto/src/limits\.rs$|crates/fil-proto/tests/golden/|crates/fil-transport/src/pipe/remote-commands\.txt$|README\.md$|LICENSE$|THIRD-PARTY-NOTICES\.md$)'; then
+                run=false
+              fi
+            else
+              echo "no merge base with origin/main: running the release scripts' tests"
+            fi
+          fi
+          echo "release-test: $run"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      - name: Toolchain (from rust-toolchain.toml)
+        if: steps.relpaths.outputs.run == 'true'
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        if: steps.relpaths.outputs.run == 'true'
+        with:
+          tool: just@1.59.0
+      - name: The release scripts' own tests (macOS signing fakes included)
+        if: steps.relpaths.outputs.run == 'true'
+        run: tests/release/just.sh release-test
 
   remote:
     if: inputs.suite == 'remote' || inputs.suite == 'all'
@@ -181,7 +250,8 @@ jobs:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ inputs.ref == 'main' }}
+          # Restore always, save only from a dispatch on main that checks main (see linux-check).
+          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
       - name: Machine
         run: |
           sw_vers

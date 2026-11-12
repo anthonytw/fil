@@ -2,11 +2,12 @@
 //! `PipeLink` on fil-netsim streams, `QuicLink` on fil-netsim datagrams), with real loopback TCP
 //! applications and servers (DESIGN.md sections 7 and 8.5).
 //!
-//! The heavy sizes run scaled down here and at full size with `just forward-soak`:
-//! `FIL_FORWARD_BULK_MIB` (default 8, soak 256), `FIL_FORWARD_SEQ` (default 2,000, soak 20,000),
-//! `FIL_FORWARD_CONCURRENT` (default 1,000 on QUIC and 300 on the others, soak 1,000).
-//! A test fails if it runs longer than `FIL_FORWARD_TEST_LIMIT` seconds (default 120; the soak sets
-//! 3600).
+//! The heavy sizes run small by default (`FIL_TEST_SCALE=smoke`, every PR) and at full size with
+//! `FIL_TEST_SCALE=full` (`just test-release`, `just forward-soak`; fil_testkit::scale), each
+//! smoke / full: `FIL_FORWARD_BULK_MIB` 2 / 256, `FIL_FORWARD_SEQ` 1,500 / 20,000 (past QUIC's
+//! 1,024 streams either way), `FIL_FORWARD_CONCURRENT` 300 / 1,000, `FIL_FORWARD_EPOCH_RUNS`
+//! 10 / 150. A variable that is set overrides the scale. A test fails if it runs longer than
+//! `FIL_FORWARD_TEST_LIMIT` seconds (120 / 3,600).
 
 mod support;
 
@@ -82,7 +83,7 @@ async fn echo_through(port: u16, seed: u64, n: u64, progress: Option<Arc<AtomicU
 
 /// A bulk transfer through `-L`, both directions at once (an echo), SHA-256 compared.
 async fn bulk_sha256(t: Transport) {
-    let n = env_or("FIL_FORWARD_BULK_MIB", 8) << 20;
+    let n = scaled("FIL_FORWARD_BULK_MIB", 2, 256) << 20;
     let server = echo_server().await;
     let w = World::new(t, mux_config()).await;
     let port = w.local_forward(1, server.port);
@@ -183,14 +184,11 @@ async fn reset_propagates(t: Transport) {
 /// Many applications at once. Up to `MAX_OPEN_CHANNELS` are channels at a time; the rest are
 /// accepted and wait for a channel (within `open_wait`), oldest first.
 async fn concurrent_connections(t: Transport) {
-    // 1,000 on QUIC (the M2 "done when" transport), 300 on the others in `just ci`: each
-    // connection leaves two sockets in TIME_WAIT on ephemeral ports for 30 s, and macOS has
-    // about 16,000 of them, so the suite run twice in a row must not use a third of them each time.
-    // `just forward-soak` runs 1,000 on all three.
-    let n = env_or(
-        "FIL_FORWARD_CONCURRENT",
-        if t == Transport::Quic { 1000 } else { 300 },
-    );
+    // 300 at smoke scale (already past macOS's listen queue of 128, the overflow this catches),
+    // 1,000 (the M2 "done when") at FIL_TEST_SCALE=full: each connection leaves two sockets in
+    // TIME_WAIT on ephemeral ports for 30 s, and macOS has about 16,000 of them, so the suite run
+    // twice in a row must not use a third of them each time.
+    let n = scaled("FIL_FORWARD_CONCURRENT", 300, 1000);
     // One transport at a time: three bursts of a thousand loopback connections at once overflow
     // the servers' listen queues (128 on macOS) beyond what a retried connect absorbs.
     let _one_at_a_time = heavy().await;
@@ -336,7 +334,7 @@ fn is_reset(e: &std::io::Error) -> bool {
 /// Many short connections, one after another, on one link that never goes down. Over QUIC every
 /// channel is a stream each way: without `Link::finish` the link runs out of streams at 1,024.
 async fn sequential_connections(t: Transport) {
-    let n = env_or("FIL_FORWARD_SEQ", 2000);
+    let n = scaled("FIL_FORWARD_SEQ", 1500, 20_000);
     let server = oneshot_echo_server(64).await;
     let w = World::new(t, mux_config()).await;
     let port = w.local_forward(1, server.port);
@@ -373,7 +371,7 @@ async fn sequential_connections(t: Transport) {
 /// The link dies three times during a transfer; each time a new link resumes it. The bytes are
 /// exact and the server saw one connection.
 async fn drops_mid_transfer(t: Transport) {
-    let n = env_or("FIL_FORWARD_BULK_MIB", 8) << 20;
+    let n = scaled("FIL_FORWARD_BULK_MIB", 2, 256) << 20;
     let server = echo_server().await;
     let mut w = World::new(t, mux_config()).await;
     let port = w.local_forward(1, server.port);
@@ -888,7 +886,7 @@ async fn swaps_mid_transfer() {
 }
 
 async fn swaps_mid_transfer_body() {
-    let n = env_or("FIL_FORWARD_BULK_MIB", 8) << 20;
+    let n = scaled("FIL_FORWARD_BULK_MIB", 2, 256) << 20;
     let server = echo_server().await;
     let mut w = World::new(Transport::Pipe, mux_config()).await;
     let port = w.local_forward(1, server.port);
@@ -1027,7 +1025,7 @@ async fn a_new_epoch_never_crosses_bytes_into_a_reused_id() {
 }
 
 async fn a_new_epoch_never_crosses_bytes_into_a_reused_id_body() {
-    let runs = env_or("FIL_FORWARD_EPOCH_RUNS", 30);
+    let runs = scaled("FIL_FORWARD_EPOCH_RUNS", 10, 150);
     for run in 0..runs {
         let server = echo_server().await;
         let mut w = World::new(Transport::Mem, mux_config()).await;

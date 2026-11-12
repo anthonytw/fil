@@ -332,10 +332,8 @@ const REGRESSION_SEEDS: &[u64] = &[39, 79];
 
 #[test]
 fn random_sessions_never_corrupt_the_screen() {
-    let seeds: u64 = std::env::var("FIL_STATUS_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(6);
+    // 6, or 600 at FIL_TEST_SCALE=full (`just status-soak`'s size).
+    let seeds = fil_testkit::scale::pick("FIL_STATUS_SEEDS", 6, 600);
     for b in backends() {
         let pool = POOL;
         for seed in (1..=seeds).chain(REGRESSION_SEEDS.iter().copied()) {

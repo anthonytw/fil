@@ -1,4 +1,4 @@
-# Wall-clock tests
+# Wall-clock tests, and the test tiers
 
 Some tests pass or fail on real elapsed time: a latency percentile, a refusal "at once", Ctrl-C
 within 3 s. This page says how they are told apart from the rest, where they run, and what a
@@ -28,13 +28,15 @@ Two kinds of bound need telling apart, and they get different treatment.
 ## The structure
 
 1. **Wall-clock tests are named `wallclock_*`.** `just test` runs every other test, in parallel
-   (`--skip wallclock_`); `just test-wallclock` runs the `wallclock_` ones, one at a time
-   (`--test-threads=1`), so they do not measure the contention between tests. `just ci` runs only
-   `test` (it is the per-PR check, on shared CI runners whose stalls a wall-clock test would
-   measure); `just ci-release` runs both, on a quiet machine before a release, so nothing is left
-   out. Name a new wall-clock test with the prefix and it is in the serial step and out of the
-   parallel one. Two of `fil_testkit::timing`'s own tests carry the prefix too: they assert that a
-   quiet stretch records no stall, which a busy host cannot promise.
+   (cargo-nextest, whose profiles in `.config/nextest.toml` leave the prefix out); `just
+   test-wallclock` runs the `wallclock_` ones, one at a time (`--test-threads=1`), so they do not
+   measure the contention between tests. `just ci` runs only `test` (it is the per-PR check, on
+   shared CI runners whose stalls a wall-clock test would measure); `just ci-release` runs both,
+   on a quiet machine before a release, so nothing is left out. Name a new wall-clock test with
+   the prefix and it is in the serial step and out of the parallel one. Two of
+   `fil_testkit::timing`'s own tests carry the prefix too: they assert that a quiet stretch
+   records no stall, which a busy host cannot promise. The tiers below say where everything else
+   runs.
 2. **(T) bounds judge only what the host left alone.** `fil_testkit::timing::Stalls` watches the
    host with an OS thread of its own (never a task of the test's runtime, which the product shares, so a product that blocks a worker is not excused as the host) that ticks every 2 ms and records every
    tick that came more than 8 ms late. A sample whose interval overlaps a stall is measured again
@@ -87,3 +89,117 @@ The Mac did not miss any bound in 3 quiet runs, 3 runs with six busy loops and 2
 from the container's CPU cap. Since 2026-11-09 the wall-clock tests are not part of the per-PR
 checks on shared runners at all; `just ci-release` runs them before a release on the Mac, and the
 Linux VM runs `just vm-run just test-wallclock`.
+
+## Tiers
+
+Since the test-suite sweep (2026-11-11) every test and harness runs in one of two tiers: the
+per-PR gate (on #81's head: linux-check `check` 9.2 min, `release-test` 10.9 min; macos-check
+`check` about 20 min) and the release suite, which runs everything else before a release (an
+estimate of about an hour, not yet measured whole). Two names and one knob decide where a test
+runs:
+
+- **`wallclock_*`**: alone, in the release suite only (above).
+- **`soak_*`**: a test with no small form (the netsim soak): the release suite only.
+- **`FIL_TEST_SCALE=smoke|full`** (default `smoke`): every test that has a size picks it with
+  `fil_testkit::scale::pick(VAR, smoke, full)`, and a set `VAR` (`FIL_PREDICT_SEEDS`,
+  `FIL_FORWARD_SEQ`, `MUX_SEEDS`, ...) overrides both. The drop-in suite takes `--scale` (default
+  from the same variable).
+- **Logic or OS** (`.config/nextest.toml`): a test of pure logic behaves the same on every
+  64-bit little-endian target, so it runs on Linux only; a test that touches the OS (PTYs,
+  signals, sockets, processes, files and their modes, rlimits, login shells) runs on Linux and
+  Apple silicon. A new test binary is logic unless it is in fil-daemon, fil-session or
+  fil-testbins or listed in the `os` profile: list an OS binary there when you add it.
+  - OS: every binary of fil-daemon, fil-session and fil-testbins; the library unit tests of
+    fil-client, fil-transport, fil-forward and fil-shell; fil-transport `quic_udp`, `pipe`,
+    `channel_churn`; fil-forward `forward`, `limits`, `nobufs`, `pace`, `wakeups`, `agent`,
+    `agent_constraints`; fil-client `offline`, `tty_pty`, `agent`, `forward`,
+    `forward_hostile`, `predict_e2e`, `predict_stack`, `predict_suites`; fil-shell `binary`,
+    `install`, `install_finish`, `install_gc`, `install_shells`, `remote_commands`,
+    `resize_e2e`, `revision`, `session_cmds`, `trampoline`, `tty_group`, `predict_flag`, and
+    the drop-in and Pi harnesses' own tests (`example/dropin`, `example/pi_e2e`).
+  - Logic: fil-predict, fil-term, fil-proto, fil-netsim and fil-testkit whole; fil-transport
+    `alloc`, `quic_auth`, `quic_link`; fil-forward `socks`; the other fil-client binaries
+    (`acks`, `attach`, `control_path`, `detach_delivery`, `predict`, `prompts`, `reconnect`,
+    `refusals`, `resize_order`, `status`, `swap`, `terminal_restore`, `forward_flood`); fil-shell
+    `dialer`, `engine`, `forward_spec`, `ports_view`, `examples`, `docs_sync` and the `gen_docs`
+    example; the doctests. Their file access is reading committed fixtures.
+
+Sizes (smoke / full):
+
+| Test | Variable | Smoke | Full |
+|---|---|---|---|
+| fil-predict `sim` | `FIL_PREDICT_SEEDS` | 2 | 200 |
+| fil-predict `screen_view` `every_row` | `FIL_STAMP_SEEDS` | 12 | 200 |
+| fil-predict `status` `random` | `FIL_STATUS_SEEDS` | 6 | 600 |
+| fil-predict `keyless_reads` | `FIL_KEYLESS_SEEDS` | 150 | 1,500 |
+| fil-proto `mux_model` | `MUX_SEEDS` | 24 | 5,000 |
+| fil-transport `channel_churn` (QUIC) | `FIL_CHURN_CHANNELS` | 2,000 | 20,000 |
+| fil-forward `forward` bulk (at 2 MiB, twice the default window, `drops_mid_transfer`'s third cut leaves less than a window unsent; the first two still cut with more than a window outstanding) | `FIL_FORWARD_BULK_MIB` | 2 MiB | 256 MiB |
+| fil-forward `forward` sequential | `FIL_FORWARD_SEQ` | 1,500 | 20,000 |
+| fil-forward `forward` concurrent | `FIL_FORWARD_CONCURRENT` | 300 | 1,000 |
+| fil-forward `forward` new-epoch race | `FIL_FORWARD_EPOCH_RUNS` | 10 | 150 |
+| fil-forward `forward` test limit (s) | `FIL_FORWARD_TEST_LIMIT` | 120 | 3,600 |
+| fil-forward `socks` fuzz | `FIL_SOCKS_SEEDS` | 50,000 | 500,000 |
+| drop-in suite | `--scale` | no stress, idle or prediction scenarios but `predict_secret`; 12 s sleeps | everything, 45 s sleeps too |
+
+The sequential forward smoke stays above 1,024 (QUIC's stream credit, which a missing
+`Link::finish` runs out of); 300 concurrent connections already overflow macOS's listen queue of
+128, the failure that size exists to catch.
+
+**Tier 1, the PR gate** (CLAUDE.md § Delivery; `suite=check`):
+
+| Runner | Job | Contents |
+|---|---|---|
+| Linux | `linux-check` `check` | `just ci` (deny, notices, the workflow test, the exporter lock, fmt, clippy, the default-features check, release-deps, then every test but `wallclock_` and `soak_` at smoke size, logic and OS, and the doctests); the `ci`-profile no-test-hooks check; fidelity `--no-perf`; the prediction guard sweep; the PTY prediction harness at 2 seeds; the client's PTY tests |
+| Linux | `linux-check` `release-test` | the release scripts' own tests, in parallel with `check` |
+| macOS arm64 | `macos-check` `check` | clippy; `just test-os` (the OS tests at smoke size); `cargo check --target x86_64-apple-darwin -p fil-shell`; the client's PTY tests; the PTY prediction harness at 2 seeds; `just dropin --local --scale smoke` |
+| macOS arm64 | `macos-check` `release-test` | the release scripts' tests, only when the change touches the release paths (what CODEOWNERS owns as deciding a release, the justfile, and the other files selftest.sh reads; `git diff --no-renames` against the merge base with main): the macOS signing fakes are the macOS-only part |
+| macOS Intel | none | (suite=all) |
+
+The harness builds use the `ci` cargo profile (the release profile without fat LTO, 16 codegen
+units): they test behavior and feature unification, not the shipped bytes. In tests, the
+emulators and the prediction engine are built at `opt-level = 2` (root `Cargo.toml`), which
+took fil-predict's simulator from minutes to seconds.
+
+**Tier 2, the release suite.** `just ci-release`, on a quiet Mac (estimated at about an hour; the
+first full-scale pass of `test-release` took 17 min on the Mac, most of it the prior-ack rule at
+200 seeds, and `forward-soak` 83 s). Every part runs even when an earlier one fails, and the
+recipe ends by listing the parts that failed: `just ci`;
+`release-test`; `test-release` (every test at `FIL_TEST_SCALE=full` in the `ci` profile, the
+`soak_` tests included, then fil-forward's full sizes one test at a time, `forward-soak`);
+`test-wallclock`; the client's PTY tests; the guard sweep; the shipped (fat-LTO) build's
+no-test-hooks check (`shipped-no-test-hooks`); full fidelity; the PTY prediction harness at its
+defaults; the prediction matrix (`predict-suites all`); terminal pacing; and the full drop-in
+suite (`dropin --local --scale full`). On GitHub: `linux-check` `suite=all` (check, release-test,
+`full-scale`, which is `test-release` on Linux, realnet, aarch64, terminals) and `macos-check`
+`suite=all` on Apple silicon AND Intel (every test, the full drop-in suite, release-test, the
+shipped no-test-hooks check; remote; brew with a release run). The `full-scale` job's 60 min and
+the suite=all limits are estimates until a run measures them. release.yml runs release-test
+again for the release itself.
+
+Where each step that left the per-PR gate runs now:
+
+| Test or step | Before (per PR) | Now |
+|---|---|---|
+| `release-test` | inside `just ci` on Linux, arm64 and Intel | linux-check's parallel `release-test` job; macos-check's `release-test` job on arm64 only on release paths; suite=all on both Macs; `ci-release`; release.yml |
+| pure-logic test binaries on macOS | `just ci` on arm64 and Intel | Linux per PR (`just ci`); suite=all `just test` on both Macs; `ci-release` on the Mac |
+| Intel macOS check | every PR (`just ci`, harnesses, drop-in) | arm64's cross `cargo check` per PR; the whole job in suite=all |
+| deny, notices (and cargo-about), fmt, exporter lock, workflow test, release-deps on macOS | `just ci` on both Macs | Linux per PR only (identical on every platform) |
+| clippy on Intel | `just ci` | Linux and arm64 per PR |
+| fidelity on macOS | both Macs | Linux per PR; `ci-release` (full, with perf) |
+| netsim soak | linux-check per PR (`just netsim-soak`, ignored test) | `soak_` test: `test-release` (`ci-release`, linux-check suite=all `full-scale`) |
+| macOS reduced forward soak (`forward-soak 32 2000`) | both Macs | deleted (smoke `forward` covers its sizes; `forward-soak` at full size runs in `test-release`) |
+| channel_churn 20,000 x2 | every `cargo test` | 2,000 per PR; 20,000 in `test-release` |
+| fil-forward `forward` 8 MiB / 2,000 / 1,000 QUIC concurrent / 30 epochs | every `cargo test` | smoke sizes per PR; full sizes in `test-release` (`forward-soak`) |
+| fil-predict, status, MUX, keyless, SOCKS at soak sizes | on demand (`predict-soak`, `status-soak`, `mux-soak`, `forward-soak`) | `test-release` at full scale (the recipes remain) |
+| drop-in `idle`, `fwd_churn`, `fwd_bulk_typing`, prediction scenarios but `predict_secret`, 45 s sleep variants | both Macs per PR | macos-check suite=all (both Macs); `ci-release` |
+| fat-LTO no-test-hooks build | both Macs per PR | `ci` profile per PR (Linux, and arm64 through `dropin`); fat LTO in suite=all and `ci-release` |
+| fil-client `review.rs` (PR #17 probes) | every `cargo test` | folded into `offline.rs`, `status.rs`, `prompts.rs`, `swap.rs`; two were already covered (`swap.rs`, `resize_order.rs`) |
+| wall-clock tests | (not per PR since 2026-11-09) | `ci-release` (`test-wallclock`) |
+
+**Security stays in every PR.** Only scale moved out: the §11 hostile-daemon and flood tests,
+peer-UID and socket-directory checks, the agent socket, the §11.1 privacy logs (`log_content`,
+`ports_log`), the secret-rule tests (`predict_stack`, `predict_e2e`, `predict_suites`'s CI cells,
+`review_attacks`, `keyless_reads`), the guard sweep and simulator guard proofs, `remote_commands`,
+the install and trampoline contracts, `tty_group`, release-deps and no-test-hooks, and the
+drop-in suite's `predict_secret` all run on every PR (Linux, and arm64 for the OS ones).

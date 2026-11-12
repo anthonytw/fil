@@ -237,3 +237,21 @@ async fn a_refused_candidate_does_not_end_a_session_the_old_link_is_still_delive
     );
     assert!(term.text().contains("the last output"));
 }
+
+/// The take-back question when the overlay gate is closed, because the stream stopped at the
+/// last column (a pending wrap, as a progress bar leaves it): the question is still drawn.
+/// (From the PR #17 review probes, folded in by the test-suite sweep.)
+#[tokio::test(start_paused = true)]
+async fn the_take_back_question_is_visible_after_a_full_width_line() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(&[b'#'; 80]).await;
+    settle().await;
+    rig.daemon.take_over("desktop").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let text = rig.term.text();
+    assert!(
+        text.contains("Take it back?"),
+        "the client waits for y/n on an invisible question:\n{text}"
+    );
+}

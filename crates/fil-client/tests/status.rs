@@ -393,3 +393,146 @@ async fn a_pty_mode_report_is_applied_in_order_with_the_output() {
         "a password is never shown back: {text}"
     );
 }
+
+// ---- from the PR #17 review probes (tests/review.rs, folded in by the test-suite sweep) -------
+
+/// The password-prompt mode survives a catch-up snapshot: keys typed offline at the prompt are
+/// still masked in the confirmation after the snapshot.
+#[tokio::test(start_paused = true)]
+async fn the_password_mode_survives_a_catch_up_snapshot() {
+    let mut cfg = config();
+    cfg.offline.confirm_after = Some(Duration::from_secs(1));
+    let rig = start(cfg);
+    rig.attached().await;
+    rig.daemon.output(b"Password: ").await;
+    rig.daemon.pty_mode(true, false).await;
+    settle().await;
+    rig.daemon.catch_up(b"").await;
+    settle().await;
+    go_offline(&rig).await;
+    rig.type_str("hunter2\r");
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    reconnect(&rig, 2).await;
+    let text = rig.term.text();
+    assert!(
+        !text.contains("hunter2"),
+        "password shown in clear:\n{text}"
+    );
+}
+
+/// A resume snapshot (the log wrapped while offline) written onto a terminal that is on the
+/// alternate screen, while the daemon's screen has left it: the terminal follows the daemon.
+#[tokio::test(start_paused = true)]
+async fn a_resume_snapshot_onto_the_alternate_screen_follows_the_daemon() {
+    let daemon = FakeDaemon::new(4096);
+    let rig = start_with(daemon, config(), 80, 24, "xterm-256color");
+    rig.attached().await;
+    rig.daemon
+        .output(b"$ vim\r\n\x1b[?1049h\x1b[Hvim screen")
+        .await;
+    settle().await;
+    assert!(rig.term.state().modes.alt_screen);
+    go_offline(&rig).await;
+    let mut out = b"\x1b[?1049l".to_vec();
+    out.extend(lines(0..400));
+    rig.daemon.output_unsent(&out).await;
+    reconnect(&rig, 2).await;
+    assert_eq!(rig.daemon.snapshots().await, 2, "the resume was a snapshot");
+    let d = rig.daemon.screen(0).await;
+    assert_eq!(
+        rig.term.state().modes.alt_screen,
+        d.modes.alt_screen,
+        "alt screen mismatch"
+    );
+}
+
+/// A status line drawn while offline, then the window narrows: the scrollback is unchanged and
+/// no piece of the status line is left on the screen after the resume.
+#[tokio::test(start_paused = true)]
+async fn narrowing_while_offline_leaves_the_scrollback_clean() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(&lines(0..5)).await;
+    settle().await;
+    let hist_before = rig.term.history();
+    go_offline(&rig).await;
+    rig.term.resize(60, 24);
+    settle().await;
+    reconnect(&rig, 2).await;
+    let hist = rig.term.history();
+    assert_eq!(hist, hist_before, "scrollback changed: {hist:?}");
+    let text = rig.term.text();
+    assert!(
+        !text.contains("fil:"),
+        "status leftovers on screen:\n{text}"
+    );
+}
+
+/// Narrowing while the status line sits over long program lines (cursor low, status at the
+/// top): the resume asks for a snapshot, keeps the key, and loses none of the program's lines.
+#[tokio::test(start_paused = true)]
+async fn narrowing_under_the_status_over_long_lines_resumes_with_a_snapshot() {
+    let rig = start(config());
+    rig.attached().await;
+    let mut out = Vec::new();
+    for i in 0..30 {
+        out.extend(format!("{i:02} {}\r\n", "x".repeat(75)).into_bytes());
+    }
+    rig.daemon.output(&out).await;
+    settle().await;
+    go_offline(&rig).await;
+    assert!(
+        rig.term
+            .state()
+            .screen
+            .iter()
+            .any(|l| l.text().contains("fil:")),
+        "the status line is drawn"
+    );
+    rig.term.resize(60, 24);
+    settle().await;
+    reconnect(&rig, 2).await;
+    let attaches = rig.daemon.attaches().await;
+    let mut r = fil_term::create(
+        fil_term::DEFAULT_BACKEND,
+        fil_term::Size { cols: 80, rows: 24 },
+        1000,
+    )
+    .unwrap();
+    r.feed(&out);
+    r.resize(fil_term::Size { cols: 60, rows: 24 });
+    let want = r.state(1000);
+    let got = rig.term.state();
+    assert_eq!(got.screen_text(), want.screen_text(), "screen differs");
+    // The window narrowed under the overlay, so the client did not trust the screen and took a
+    // snapshot. That is still a resume (same key, same epoch, no new ssh login, input kept) that
+    // asks to be repainted. The terminal had already re-wrapped the overlay's rows into its
+    // scrollback by then, which nothing can undo: the history keeps those fragments and gains
+    // the snapshot's lines, but loses nothing.
+    assert!(
+        attaches[1].resume.is_some_and(|r| r.want_snapshot),
+        "narrowing under the overlay asks for a snapshot: {:?}",
+        attaches[1].resume
+    );
+    assert_eq!(attaches[0].key, attaches[1].key, "the key is kept");
+    assert_eq!(
+        rig.dial.purposes(),
+        vec![
+            fil_client::DialPurpose::Attach,
+            fil_client::DialPurpose::Resume
+        ]
+    );
+    let wh: Vec<_> = want
+        .history
+        .iter()
+        .map(fil_term::model::Line::text)
+        .collect();
+    let have = rig.term.history();
+    assert!(have.len() >= wh.len());
+    let mut it = have.iter();
+    assert!(
+        wh.iter().all(|w| it.any(|h| h == w)),
+        "the program's own lines are all still in the scrollback, in order"
+    );
+}

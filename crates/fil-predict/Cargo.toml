@@ -31,6 +31,8 @@ vte = "0.15"
 # The vt100 backend is not in the shipped binary (fil-term's default features); the tests and
 # examples iterate over every backend, so they build it.
 [dev-dependencies]
+# FIL_TEST_SCALE (fil_testkit::scale).
+fil-testkit = { path = "../fil-testkit" }
 fil-term = { path = "../fil-term", features = ["vt100"] }
 # The tests use the harness (oracle, driver, sim).
 fil-predict = { path = ".", features = ["testkit"] }

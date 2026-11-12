@@ -18,14 +18,58 @@ target_dir := if env("CARGO_TARGET_DIR", "") == "" { source_directory() / "targe
 default:
     @just --list
 
-# The per-PR checks (CLAUDE.md § Delivery; GitHub's linux-check and macos-check run it). `deny` runs
-# first so that a network failure (the advisory database) shows up at once, not after the whole test
-# suite; `notices` next, so that a missing cargo-about (the Notices section below) does too. The
-# wall-clock tests are not in it: on a shared CI runner they measure the host (docs/dev/timing-tests.md).
-ci: deny notices ci-workflow-test exporter-lock fmt-check clippy check-default release-deps release-test test
+# The per-PR checks (CLAUDE.md § Delivery; GitHub's linux-check runs it, macos-check runs `clippy`
+# and `test-os` instead; docs/dev/timing-tests.md "Tiers"). `deny` runs first so that a network
+# failure (the advisory database) shows up at once, not after the whole test suite; `notices` next,
+# so that a missing cargo-about (the Notices section below) does too. Not in it: the wall-clock
+# tests (on a shared CI runner they measure the host), the `soak_` tests and the full sizes
+# (FIL_TEST_SCALE=full), and `release-test` (the release scripts' own tests, a parallel job of
+# linux-check; run it when you touch tests/release, packaging or the workflows). `ci-release` has
+# all of them.
+ci: deny notices ci-workflow-test exporter-lock fmt-check clippy check-default release-deps test
 
-# Before a release (docs/m4/release.md §9.2), on a quiet machine: `ci` and the wall-clock tests.
-ci-release: ci test-wallclock
+# Before a release (docs/m4/release.md §9.2), on a quiet machine (an hour or more; not yet timed whole): `ci`, then
+# everything the per-PR tiers leave out: the release scripts' tests, every test at full size with
+# the `soak_` tests (`test-release`), the wall-clock tests alone, the full drop-in suite, the
+# prediction matrix, terminal pacing, the PTY and prediction harnesses, and the shipped (fat-LTO)
+# build's no-test-hooks check. GitHub's suite=all runs the rest (realnet, aarch64, terminals,
+# Intel macOS, macOS as the remote host). Every part runs even when an earlier one fails (one red
+# test must not hide the drop-in suite or pacing); the recipe fails at the end, listing the parts
+# that failed.
+ci-release:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cd "{{source_directory()}}"
+    j=(just --justfile "{{source_file()}}" --working-directory "{{source_directory()}}")
+    failed=()
+    part() { echo "==== ci-release: $*"; "${j[@]}" "$@" || failed+=("$*"); }
+    part ci
+    part release-test
+    part test-release
+    part test-wallclock
+    part client-pty
+    part predict-mutants
+    part shipped-no-test-hooks
+    part fidelity
+    part predict-harness
+    part predict-suites all
+    part pacing
+    part dropin --local --scale full
+    if [ ${#failed[@]} -gt 0 ]; then
+      echo "==== ci-release: FAILED: ${#failed[@]} part(s):" >&2
+      printf '  just %s\n' "${failed[@]}" >&2
+      exit 1
+    fi
+    echo "==== ci-release: every part passed"
+
+# The release binary as shipped (the release profile: fat LTO, one codegen unit) has no test hooks.
+# The per-PR check builds the `ci` profile instead (`no-test-hooks` checks feature unification,
+# which the profile does not change); this one runs in `ci-release` and the check workflows'
+# suite=all.
+shipped-no-test-hooks:
+    cargo build --release -p fil-shell --bins
+    just no-test-hooks "{{target_dir}}/release/fil"
+    "{{target_dir}}/release/fil" --version
 
 # The cases of the Gitea workflow's push-to-main skip decision (tests/ci/push_skip.py, issue #38):
 # offline fakes of git and the API, under a second. Part of `ci`; needs python3.
@@ -50,18 +94,56 @@ clippy:
 check-default:
     cargo check -p fil-shell
 
-# Every test but the wall-clock ones (named wallclock_*, below), in parallel. --no-fail-fast: one
-# failing test binary does not hide the rest (a CI run reports every failure); the recipe still
-# fails on any.
-test:
-    cargo test --workspace --all-features --no-fail-fast -- --skip wallclock_
+# Every test but the wall-clock ones (named wallclock_*, below) and the soaks (soak_*), at smoke
+# size, in parallel, each test in a process of its own (cargo-nextest; `.config/nextest.toml`'s
+# default profile), then the doctests, which nextest does not run. Logic and OS tests alike:
+# linux-check runs this; macos-check runs only the OS tests (`test-os`). Every failure is reported
+# (fail-fast is off); the recipe still fails on any. Needs cargo-nextest 0.9.149, the version the
+# workflows pin (`_nextest` below says how to install it).
+test: _nextest
+    #!/usr/bin/env bash
+    set -uo pipefail
+    # Both halves run even when the first fails, so one run reports every failure.
+    rc=0
+    cargo nextest run --workspace --all-features || rc=1
+    cargo test --workspace --all-features --doc || rc=1
+    exit $rc
+
+# cargo-nextest, which `test`, `test-os`, `test-release` and `forward-soak` need: a clear error
+# naming the install, never a quiet fallback to `cargo test` (which would run the tests in one
+# process per binary, without .config/nextest.toml's groups and filters).
+_nextest:
+    @cargo nextest --version > /dev/null 2>&1 || { echo "cargo-nextest is missing (the tests run under it, .config/nextest.toml): cargo install --locked cargo-nextest@0.9.149, or the prebuilt binary from https://nexte.st; in the Linux VM, just vm-setup" >&2; exit 1; }
+
+# The OS tests only (PTYs, signals, sockets, processes, login shells; `.config/nextest.toml`'s `os`
+# profile), at smoke size: what macos-check runs per PR, since pure logic behaves the same on Linux.
+test-os: _nextest
+    cargo nextest run --workspace --all-features -P os
+
+# Every test at full size (FIL_TEST_SCALE=full; fil_testkit::scale), `soak_*` included, in the `ci`
+# profile (optimized, as the soaks always ran): the release suite's half of `test`. fil-forward runs
+# apart and one test at a time (`forward-soak`), since its full sizes use up the machine's ephemeral
+# ports and listen queues. The wall-clock tests are `test-wallclock`'s. Both halves run even when
+# the first fails; the recipe fails at the end, naming them.
+test-release: _nextest
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cd "{{source_directory()}}"
+    failed=()
+    FIL_TEST_SCALE=full cargo nextest run --workspace --all-features --cargo-profile ci -P release -E 'not package(fil-forward) and not test(/(^|::)wallclock_/)' || failed+=("every test but fil-forward, at full size")
+    just --justfile "{{source_file()}}" --working-directory "{{source_directory()}}" forward-soak || failed+=("forward-soak")
+    if [ ${#failed[@]} -gt 0 ]; then
+      printf 'test-release: FAILED: %s\n' "${failed[@]}" >&2
+      exit 1
+    fi
 
 # The wall-clock tests, one at a time (docs/dev/timing-tests.md): tests named wallclock_*, whose
 # pass or fail depends on real elapsed time (a latency percentile, "at once", Ctrl-C within 3 s).
 # Run beside the rest of the suite they measure the contention between tests (a CI container
 # capped at a few CPUs is throttled by the kernel in 100 ms periods); alone they measure the
-# product. `test` and this recipe together run every test once: `ci-release` runs both. Name a new
-# wall-clock test with the prefix and it is in this step and out of the other.
+# product. `test`, `test-release` (the soak_ tests and the full sizes) and this recipe together run
+# every test: `ci-release` runs all three. Name a new wall-clock test with the prefix and it is in
+# this step and out of the others.
 test-wallclock:
     cargo test --workspace --all-features --no-fail-fast -- wallclock_ --test-threads=1
 
@@ -76,9 +158,10 @@ wire-golden:
 deny:
     cargo deny {{deny_flags}} check advisories licenses bans sources
 
-# Slow link-simulator soak: many seeds, harsh conditions (not part of `ci`).
+# Slow link-simulator soak: many seeds, harsh conditions (a `soak_` test: `test-release` runs it,
+# not `ci`).
 netsim-soak:
-    cargo test -p fil-netsim --test quic --release -- --ignored --nocapture soak
+    cargo test -p fil-netsim --test quic --profile ci -- --nocapture soak_
 
 # Terminal pacing (M3 K1, crates/fil-session/tests/terminal_pacing.rs) in release: Ctrl-C during a
 # flood at 1 Mbit/s paced and unpaced (the unpaced QUIC cell takes about 20 s), and throughput
@@ -148,14 +231,14 @@ fuzz-deny:
       cargo deny --manifest-path "$m" check licenses bans sources
     done
 
-# The forward suite at full size (crates/fil-forward/tests/forward.rs): 256 MiB each way through a
-# forward, 20,000 sequential connections, on link::mem, the pipe and QUIC. `just ci` runs the same
-# tests at 8 MiB and 2,000 (and 300 concurrent off QUIC). Release build. Also runs the SOCKS fuzz
-# table and the new-epoch race with more seeds and runs. One test at a time: at these sizes,
-# tests side by side overflow loopback listen queues (128 on macOS) and the ephemeral ports. The
-# wall-clock tests are skipped (macos-check runs this on shared runners); `just ci-release` runs them.
-forward-soak mib="256" seq="20000":
-    FIL_FORWARD_TEST_LIMIT=3600 FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} FIL_FORWARD_CONCURRENT=1000 FIL_FORWARD_EPOCH_RUNS=150 FIL_SOCKS_SEEDS=500000 cargo test --release -p fil-forward -- --nocapture --test-threads=1 --skip wallclock_
+# Every fil-forward test at full size (FIL_TEST_SCALE=full; crates/fil-forward/tests/forward.rs):
+# 256 MiB each way through a forward, 20,000 sequential and 1,000 concurrent connections, on
+# link::mem, the pipe and QUIC, the SOCKS fuzz table and the new-epoch race with more seeds and
+# runs. `just ci` runs the same tests at smoke size (2 MiB, 1,500, 300). The `ci` profile. One test
+# at a time: at these sizes, tests side by side overflow loopback listen queues (128 on macOS) and
+# the ephemeral ports. Part of `test-release`; the wall-clock tests are `test-wallclock`'s.
+forward-soak mib="256" seq="20000": _nextest
+    FIL_TEST_SCALE=full FIL_FORWARD_BULK_MIB={{mib}} FIL_FORWARD_SEQ={{seq}} cargo nextest run --all-features --cargo-profile ci -P release -p fil-forward -j 1 -E 'not test(/(^|::)wallclock_/)'
 
 # Regenerate the synthetic emulator fixtures from crates/fil-term/tests/common/synthetic.rs.
 fixtures:
@@ -167,14 +250,15 @@ record *scenarios:
     cargo run -q --release -p fil-term --example record -- {{scenarios}}
 
 # Emulator restore-fidelity harness (docs/spikes/emulator.md). Flags: --only NAME, --no-perf, --verbose.
+# The `ci` profile (optimized, quick to link), as every harness build here.
 fidelity *args:
-    cargo run --release -p fil-term --example fidelity --all-features -- {{args}}
+    cargo run --profile ci -p fil-term --example fidelity --all-features -- {{args}}
 
 # Prediction overlay harness (docs/spikes/prediction.md): real programs on a PTY behind fil-netsim
 # latency, checked against an independent emulator. Flags: --seeds N, --keys N, --latency MS,
 # --only PROGRAM, --backend NAME, --hostile, --guard-off NAME, --jobs N, --verbose.
 predict-harness *args:
-    cargo run --release -p fil-predict --features harness --example predict_harness -- {{args}}
+    cargo run --profile ci -p fil-predict --features harness --example predict_harness -- {{args}}
 
 # The full-stack prediction harness (docs/m3/harness.md): the real client engine against a real session
 # on a real PTY, over simulated pipe and QUIC links, the user's terminal an emulator that reflows.
@@ -216,7 +300,7 @@ predict-soak seeds="200":
 
 # Guard-off sweep: proves every overlay guard is needed (slow; not in `ci`). Run after changing a guard.
 predict-mutants:
-    cargo test -p fil-predict --release --test mutants -- --ignored
+    cargo test -p fil-predict --profile ci --test mutants -- --ignored
 
 # Status-line fuzz (crates/fil-predict/tests/status.rs): many random sessions checked against the
 # oracle, in release. Run after changing the overlay's status drawing.
@@ -244,7 +328,8 @@ realnet *args:
 # with FIL_VM) is Ubuntu aarch64 with Docker, netem and no access to this Mac; code reaches it by
 # rsync. GitHub's linux-check stays the x86_64 reference.
 
-# Once after creating the VM: conntrack, the pinned toolchain, just, cargo-deny and cargo-about.
+# Once after creating the VM (and again when a tool is added): conntrack, the pinned toolchain,
+# just, cargo-deny, cargo-about and cargo-nextest.
 vm-setup:
     tests/realnet/vm.sh setup
 
@@ -306,14 +391,16 @@ pi-e2e *args:
 # check fails goes). `--local` runs against a private daemon on this machine instead (no targets
 # needed; a development aid). Targets as for pi-e2e. A skipped scenario or a
 # missing tool fails the run unless allowed. The M2 forward scenarios (docs/m2/dropin.md) also use
-# this machine's fwdprobe, built here, and the host's, installed through the gate. Never part of `ci`.
+# this machine's fwdprobe, built here, and the host's, installed through the gate. `--scale
+# smoke|full` (default FIL_TEST_SCALE, else smoke): smoke, macos-check's per-PR run, leaves out
+# the long scenarios; `ci-release` and suite=all run full. Built in the `ci` profile. Never part of `ci`.
 dropin *args:
-    cargo build -q --release -p fil-shell --bins
-    cargo build -q --release -p fil-shell --example dropin
-    cargo build -q --release -p fil-daemon --bin fil-daemon-dev
-    cargo build -q --release -p fil-testbins --bin fwdprobe
-    just no-test-hooks "{{target_dir}}/release/fil" "{{target_dir}}/release/fil-daemon-dev"
-    "{{target_dir}}/release/examples/dropin" {{args}}
+    cargo build -q --profile ci -p fil-shell --bins
+    cargo build -q --profile ci -p fil-shell --example dropin
+    cargo build -q --profile ci -p fil-daemon --bin fil-daemon-dev
+    cargo build -q --profile ci -p fil-testbins --bin fwdprobe
+    just no-test-hooks "{{target_dir}}/ci/fil" "{{target_dir}}/ci/fil-daemon-dev"
+    "{{target_dir}}/ci/examples/dropin" --fil "{{target_dir}}/ci/fil" {{args}}
 
 # macOS as the REMOTE host (DESIGN.md §16.9, docs/m4/plan.md MAC): the real release `fil` serves a
 # session over a real ssh login to this Mac (an sshd of its own on a high loopback port with

@@ -255,12 +255,10 @@ fn random_trace(seed: u64) -> Trace {
     t.tick(now + 2000)
 }
 
-/// Seeds per predictor and backend; `FIL_KEYLESS_SEEDS` runs more.
+/// Seeds per predictor and backend: 150, or 1,500 at `FIL_TEST_SCALE=full`; `FIL_KEYLESS_SEEDS`
+/// sets its own.
 fn seeds() -> u64 {
-    std::env::var("FIL_KEYLESS_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(150)
+    fil_testkit::scale::pick("FIL_KEYLESS_SEEDS", 150, 1500)
 }
 
 #[test]

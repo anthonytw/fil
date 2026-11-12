@@ -2,8 +2,14 @@
 //! connection is a channel, so a link must carry any number of them over its life while holding
 //! only the ones that are open.
 //!
+//! The QUIC churns carry 2,000 channels each, or 20,000 at `FIL_TEST_SCALE=full`
+//! (fil_testkit::scale; `FIL_CHURN_CHANNELS` sets its own): a bookkeeping leak shows at 2,000
+//! (the exact `channel_state` bound and `assert_quic_idle`), the resident-set backstop needs the
+//! larger number to see a small leak grow.
+//!
 //! The tests here hold a lock while they run, so that the resident-set measurements of one are
-//! not mixed with another's allocations (cargo runs the tests of one file in one process).
+//! not mixed with another's allocations when `cargo test` runs the tests of one file in one
+//! process (nextest runs each test in a process of its own).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -24,6 +30,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 
+/// Channels a QUIC churn carries, and the one after which it measures the resident set first.
+fn quic_channels() -> (u32, u32) {
+    let n = fil_testkit::scale::pick("FIL_CHURN_CHANNELS", 2_000, 20_000);
+    let n = u32::try_from(n).expect("FIL_CHURN_CHANNELS fits in 32 bits");
+    (n, n / 10)
+}
+
 /// Channels a churn keeps in flight: the client opens the next one once the reply on the one
 /// this many before has arrived.
 const WINDOW: u32 = 16;
@@ -43,8 +56,8 @@ const HELD_BOUND: usize = 2 * WINDOW as usize + 4;
 /// What the real-clock churn may hold per side: [`HELD_BOUND`], plus the unanswered stream ends
 /// an honest peer may leave outstanding, which is the stream credit it was granted
 /// (`quic::pinned::MAX_STREAMS`; `MAX_ENDING` in `quic.rs`). That is the link's own limit, not a
-/// tuned number, and it is still far below the 20,000 channels carried, so a leak that grows
-/// with the channels is caught here, and any leak at all by `assert_quic_idle`.
+/// tuned number, and it is still below the channels carried (2,000, or 20,000 at full scale), so
+/// a leak that grows with the channels is caught here, and any leak at all by `assert_quic_idle`.
 const HELD_BOUND_REAL_CLOCK: usize = quic::pinned::MAX_STREAMS as usize + HELD_BOUND;
 
 async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
@@ -182,12 +195,14 @@ async fn assert_quic_idle(client: &QuicLink, daemon: &QuicLink) {
 
 /// RSS may grow while allocator pools and quinn's buffers warm up, but not with the channels
 /// carried. This is a backstop for leaks the size of a task (a writer task or a quinn stream per
-/// channel): its limit would let about 230 bytes a channel through, so the proof that no map entry
-/// is kept per channel is the `channel_state` bound, not this.
+/// channel): its 4 MiB limit would let about 230 bytes a channel through at full scale (18,000
+/// channels after the first measurement) and about 2.3 KB a channel at smoke size (1,800), so the
+/// proof that no map entry is kept per channel is the `channel_state` bound and
+/// `assert_quic_idle`, which do not depend on the size, not this.
 fn assert_rss_flat(what: &str, c: &Churn, bound: usize) {
     let grew = c.rss_end.saturating_sub(c.rss_early);
     eprintln!(
-        "{what}: held at most {} per side, RSS {} KiB after 2,000 channels, {} KiB at the end (+{grew} KiB)",
+        "{what}: held at most {} per side, RSS {} KiB early, {} KiB at the end (+{grew} KiB)",
         c.held_max, c.rss_early, c.rss_end
     );
     assert!(c.held_max <= bound, "{what}: bound {bound}: {c:?}");
@@ -195,7 +210,7 @@ fn assert_rss_flat(what: &str, c: &Churn, bound: usize) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn twenty_thousand_sequential_channels_on_one_quic_link_over_loopback() {
+async fn sequential_channels_on_one_quic_link_over_loopback() {
     let _serial = serial().await;
     let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let identity = DaemonIdentity::generate().unwrap();
@@ -223,13 +238,14 @@ async fn twenty_thousand_sequential_channels_on_one_quic_link_over_loopback() {
     .unwrap();
     let daemon = listener.accept().await.unwrap();
     let (client, daemon) = (Arc::new(client), Arc::new(daemon));
-    let c = churn(client.clone(), daemon.clone(), 20_000, 2_000, quic_held).await;
+    let (n, rss_from) = quic_channels();
+    let c = churn(client.clone(), daemon.clone(), n, rss_from, quic_held).await;
     assert_quic_idle(&client, &daemon).await;
     assert_rss_flat("QUIC over loopback", &c, HELD_BOUND_REAL_CLOCK);
 }
 
 #[tokio::test(start_paused = true)]
-async fn twenty_thousand_sequential_channels_on_one_quic_link_over_netsim() {
+async fn sequential_channels_on_one_quic_link_over_netsim() {
     let _serial = serial().await;
     let net = Net::new(7);
     net.update_conditions(|c| c.latency = Duration::from_millis(20));
@@ -261,7 +277,8 @@ async fn twenty_thousand_sequential_channels_on_one_quic_link_over_netsim() {
         .unwrap();
     let daemon = listener.accept().await.unwrap();
     let (client, daemon) = (Arc::new(client), Arc::new(daemon));
-    let c = churn(client.clone(), daemon.clone(), 20_000, 2_000, quic_held).await;
+    let (n, rss_from) = quic_channels();
+    let c = churn(client.clone(), daemon.clone(), n, rss_from, quic_held).await;
     assert_quic_idle(&client, &daemon).await;
     assert_rss_flat("QUIC over fil-netsim", &c, HELD_BOUND);
 }

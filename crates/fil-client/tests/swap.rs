@@ -356,3 +356,32 @@ async fn a_failed_candidate_does_not_lose_the_pending_resize() {
     let sizes = rig.daemon.sizes().await;
     assert!(sizes.contains(&(100, 30)), "{sizes:?}");
 }
+
+/// The path manager offers a new link because the old one went quiet (the main reason to swap):
+/// the swap clears the status line and input goes over the new link. (From the PR #17 review
+/// probes, folded in by the test-suite sweep.)
+#[tokio::test(start_paused = true)]
+async fn a_swap_away_from_a_quiet_link_clears_the_status_and_carries_input() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(b"$ ").await;
+    settle().await;
+    rig.daemon.degrade_link().await;
+    settle().await;
+    assert!(rig.term.text().contains("no reply"), "{}", rig.term.text());
+    rig.dial.offer_swap(LinkKind::Direct);
+    until_async("the candidate attach", 30, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    rig.type_str("hello");
+    settle().await;
+    let text = rig.term.text();
+    assert!(
+        !text.contains("no reply"),
+        "status still up after the swap:\n{text}"
+    );
+    assert_eq!(rig.daemon.input().await, b"hello");
+}

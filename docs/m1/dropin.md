@@ -22,11 +22,14 @@ The harness (the `FIL_PI_TARGETS` rules, the gate, cleanup and the client on a p
 
 ```sh
 export FIL_PI_TARGETS="pi1=fil-test@HOST1,pi2=fil-test@HOST2"   # required; the keys are the only hosts it may touch
-just dropin                                   # both Pis, every scenario (about 12 minutes per Pi, with cleanups)
+just dropin --scale full                      # both Pis, every scenario (about 12 minutes per Pi, with cleanups)
+just dropin                                   # smoke (the default, FIL_TEST_SCALE): no stress, idle or prediction scenarios but predict_secret; 12 s sleeps only
 just dropin --hosts pi1 --only vim_edit,flood # narrow
 just dropin --list                            # the scenario names
 just dropin --local                           # this machine, a private daemon, no targets needed
 ```
+
+`--scale smoke|full` (default `FIL_TEST_SCALE`, else `smoke`; `docs/dev/timing-tests.md` "Tiers"): the smoke run, macos-check's per-PR one, leaves out the scenarios in `FULL_ONLY` (`crates/fil/examples/dropin/main.rs`: the stress, the 90 s idle, the prediction scenarios but `predict_secret`) and runs `client_sleep` and `fwd_sleep` with the 12 s auto variant only; a scenario named in `--only` runs at either scale. The results below are full runs.
 
 The Pi binary must be installed first (`docs/m1/pi.md`), and it must be built from the same tree as the client: the wire format moves between milestones, and a client and daemon from different trees stop at "protocol error".
 

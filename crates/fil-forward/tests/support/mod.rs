@@ -1406,12 +1406,10 @@ impl Drop for StallWatch {
     }
 }
 
-/// The scale knobs: heavy runs set them (`just forward-soak`).
-pub fn env_or(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// A scale knob: the variable `name` if set, else `smoke` or `full` by `FIL_TEST_SCALE`
+/// (fil_testkit::scale; `just forward-soak` and `just test-release` run full).
+pub fn scaled(name: &str, smoke: u64, full: u64) -> u64 {
+    fil_testkit::scale::pick(name, smoke, full)
 }
 
 /// The longest a test may run, by default. Every wait in a test is for something that happens at
@@ -1420,9 +1418,10 @@ pub fn env_or(name: &str, default: u64) -> u64 {
 /// (seconds) sets it, for soak runs whose scale knobs (`FIL_FORWARD_*`) make a test last longer.
 pub const TEST_LIMIT: Duration = Duration::from_secs(120);
 
-/// The limit in force: [`TEST_LIMIT`] unless the environment sets another.
+/// The limit in force: [`TEST_LIMIT`], an hour at `FIL_TEST_SCALE=full`, unless the environment
+/// sets another.
 pub fn test_limit() -> Duration {
-    Duration::from_secs(env_or("FIL_FORWARD_TEST_LIMIT", TEST_LIMIT.as_secs()))
+    Duration::from_secs(scaled("FIL_FORWARD_TEST_LIMIT", TEST_LIMIT.as_secs(), 3600))
 }
 
 /// Runs a test's body under [`test_limit`]; the panic names the test and, when the body built

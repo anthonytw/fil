@@ -31,6 +31,8 @@ tracing = "0.1"
 test-hooks = []
 
 [dev-dependencies]
+# FIL_TEST_SCALE (fil_testkit::scale). A dev-dependency cycle, as fil-testkit depends on this crate.
+fil-testkit = { path = "../fil-testkit" }
 # Enables `test-hooks` for this crate's own tests.
 fil-transport = { path = ".", features = ["test-hooks"] }
 fil-netsim = { path = "../fil-netsim" }

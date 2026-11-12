@@ -25,6 +25,8 @@ ring = "0.17"
 test-hooks = []
 
 [dev-dependencies]
+# FIL_TEST_SCALE (fil_testkit::scale). A dev-dependency cycle, as fil-testkit depends on this crate.
+fil-testkit = { path = "../fil-testkit" }
 fil-netsim = { path = "../fil-netsim" }
 # For tests/wire_golden.rs only, which pins the QUIC stream layout (fil_transport::quic::pinned)
 # next to the messages. A dev-dependency cycle: fil-transport depends on this crate.

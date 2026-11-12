@@ -1,16 +1,19 @@
 //! Runs a scripted session through the real overlay and records what it writes to the user's
 //! terminal: the erase, the server bytes, the paint, and the synchronized-output markers.
 //!
-//! The overlay is the one in `fil-predict`, driven as `fil_predict::driver::Driver` drives it,
-//! except for one thing: a resize reaches the terminal first, as it does in life (the harness's
-//! driver erases first, which no terminal does; docs/m3/plan.md section 3, T1).
+//! The overlay is the one in `fil-predict`, driven as `fil_predict::driver::Driver` drives it
+//! (typed input at running input offsets, the RTT as the link's hint), except for one thing: a
+//! resize reaches the terminal first, as it does in life (the harness's driver erases first,
+//! which no terminal does; docs/m3/plan.md section 3, T1).
 
 use std::time::Duration;
 
 use fil_predict::oracle::{Kind, check_equal, check_view};
-use fil_predict::overlay::{Bracket, Flush, Guards};
+use fil_predict::overlay::{Bracket, Flush, Guards, InputKind};
 use fil_predict::sim::FixedPredictor;
-use fil_predict::{Config, MoshConfig, MoshPredictor, Overlay, Placement, PtyMode, Status};
+use fil_predict::{
+    Config, InputPos, LinkView, MoshConfig, MoshPredictor, Overlay, Placement, PtyMode, Status,
+};
 use fil_term::{Size, TermState};
 
 use crate::trace::{Check, HISTORY, Hist, Tb, model_backend, probe};
@@ -62,9 +65,14 @@ impl Script {
 }
 
 pub enum Predict {
-    /// Shows exactly these cells (and cursor) from the first key until 300 ms later.
-    Fixed(Vec<(u16, u16, char)>, Option<(u16, u16)>),
-    /// The default predictor.
+    /// Guesses the n-th printable key or Backspace at the n-th of these cells, with the key's
+    /// own character (`fil_predict::sim::FixedPredictor`; the core places the cursor after it).
+    /// Run on M0's core ([`Guards::M0`]: every guess written as soon as it is declared), as
+    /// `crates/fil-predict/tests/hazards.rs` runs the same traces: with every C1 rule on, these
+    /// guesses stay tentative and nothing would reach the terminal, so the trace would not test
+    /// the painting guard it is named for.
+    Fixed(Vec<(u16, u16)>),
+    /// The default predictor, with every guard on (what fil ships).
     Mosh,
 }
 
@@ -126,9 +134,12 @@ pub fn run(r: &Run, sync: bool) -> Outcome {
     } else {
         format!("{}-nosync", r.name)
     };
-    let predictor: Box<dyn fil_predict::Predictor> = match &r.predict {
-        Predict::Fixed(cells, cur) => Box::new(FixedPredictor::new(cells.clone(), *cur)),
-        Predict::Mosh => Box::new(MoshPredictor::new(MoshConfig::default())),
+    let (predictor, guards): (Box<dyn fil_predict::Predictor>, Guards) = match &r.predict {
+        Predict::Fixed(cells) => (Box::new(FixedPredictor::new(cells.clone())), Guards::M0),
+        Predict::Mosh => (
+            Box::new(MoshPredictor::new(MoshConfig::default())),
+            Guards::ALL,
+        ),
     };
     let mut overlay = Overlay::with_backend(
         &backend,
@@ -136,7 +147,7 @@ pub fn run(r: &Run, sync: bool) -> Outcome {
         HISTORY,
         predictor,
         Config {
-            guards: Guards::ALL,
+            guards,
             sync_output: sync,
         },
     );
@@ -161,6 +172,9 @@ pub fn run(r: &Run, sync: bool) -> Outcome {
     // the terminal-against-model comparison is made.
     let damaged = std::cell::Cell::new(false);
     let mut last = Duration::ZERO;
+    // The next input byte's offset (DESIGN.md section 8.5), as the driver counts it.
+    let mut input_end: InputPos = 0;
+    let mut link = LinkView::default();
 
     let flush = |tb: &mut Tb,
                  overlay: &Overlay,
@@ -213,7 +227,8 @@ pub fn run(r: &Run, sync: bool) -> Outcome {
         let label = format!("e{i}");
         match op {
             Op::Input(b) => {
-                let f = overlay.on_input(b, at);
+                let f = overlay.on_input(b, input_end, InputKind::Typed, at);
+                input_end += b.len() as u64;
                 flush(&mut tb, &overlay, &f, None, &label, &mut painted);
             }
             Op::Server(b) => {
@@ -228,7 +243,10 @@ pub fn run(r: &Run, sync: bool) -> Outcome {
                 });
                 flush(&mut tb, &overlay, &f, None, &label, &mut painted);
             }
-            Op::Rtt(d) => overlay.set_rtt(Duration::from_millis(*d)),
+            Op::Rtt(d) => {
+                link.rtt_hint = Some(Duration::from_millis(*d));
+                overlay.set_link(link);
+            }
             Op::Status(s) => {
                 let st = s.as_ref().map(|lines| Status {
                     lines: lines.clone(),

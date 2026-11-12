@@ -16,9 +16,13 @@ use trace::Tb;
 /// Every trace, with the size the terminal starts at.
 pub fn all() -> Vec<(Tb, u16, u16)> {
     let mut out = Vec::new();
+    let mut hazards_painted = 0usize;
     for r in overlay_scenarios::runs() {
         for sync in [true, false] {
             let o = overlay::run(&r, sync);
+            if r.name.starts_with("ov-") && r.name != "ov-typing" && o.painted > 0 {
+                hazards_painted += 1;
+            }
             // The status lines and the typing session must draw something; a hazard trace
             // often shows only that the guard held back what the fixed predictor wanted.
             assert!(
@@ -33,6 +37,12 @@ pub fn all() -> Vec<(Tb, u16, u16)> {
             out.push((o.tb, r.size.cols, r.size.rows));
         }
     }
+    // Most hazard traces paint (on M0's core); if none does, the guesses no longer reach the
+    // terminal (all of C1's rules on, say) and every hazard trace proves nothing.
+    assert!(
+        hazards_painted > 0,
+        "no ov-* hazard trace painted anything: are they on M0's core?"
+    );
     out.push((scenarios::canary(), 80, 24));
     for tb in scenarios::snapshots()
         .into_iter()

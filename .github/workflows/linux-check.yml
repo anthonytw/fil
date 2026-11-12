@@ -113,9 +113,10 @@ jobs:
     # Linux, where the logic tests live. `just ci-release` runs the same on the Mac.
     if: inputs.suite == 'all'
     runs-on: ubuntu-24.04
-    # Not measured on a runner yet (an estimate). On the dev Mac (14 cores) the full-size pass took
-    # 17 min, most of it one test (the prior-ack rule at 200 seeds), and the forward soak 83 s;
-    # a 4-vCPU runner builds and runs slower.
+    # Not measured on a runner yet (an estimate). On the dev Mac (14 cores) the first full-size pass
+    # took 17 min, most of it one test (the prior-ack rule at 200 seeds; over 40 min on a runner);
+    # that test now runs 16 seeds at full size, about 86 s on the Mac, so the pass is shorter (not
+    # re-measured as a whole). The forward soak took 83 s; a 4-vCPU runner builds and runs slower.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

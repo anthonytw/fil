@@ -163,7 +163,8 @@ took fil-predict's simulator from minutes to seconds.
 
 **Tier 2, the release suite.** `just ci-release`, on a quiet Mac (estimated at about an hour; the
 first full-scale pass of `test-release` took 17 min on the Mac, most of it the prior-ack rule at
-200 seeds, and `forward-soak` 83 s). Every part runs even when an earlier one fails, and the
+200 seeds; that test now runs 16 seeds at full size, about 86 s on the Mac, and the whole pass has
+not been re-measured since; `forward-soak` took 83 s). Every part runs even when an earlier one fails, and the
 recipe ends by listing the parts that failed: `just ci`;
 `release-test`; `test-release` (every test at `FIL_TEST_SCALE=full` in the `ci` profile, the
 `soak_` tests included, then fil-forward's full sizes one test at a time, `forward-soak`);

@@ -1,6 +1,9 @@
 //! The overlay scenarios: the spike's hazard traces (`crates/fil-predict/tests/hazards.rs`, one
 //! per row of the hazard table in docs/spikes/prediction.md), status lines
 //! (`crates/fil-predict/tests/status.rs`) and a typing session with the default predictor.
+//!
+//! The hazard traces use the fixed predictor, which guesses each typed key's own character at the
+//! next cell of the list (a key past the end of the list is not guessed).
 
 use fil_term::Size;
 
@@ -19,15 +22,14 @@ fn hz(
     name: &'static str,
     doc: &'static str,
     script: Script,
-    cells: &[(u16, u16, char)],
-    cursor: Option<(u16, u16)>,
+    cells: &[(u16, u16)],
     attrs: &'static str,
 ) -> Run {
     Run {
         name,
         doc,
         size: S40X12,
-        predict: Predict::Fixed(cells.to_vec(), cursor),
+        predict: Predict::Fixed(cells.to_vec()),
         script,
         attrs,
     }
@@ -42,16 +44,14 @@ pub fn runs() -> Vec<Run> {
                 .server(0, &line('a', 40))
                 .input(10, b"x")
                 .server(20, b"b"),
-            &[(5, 5, 'z')],
-            None,
+            &[(5, 5)],
             "u",
         ),
         hz(
             "ov-last-column",
             "Hazard 10: overwriting the last cell of a soft-wrapped line loses the line's wrap flag (reflow and snapshots need it).",
             Script::new().server(0, &line('a', 41)).input(10, b"x"),
-            &[(0, 39, 'z')],
-            Some((0, 39)),
+            &[(0, 39)],
             "u",
         ),
         hz(
@@ -59,9 +59,8 @@ pub fn runs() -> Vec<Run> {
             "Hazard 8: half of a wide character is never overwritten.",
             Script::new()
                 .server(0, "\x1b[6;6H日本語".as_bytes())
-                .input(10, b"x"),
-            &[(5, 6, 'y'), (5, 5, 'z')],
-            None,
+                .input(10, b"yz"),
+            &[(5, 6), (5, 5)],
             "u",
         ),
         hz(
@@ -71,8 +70,7 @@ pub fn runs() -> Vec<Run> {
                 .server(0, b"\x1b[3;9r\x1b[?6h\x1b[1;1Hhi")
                 .input(10, b"x")
                 .server(20, b"!"),
-            &[(3, 3, 'z')],
-            Some((3, 5)),
+            &[(3, 3)],
             "u",
         ),
         hz(
@@ -82,8 +80,7 @@ pub fn runs() -> Vec<Run> {
                 .server(0, b"\x1b[1;31;48;5;4;4:3;58;5;9mhi")
                 .input(10, b"x")
                 .server(20, b"!"),
-            &[(2, 2, 'z')],
-            None,
+            &[(2, 2)],
             "bfgu",
         ),
         hz(
@@ -93,8 +90,7 @@ pub fn runs() -> Vec<Run> {
                 .server(0, b"\x1b[1;31;48;5;4;4:3;58:5:9mhi")
                 .input(10, b"x")
                 .server(20, b"!"),
-            &[(2, 2, 'z')],
-            None,
+            &[(2, 2)],
             "bfgusk",
         ),
         hz(
@@ -104,8 +100,7 @@ pub fn runs() -> Vec<Run> {
                 .server(0, b"\x1b]8;id=a;http://example.test/x\x1b\\hi")
                 .input(10, b"x")
                 .server(20, b"yo"),
-            &[(2, 2, 'z')],
-            None,
+            &[(2, 2)],
             "u",
         ),
         hz(
@@ -116,8 +111,7 @@ pub fn runs() -> Vec<Run> {
                 .server(20, b"\x1b[?25l")
                 .input(30, b"y")
                 .server(40, b"a"),
-            &[(2, 2, 'z')],
-            None,
+            &[(2, 2)],
             "u",
         ),
         hz(
@@ -126,8 +120,7 @@ pub fn runs() -> Vec<Run> {
             Script::new()
                 .server(0, b"\x1b[4hhi\x1b[1;1H")
                 .input(10, b"x"),
-            &[(0, 0, 'z')],
-            Some((0, 1)),
+            &[(0, 0)],
             "u",
         ),
         hz(
@@ -138,8 +131,7 @@ pub fn runs() -> Vec<Run> {
                 .input(10, b"x")
                 .server(20, b"\x0f")
                 .input(30, b"y"),
-            &[(2, 2, 'q')],
-            None,
+            &[(2, 2)],
             "u",
         ),
         hz(
@@ -150,8 +142,7 @@ pub fn runs() -> Vec<Run> {
                 .server(5, b"\x0e")
                 .server(10, b"\x1b[!p")
                 .input(20, b"x"),
-            &[(2, 2, 'q')],
-            None,
+            &[(2, 2)],
             "u",
         ),
         hz(
@@ -162,8 +153,7 @@ pub fn runs() -> Vec<Run> {
                 .server(5, b"\x1b[?1049l")
                 .input(10, b"x")
                 .input(20, b"y"),
-            &[(2, 2, 'q')],
-            None,
+            &[(2, 2)],
             "u",
         ),
         hz(
@@ -173,16 +163,14 @@ pub fn runs() -> Vec<Run> {
                 .input(10, b"s")
                 .pty(20, true, false)
                 .input(30, b"t"),
-            &[(1, 1, 's')],
-            None,
+            &[(1, 1)],
             "u",
         ),
         hz(
             "ov-alt-screen",
             "Hazard 16: no predictions on the alternate screen.",
             Script::new().server(0, b"\x1b[?1049h").input(10, b"x"),
-            &[(1, 1, 'x')],
-            None,
+            &[(1, 1)],
             "u",
         ),
         hz(
@@ -195,8 +183,7 @@ pub fn runs() -> Vec<Run> {
                 .server(30, &[0xe3, 0x81])
                 .input(40, b"x")
                 .server(50, &[0x82]),
-            &[(5, 5, 'z')],
-            None,
+            &[(5, 5)],
             "u",
         ),
         hz(
@@ -208,8 +195,7 @@ pub fn runs() -> Vec<Run> {
                 .server(30, b"[B")
                 .server(40, b"\x1b[3")
                 .server(50, b"1m!"),
-            &[(5, 5, 'z')],
-            None,
+            &[(5, 5)],
             "u",
         ),
         hz(
@@ -220,8 +206,7 @@ pub fn runs() -> Vec<Run> {
                 .input(10, b"x")
                 .server(20, b"\x1b[?2026h\x1b[1;3Hq")
                 .server(30, b"\x1b[?2026l"),
-            &[(0, 2, 'a')],
-            Some((0, 3)),
+            &[(0, 2)],
             "u",
         ),
         hz(
@@ -231,8 +216,7 @@ pub fn runs() -> Vec<Run> {
                 .server(0, b"\x1b[3;3H\x1b7\x1b[1;1H")
                 .input(10, b"x")
                 .server(20, b"\x1b8X"),
-            &[(5, 5, 'z')],
-            None,
+            &[(5, 5)],
             "u",
         ),
         hz(
@@ -242,8 +226,7 @@ pub fn runs() -> Vec<Run> {
                 .server(0, b"\x1b[3;8r\x1b[8;1Hab")
                 .input(10, b"x")
                 .server(20, b"\r\n\r\ncd"),
-            &[(7, 2, 'z')],
-            Some((7, 3)),
+            &[(7, 2)],
             "u",
         ),
         hz(
@@ -253,8 +236,7 @@ pub fn runs() -> Vec<Run> {
                 .server(0, b"$ ")
                 .input(10, b"x")
                 .server(20, b"\x1b[H\x1b[2J$ "),
-            &[(0, 2, 'a')],
-            Some((0, 3)),
+            &[(0, 2)],
             "u",
         ),
         // Resizes, in the order a terminal does them: the terminal reflows first.
@@ -269,8 +251,7 @@ pub fn runs() -> Vec<Run> {
                 .input(10, b"x")
                 .resize(20, 30, 10)
                 .server(30, b" more"),
-            &[(1, 20, 'z')],
-            Some((1, 21)),
+            &[(1, 20)],
             "u",
         ),
         hz(
@@ -284,8 +265,7 @@ pub fn runs() -> Vec<Run> {
                 .input(10, b"x")
                 .resize(20, 70, 12)
                 .server(30, b" more"),
-            &[(1, 10, 'z')],
-            Some((1, 11)),
+            &[(1, 10)],
             "u",
         ),
     ];

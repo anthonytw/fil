@@ -13,7 +13,9 @@ publish = false
 
 [dependencies]
 fil-term = { path = "../../../crates/fil-term", default-features = false, features = ["alacritty"] }
-fil-predict = { path = "../../../crates/fil-predict" }
+# The replays use the prediction harness (oracle, sim), which is behind fil-predict's `testkit`
+# feature (not in the shipped library).
+fil-predict = { path = "../../../crates/fil-predict", features = ["testkit"] }
 serde_json = "1"
 unicode-width = "0.2"
 

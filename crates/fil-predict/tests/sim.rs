@@ -27,6 +27,14 @@ fn seeds() -> u64 {
     fil_testkit::scale::pick("FIL_PREDICT_SEEDS", 2, 200)
 }
 
+/// Seeds for the prior-ack side-by-side run, which covers every scenario, backend and predictor
+/// in one test and replays two drivers per event: about 100 per-scenario tests' worth of work per
+/// seed (4.6 CPU-s), so 200 seeds took over 40 minutes on a CI runner. 2, or 16 at full scale;
+/// `FIL_PREDICT_SEEDS` overrides it too.
+fn prior_ack_seeds() -> u64 {
+    fil_testkit::scale::pick("FIL_PREDICT_SEEDS", 2, 16)
+}
+
 /// Visible mispredictions by kind: `ended`, `contradicted`, the rest.
 fn kinds(m: &Mispredicted, keys: u64) -> String {
     let per = |n: u64| n as f64 * 1000.0 / keys.max(1) as f64;
@@ -284,7 +292,7 @@ fn the_prior_ack_rule_only_withholds_confirmations() {
     for sc in Scenario::ALL {
         for b in backends() {
             for hostile in [false, true] {
-                for seed in base()..base() + seeds() {
+                for seed in base()..base() + prior_ack_seeds() {
                     let mut cfg = SimConfig::new(sc, seed, b.name);
                     cfg.keys = 50;
                     if hostile {

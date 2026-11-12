@@ -81,8 +81,23 @@ async fn exchange<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, 
     let agent = Agent::new(format!("fil {}", env!("CARGO_PKG_VERSION")))
         .map_err(|e| MgmtError::Protocol(e.to_string()))?;
     let ours = Hello::ours(agent);
-    send(link, &ControlMsg::Hello(ours.clone())).await?;
-    send(link, &ControlMsg::Request(request)).await?;
+    // A peer may answer and hang up before both of these are in: a relay that refuses this
+    // fil's wire writes its `Hello` and `Error(VersionMismatch)` as soon as it has read our
+    // `Hello`, and exits. A send then fails because the link is down, but what arrived before
+    // the end is still readable, and it says why: read it, and report the link as lost only if
+    // nothing came (`recv` gives the same error once the queue is empty). Only the peer's own
+    // words count then (its `Hello`, an `Error`, a refusal): a request that never left cannot
+    // have an answer, so a `Response` in the queue is not one, and the link was lost.
+    let sent = async {
+        send(link, &ControlMsg::Hello(ours.clone())).await?;
+        send(link, &ControlMsg::Request(request)).await
+    }
+    .await;
+    let mut unsent = match sent {
+        Ok(()) => None,
+        Err(MgmtError::Lost(e)) => Some(e),
+        Err(e) => return Err(e),
+    };
     let mut parts: Vec<Response> = Vec::new();
     let mut rows = 0usize;
     loop {
@@ -93,6 +108,9 @@ async fn exchange<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, 
         match ControlMsg::decode(&payload).map_err(|e| MgmtError::Protocol(e.to_string()))? {
             ControlMsg::Hello(peer) => {
                 ours.check(&peer).map_err(MgmtError::Version)?;
+            }
+            ControlMsg::Response(_) if unsent.is_some() => {
+                return Err(MgmtError::Lost(unsent.take().expect("checked")));
             }
             ControlMsg::Response(Response::Ports { part, more }) => {
                 rows += part.rows.len();
@@ -584,6 +602,87 @@ mod tests {
             "{text}"
         );
         d.abort();
+    }
+
+    /// A real pipe link whose peer wrote `msgs` and ended the stream, already down (the end of
+    /// stream, not a local close) with them waiting in its inbound queue. The second value is the
+    /// peer's end, which must outlive the link's use.
+    async fn down_link_holding(
+        msgs: Vec<ControlMsg>,
+    ) -> (fil_transport::pipe::PipeLink, tokio::io::DuplexStream) {
+        use fil_transport::pipe::{PipeConfig, PipeLink};
+        use tokio::io::AsyncWriteExt;
+
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        let mut bytes = fil_proto::preamble::encode(fil_proto::limits::PROTOCOL_MAJOR);
+        bytes.extend(fil_proto::opening::frame_of(fil_proto::opening::PONG).unwrap());
+        for msg in msgs {
+            bytes.extend(fil_proto::opening::frame_of(&msg.encode().unwrap()).unwrap());
+        }
+        far.write_all(&bytes).await.unwrap();
+        // The peer's side of the stream ends; its end stays open for our writes (unread).
+        far.shutdown().await.unwrap();
+        let link = PipeLink::connect(near, PipeConfig::new(Default::default()))
+            .await
+            .unwrap();
+        let state = link
+            .status()
+            .wait_for(|s| matches!(s.state, fil_transport::LinkState::Down(_)))
+            .await
+            .unwrap()
+            .state
+            .clone();
+        assert!(
+            matches!(state, fil_transport::LinkState::Down(DownReason::Io(_))),
+            "{state:?}"
+        );
+        (link, far)
+    }
+
+    /// A relay of a newer wire answers with its `Hello` and `Error(VersionMismatch)` and exits,
+    /// and on a busy machine the pipe link can be down before this side's sends are in (the
+    /// client's task was off the CPU while the link's driver read the refusal and the end of the
+    /// stream). The refusal is still what the user hears, not "the connection was lost": a real
+    /// pipe link, down with the refusal waiting, before `ask` runs.
+    #[tokio::test]
+    async fn a_refusal_that_arrived_before_the_link_went_down_is_still_read() {
+        let hello = Hello::with_revision(
+            Agent::new("fil-relay newer").unwrap(),
+            fil_proto::version::wire_revision() + 1,
+        );
+        let (client, _far) = down_link_holding(vec![
+            ControlMsg::Hello(hello),
+            ControlMsg::Error(ErrorCode::VersionMismatch),
+        ])
+        .await;
+        let err = ask_one(&client, Request::ListSessions).await.unwrap_err();
+        assert!(matches!(err, MgmtError::Version(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("newer") && text.contains("upgrade this fil"),
+            "{text}"
+        );
+    }
+
+    /// The other side of reading what came before the end: when the request was never sent, a
+    /// `Response` waiting in the queue is not its answer (a peer that answered before it read
+    /// anything), so `fil kill` must not say it killed anything. The link was lost.
+    #[tokio::test]
+    async fn a_response_to_a_request_that_was_never_sent_is_not_an_answer() {
+        let (client, _far) = down_link_holding(vec![
+            ControlMsg::Hello(Hello::ours(Agent::new("test-daemon").unwrap())),
+            ControlMsg::Response(Response::Killed { unchecked: false }),
+        ])
+        .await;
+        let err = ask_one(
+            &client,
+            Request::KillSession {
+                name: SessionName::new("main").unwrap(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, MgmtError::Lost(_)), "{err}");
     }
 
     #[test]

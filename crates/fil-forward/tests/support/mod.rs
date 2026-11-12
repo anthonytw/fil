@@ -775,15 +775,19 @@ impl World {
     }
 }
 
-/// Polls `f` until it holds, failing after `limit`.
-pub async fn eventually(limit: Duration, f: impl Fn() -> bool) {
-    let deadline = tokio::time::Instant::now() + limit;
-    while !f() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "condition not met within {limit:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+/// Polls `f` until it holds, failing after `limit`. The failure names the caller's line.
+#[track_caller]
+pub fn eventually(limit: Duration, f: impl Fn() -> bool) -> impl Future<Output = ()> {
+    let at = std::panic::Location::caller();
+    async move {
+        let deadline = tokio::time::Instant::now() + limit;
+        while !f() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "condition at {at} not met within {limit:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 

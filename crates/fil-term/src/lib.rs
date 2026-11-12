@@ -10,6 +10,7 @@ mod boundary;
 pub mod compare;
 pub mod model;
 mod model_impls;
+pub mod osc_cap;
 pub mod snapshot;
 #[cfg(any(feature = "alacritty", feature = "vt100"))]
 mod sniff;
@@ -22,6 +23,7 @@ mod be_vt100;
 
 pub use boundary::Boundary;
 pub use model::{Size, TermState};
+pub use osc_cap::OscCap;
 pub use view::{CellView, Screen};
 
 /// Which parts of [`TermState`] a backend can report. The fidelity suite scores a field

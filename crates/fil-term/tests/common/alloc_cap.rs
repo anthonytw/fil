@@ -107,7 +107,14 @@ pub const CHILD_ENV: &str = "FIL_TEST_ALLOC_CAP_CHILD";
 /// `std::env::var(CHILD_ENV)` and returns at once when it is unset.
 pub fn run_child(test_name: &str, scenario: &str, limit: Duration) {
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        // `--include-ignored`: a test ignored by default still runs its child when asked for.
+        .args([
+            "--exact",
+            test_name,
+            "--nocapture",
+            "--test-threads=1",
+            "--include-ignored",
+        ])
         .env(CHILD_ENV, scenario)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -1166,8 +1166,13 @@ async fn wallclock_a_new_epoch_rechecks_the_queued_connections_at_once_body() {
     let mut w = World::new(Transport::Mem, cfg).await;
     let port = w.local_forward(1, hold.port);
     let a = connect(port).await;
+    // `a` holds the channel and its open is answered, so a `waiting` of 1 below is `b`.
     eventually(Duration::from_secs(5), || {
         w.client.ep.snapshot().channels == 1
+            && w.client
+                .ep
+                .stats(ForwardId(1))
+                .is_some_and(|s| s.waiting == 0)
     })
     .await;
     let mut b = connect(port).await;
@@ -1375,9 +1380,18 @@ async fn a_paused_listener_rekeys_without_rebinding_body() {
     let hold_port = w.local_forward(7, hold.port);
     let port = w.local_forward(1, echo.port);
     echo_once(port, 100, 1).await;
+    // The echo's channel is released first: until then it is the one channel, and when it
+    // goes, the holder and the next connection on forward 1 race for it.
+    eventually(Duration::from_secs(5), || {
+        w.client.ep.snapshot().channels == 0
+    })
+    .await;
     let held = connect(hold_port).await;
+    // `held`'s own channel, not just one channel: `connect` returns before the listener accepts,
+    // so a count of one could still be a channel that is about to go.
     eventually(Duration::from_secs(5), || {
         w.client.ep.snapshot().channels == 1
+            && w.client.ep.stats(ForwardId(7)).is_some_and(|s| s.open == 1)
     })
     .await;
     // Queued on forward 1 (no channel free).

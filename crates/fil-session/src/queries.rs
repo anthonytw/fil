@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use fil_term::OscCap;
 use vte::{Params, Parser, Perform};
 
 /// A terminal query this module answers.
@@ -178,6 +179,8 @@ impl Perform for QueryCollector {
 /// across reads is found once.
 pub struct QueryScanner {
     parser: Parser,
+    /// Bounds the OSC strings the parser buffers (`fil_term::osc_cap`).
+    cap: OscCap,
     st: QueryCollector,
 }
 
@@ -191,12 +194,13 @@ impl QueryScanner {
     pub fn new() -> Self {
         Self {
             parser: Parser::new(),
+            cap: OscCap::new(),
             st: QueryCollector::default(),
         }
     }
 
     pub fn scan(&mut self, bytes: &[u8]) -> Vec<Query> {
-        self.parser.advance(&mut self.st, bytes);
+        self.parser.advance(&mut self.st, &self.cap.filter(bytes));
         std::mem::take(&mut self.st.found)
     }
 }
@@ -252,6 +256,8 @@ impl Perform for ReplyCollector {
 /// Finds a terminal's answers in the input stream that comes back from the client.
 pub struct ReplyScanner {
     parser: Parser,
+    /// Bounds the OSC strings the parser buffers (`fil_term::osc_cap`).
+    cap: OscCap,
     st: ReplyCollector,
 }
 
@@ -265,12 +271,13 @@ impl ReplyScanner {
     pub fn new() -> Self {
         Self {
             parser: Parser::new(),
+            cap: OscCap::new(),
             st: ReplyCollector::default(),
         }
     }
 
     pub fn scan(&mut self, bytes: &[u8]) -> Vec<Reply> {
-        self.parser.advance(&mut self.st, bytes);
+        self.parser.advance(&mut self.st, &self.cap.filter(bytes));
         std::mem::take(&mut self.st.found)
     }
 }

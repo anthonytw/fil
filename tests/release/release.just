@@ -152,14 +152,14 @@ release-preflight version *args:
 # The one-command release (docs/m4/release.md section 9.5): binds the run to VERSION and HEAD, takes
 # the lock, works out from the world (git refs, GitHub's runs and releases, crates.io, the tap) which
 # of the seventeen steps are done, runs the preflight for the rest, unlocks the keys, then does every
-# step that is left: the mirror commit and the tag (after one typed confirmation); the dry run and
-# the suite=all checks, with a waiver of red checks asked at a terminal; the dry run's verification;
-# the tag's run and its draft; the verification, the macOS, package and SHA256SUMS signatures, the
-# upload and the verification after it; then (after the second confirmation) publish, the
-# verification of what is published, the crates-io deployment's approval, the Homebrew tap and its
-# install test; and finish (the AUR PKGBUILD, the coordinator's copy, the keys forgotten). Re-run it
-# after any failure; `--redo STEP` does a done step again. `--status` is read-only: each step's
-# state and the keys.
+# step that is left: the mirror (GitHub's main fast-forwarded to the release commit) and the tag
+# (after one typed confirmation); the dry run and the suite=all checks, with a waiver of red checks
+# asked at a terminal; the dry run's verification; the tag's run and its draft; the verification,
+# the macOS, package and SHA256SUMS signatures, the upload and the verification after it; then
+# (after the second confirmation) publish, the verification of what is published, the crates-io
+# deployment's approval, the Homebrew tap and its install test; and finish (the AUR PKGBUILD, the
+# coordinator's copy, the keys forgotten). Re-run it after any failure; `--redo STEP` does a done
+# step again. `--status` is read-only: each step's state and the keys.
 # See tests/release/release.sh.
 [positional-arguments]
 release version *args:

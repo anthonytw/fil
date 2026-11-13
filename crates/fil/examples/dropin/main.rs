@@ -755,7 +755,7 @@ fn main() {
                 End::Pass(notes) => {
                     // A finding in fil the scenario recorded and went past (docs/m2/dropin.md):
                     // the run marks it, and fails on it with --strict.
-                    let bugs = notes.iter().filter(|n| n.starts_with("KNOWN-BUG:")).count();
+                    let bugs = notes.iter().filter(|n| is_kind(n, "KNOWN-BUG:")).count();
                     let mark = if bugs > 0 { "PASS*" } else { "PASS" };
                     if bugs > 0 {
                         known.push(format!("{host} {name}"));
@@ -909,7 +909,7 @@ fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_
             // A miss in what a done-when or a security property requires (forward.rs): every one
             // the scenario collected fails it, all listed. Only a named finding (KNOWN-BUG:,
             // which says what fixes it) passes as PASS*.
-            let misses: Vec<&String> = notes.iter().filter(|n| n.starts_with("MISS:")).collect();
+            let misses: Vec<&String> = notes.iter().filter(|n| is_kind(n, "MISS:")).collect();
             if !misses.is_empty() {
                 return End::Fail(format!(
                     "{} miss(es): {}\n{}",
@@ -934,8 +934,7 @@ fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_
                     "XPASS: `{name}` is a known failure but it passed; if the bug is fixed, remove it from XFAIL (and from the findings); if it is luck, run it again"
                 ));
             }
-            let missing: Vec<&String> =
-                notes.iter().filter(|n| n.starts_with("MISSING:")).collect();
+            let missing: Vec<&String> = notes.iter().filter(|n| is_kind(n, "MISSING:")).collect();
             if !missing.is_empty() && !allow_missing {
                 return End::Fail(format!(
                     "a required tool is missing (`--allow-missing` to accept): {}",
@@ -946,8 +945,10 @@ fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_
                         .join("; ")
                 ));
             }
-            if notes.first().is_some_and(|n| n.starts_with("SKIP:")) {
+            if notes.first().is_some_and(|n| n.starts_with("SKIP:")) || all_variants_skipped(&notes)
+            {
                 // Not applicable here (e.g. needs ssh as the transport): only expected locally.
+                // A scenario whose every variant skipped ran nothing either, so it is a skip, not a pass.
                 if local || allow_skip {
                     return End::Skip(notes);
                 }
@@ -966,9 +967,76 @@ fn classify(name: &str, r: common::Res, local: bool, allow_missing: bool, allow_
     }
 }
 
+/// Whether a note is of a kind (`MISS:`, `MISSING:`, `KNOWN-BUG:`, `SKIP:`), with or without the
+/// variant tags a scenario puts in front of it (`auto: `, `pipe: `, `cable30s: `, ...; a tag is
+/// one word of letters, digits, `_` and `-`): `auto: MISS: ...` is a miss like `MISS: ...`.
+fn is_kind(n: &str, kind: &str) -> bool {
+    let mut rest = n;
+    loop {
+        if rest.starts_with(kind) {
+            return true;
+        }
+        match rest.split_once(": ") {
+            Some((tag, tail))
+                if !tag.is_empty()
+                    && tag
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+            {
+                rest = tail
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether every note is a skip (`auto: SKIP: ...`): the scenario ran its variants and none of
+/// them applied here.
+fn all_variants_skipped(notes: &[String]) -> bool {
+    !notes.is_empty() && notes.iter().all(|n| is_kind(n, "SKIP:"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_expected_failure as exp;
+    use super::{End, all_variants_skipped, classify};
+
+    #[test]
+    fn a_scenario_whose_every_variant_skipped_is_a_skip() {
+        let v = |s: &[&str]| s.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(all_variants_skipped(&v(&[
+            "auto: SKIP: needs the relay to a real host",
+            "pipe: SKIP: needs the relay to a real host",
+        ])));
+        assert!(all_variants_skipped(&v(&[
+            "pipe: cable30s: SKIP: no relay"
+        ])));
+        // One variant ran: a pass with a skipped variant noted.
+        assert!(!all_variants_skipped(&v(&[
+            "auto: SKIP: needs the relay",
+            "pipe: 200 MB each way, intact",
+        ])));
+        // A plain note, or one that only mentions a skip, is not a skip.
+        assert!(!all_variants_skipped(&v(&[
+            "sudo not run (FIL_DROPIN_SUDO=1 runs it: one failed attempt)"
+        ])));
+        assert!(!all_variants_skipped(&v(&[
+            "read -s, typed: SKIP: is not a prefix here"
+        ])));
+        assert!(!all_variants_skipped(&[]));
+    }
+
+    #[test]
+    fn a_variant_s_miss_fails_the_scenario() {
+        let notes = vec![
+            "auto: 200 MB each way, intact".to_string(),
+            "pipe: MISS: the -L stream differs after the cable pull".to_string(),
+        ];
+        assert!(matches!(
+            classify("fwd_cable_pull", Ok(notes), false, false, false),
+            End::Fail(_)
+        ));
+    }
     use super::ls_row_of;
 
     #[test]

@@ -214,6 +214,9 @@ pub fn git_tools(ctx: &Ctx, host: &str) -> Res {
     if !c.have("less")? {
         return missing("less is not installed (git's pager)");
     }
+    // git's messages are matched below, so they must be English whatever the machine's locale
+    // (an es_MX Mac translated "On branch").
+    c.run("export LC_ALL=C LANGUAGE=", CMD_TIMEOUT)?;
     c.run(
         "git init -q repo && cd repo && git config user.name dropin && git config user.email dropin@example.invalid && git config commit.gpgsign false",
         CMD_TIMEOUT,

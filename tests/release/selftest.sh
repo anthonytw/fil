@@ -283,9 +283,7 @@ echo "== CODEOWNERS"
 for path in /Cargo.toml /deny.toml /about.toml /about.hbs /.cargo/ /.gitattributes '/packaging/**' /flake.nix /flake.lock '/docs/man/**' /.github/CODEOWNERS /.github/macos-team-id /.github/package-signing-key.asc /.github/release-signers '/.github/workflows/**' '/tests/release/**' /Cross.toml /rust-toolchain.toml /rust-toolchain; do
   expect_pass "CODEOWNERS lists $path" grep -qxF "$path @anthonytw" "$REPO_ROOT/.github/CODEOWNERS"
 done
-for path in /justfile; do
-  expect_fail "CODEOWNERS does not list $path" grep -q "^$path" "$REPO_ROOT/.github/CODEOWNERS"
-done
+expect_fail "CODEOWNERS does not list /justfile" grep -q "^/justfile" "$REPO_ROOT/.github/CODEOWNERS"
 # codeowners_owner FILE PATH...: each PATH's owners under FILE (GitHub's rule: the last matching
 # pattern wins, and a pattern with no owners leaves the path unowned), as "PATH OWNERS" or "PATH -".
 # It knows the three pattern forms the file uses (/exact, /dir/, /dir/**) and refuses any other.
@@ -793,7 +791,7 @@ rm -f "\$d"/.signed-locally
 exit 0
 EOF2
 chmod +x "$st/gh-copy"
-rvc() { env FIL_GH="$st/gh-copy" FIL_RELEASE_REPO_URL="$tmp/origin" "$RELEASE_DIR/verify.sh" 0.9.0 --no-rebuild --work "$kw" "$@"; }
+rvc() { env FIL_GH="$st/gh-copy" FIL_RELEASE_REPO_URL="$tmp/origin" "$RELEASE_DIR/verify.sh" 0.9.0 --no-rebuild --work "$kw"; }
 rm -rf "$kw"; mkdir -p "$kw"; cp -R "$rel" "$kw/files"
 rvc > "$tmp/out.log" 2>&1 || true
 grep -q 'identical to the download' "$tmp/out.log" && ! ls "$kw"/files.signed-* > /dev/null 2>&1 \

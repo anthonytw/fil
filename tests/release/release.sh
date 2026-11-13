@@ -632,6 +632,8 @@ main_trust() {
 # but not as main_trust wants it: refused) when not done. With a good tag, G is the commit it names
 # (R, or a legacy mirror commit with R's tree); otherwise G is R.
 MIRROR=''
+# MIRROR names why the step is not done, for a reader of the trace; nothing branches on it.
+# shellcheck disable=SC2034
 det_mirror() {
   MIRROR=''
   if [ "$TAG_OK" = 1 ]; then
@@ -983,7 +985,7 @@ tap_formula_state() {
       c=$((c + 1))
       grep -qxF "$h  $n" "$DRAFT_SUMS" || bad=1
     done < <(tail -n +2 "$scratch/tap-formula")
-    if [ "$c" = 3 ] && [ "$bad" = 0 ]; then TAP_STATE=done; else TAP_STATE=other; fi
+    if [ "$c" = 3 ] && [ "$bad" = 0 ]; then TAP_STATE='done'; else TAP_STATE='other'; fi
     return 0
   fi
   rc=0

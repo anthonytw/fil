@@ -28,7 +28,11 @@ const PS: u16 = 18100;
 
 /// Ports on this machine: the `-L` listener, the `-R` target, the SOCKS listener (and the next few,
 /// for the management scenarios). Picked from the driver's pid so that two drivers (one per host)
-/// and other users of this machine do not collide, and below macOS's ephemeral range (49152 up).
+/// and other users of this machine do not collide, and below the ephemeral ranges of both macOS
+/// (49152 up) and Linux (32768 up by default). A port in the ephemeral range can be the local port
+/// of an outgoing connection of an earlier scenario (the quick set makes hundreds on loopback), and
+/// on Linux one of those in TIME_WAIT makes the listener's bind fail with `AddrInUse` for a minute,
+/// `SO_REUSEADDR` or not: the forward never listens and its scenario sees connection refused.
 pub struct MacPorts {
     pub l: u16,
     pub r: u16,
@@ -36,7 +40,7 @@ pub struct MacPorts {
 }
 
 pub fn mac_ports() -> MacPorts {
-    let base = 30000 + (std::process::id() % 1500) as u16 * 10; // at most 44,999
+    let base = 20000 + (std::process::id() % 1000) as u16 * 10; // at most 29,999
     MacPorts {
         l: base,
         r: base + 1,

@@ -4,7 +4,11 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
-This changes the wire (`wire 1.15` in `fil --version`), so it comes in 0.3.0: the client and the host need the same release.
+## [0.3.0] - 2026-11-14
+
+Ask before taking over a session, and predictive echo that recovers after an interruption.
+
+0.3.0 changes the wire (`wire 1.15` in `fil --version`; 0.1.0 and 0.2.0 are `wire 1.14`), so install it on your machine and on each host: a 0.3.0 client does not talk to a 0.2.0 daemon. Daemons of different wires run side by side, so nothing breaks: your 0.2.0 sessions stay on the old daemon until they end (the 0.3.0 `fil` does not list or reach them; the 0.2.0 `fil` still does), and a 0.3.0 client starts its own. The guide's "Upgrading" section has the details.
 
 ### Added
 
@@ -78,6 +82,7 @@ The first release: an ssh/et drop-in. It has no predictive echo and no `predict`
 
 Before 0.1.0 fil was developed in milestones M0 to M4, and that history is archived (the repository starts again from one initial commit). M0 proved the risky parts (terminal restore fidelity, the emulator and the transports), M1 built the client, the daemon and both transports, M2 the port forwards, `fil ports` and the agent relay, and M3 the predictive echo that is held for 0.2.0. M4 prepared the release: installing over ssh, configuration, this documentation, packaging and the license. The pull request numbers in the repository's documents and comments refer to that history.
 
-[Unreleased]: https://github.com/anthonytw/fil/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/anthonytw/fil/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/anthonytw/fil/releases/tag/v0.3.0
 [0.2.0]: https://github.com/anthonytw/fil/releases/tag/v0.2.0
 [0.1.0]: https://github.com/anthonytw/fil/releases/tag/v0.1.0

@@ -191,10 +191,16 @@ pf_git() { git -C "$ROOT" "$@"; }
 # is evil.com), the rest of the authority must be exactly github.com (or github.com:PORT with the
 # scheme's port: https://evil.com:github.com/O/R is no match), an authority with more than one '@' is
 # refused (ssh://a@evil@github.com/O/R), and a bare github.com/O/R (a local path to git) is no URL.
+# Only ASCII letters, digits and . @ : _ + / - are allowed at all (no space, no '=' of an option-like
+# userinfo, no byte outside ASCII), and the case is folded in the C locale: under a UTF-8 locale tr
+# folds U+0130 to ASCII i, which would make https://g\u0130thub.com/O/R (IDNA: another domain) match.
 pf_url_is_repo() {
   local u want rest auth host path
-  u=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-  want=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+  local ok='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.@:_+/-'
+  case $1 in '' | *[!"$ok"]*) return 1 ;; esac
+  case $2 in '' | *[!"$ok"]*) return 1 ;; esac
+  u=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+  want=$(printf '%s' "$2" | LC_ALL=C tr '[:upper:]' '[:lower:]')
   case $u in
     ssh://* | git+ssh://* | https://*)
       rest=${u#*://}
@@ -236,9 +242,14 @@ pf_real_url_ok() {
 # url and pushes to all of them, or to the pushurls), the URLs git fetches from are exactly the ones
 # it pushes to after any rewriting (git remote get-url --all and --push --all: catches a
 # url.*.pushInsteadOf), and every one of those rewritten URLs is GitHub's too (pf_real_url_ok:
-# catches a url.*.insteadOf, which rewrites fetch and push alike, pointing anywhere else).
+# catches a url.*.insteadOf, which rewrites fetch and push alike, pointing anywhere else). A remote
+# with remote.NAME.vcs (git runs the helper git-remote-VCS from PATH, whatever get-url shows), or
+# with its own uploadpack or receivepack, is not taken either.
 pf_remote_is_repo() {
-  local n=$1 u any=0 fetch push
+  local n=$1 u any=0 fetch push k
+  for k in vcs uploadpack receivepack; do
+    [ -z "$(pf_git config --get-all "remote.$n.$k" 2> /dev/null || true)" ] || return 1
+  done
   while IFS= read -r u; do
     any=1
     pf_url_is_repo "$u" "$PF_REPO" || return 1

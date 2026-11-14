@@ -2134,10 +2134,12 @@ pfgh_is "the GitHub remote is the one whose URL is github.com's OWNER/REPO (gith
 pg remote rename github neutral
 pfgh_is "...found by its URL whatever its name" neutral
 pg remote rename neutral github
-pfx env FIL_RELEASE_ROOT="$pf/clone" bash -c 'source "$1"; bad=""
+pf_utf8=$(locale -a 2> /dev/null | grep -i -m 1 -E '^(c|en_us|es_mx)\.utf-?8$' || true)
+[ -n "$pf_utf8" ] || pf_utf8=en_US.UTF-8
+pfx env FIL_RELEASE_ROOT="$pf/clone" LC_ALL="$pf_utf8" bash -c 'source "$1"; bad=""
 for u in git@github.com:o/r.git git@github.com:o/r ssh://git@github.com/o/r.git ssh://git@github.com:22/o/r git+ssh://git@github.com/o/r https://github.com/o/r.git https://github.com:443/o/r https://github.com/O/R/ https://user@github.com/o/r https://user:x@github.com/o/r git@GitHub.com:o/r.git github.com:o/r; do pf_url_is_repo "$u" o/r || bad="$bad +$u"; done
-for u in git@github.com:o/rr.git git@github.com:x/o/r.git git@github.com:o/r.git.evil git@gitlab.com:o/r.git git@git-ssh.example:o/r.git https://github.com.evil/o/r https://evil.com/@github.com/o/r https://github.com@evil.com/o/r https://github.com:22/o/r ssh://git@github.com:443/o/r https://evil.com:github.com/o/r ssh://evil.com:github.com/o/r https://x:github.com:443/o/r ssh://evil@github.com@x/o/r ssh://x@evil@github.com/o/r https://a@b@github.com/o/r a@evil@github.com:o/r ftp://github.com/o/r github.com/o/r ./github.com:o/r a/b:github.com:o/r git@github.com:/o/r https://github.com "$2/github.git" ""; do ! pf_url_is_repo "$u" o/r || bad="$bad -$u"; done
-[ -z "$bad" ] || { echo "wrong:$bad" >&2; exit 1; }' sh "$PF" "$pf" > "$tmp/out.log" 2>&1 && pass "preflight: pf_url_is_repo knows github.com's URL forms, and nothing else (the host parsed and compared whole: no evil.com/@github.com, no evil.com:github.com, no second @, no bare github.com/O/R)" || { flunk "preflight: pf_url_is_repo knows github.com's URL forms, and nothing else"; sed 's/^/       | /' "$tmp/out.log"; }
+for u in git@github.com:o/rr.git git@github.com:x/o/r.git git@github.com:o/r.git.evil git@gitlab.com:o/r.git git@git-ssh.example:o/r.git https://github.com.evil/o/r https://evil.com/@github.com/o/r https://github.com@evil.com/o/r https://github.com:22/o/r ssh://git@github.com:443/o/r https://evil.com:github.com/o/r ssh://evil.com:github.com/o/r https://x:github.com:443/o/r ssh://evil@github.com@x/o/r ssh://x@evil@github.com/o/r https://a@b@github.com/o/r a@evil@github.com:o/r "-oProxyCommand=x@github.com:o/r" "ssh://-oProxyCommand=evil@github.com/o/r" " git@github.com:o/r" "$(printf "x\\ngit@github.com:o/r")" "$(printf "https://g\\304\\260thub.com/o/r")" "$(printf "git@g\\304\\260thub.com:o/r")" "$(printf "https://github.com/o/\\304\\260")" ftp://github.com/o/r github.com/o/r ./github.com:o/r a/b:github.com:o/r git@github.com:/o/r https://github.com "$2/github.git" ""; do ! pf_url_is_repo "$u" o/r || bad="$bad -$u"; done
+[ -z "$bad" ] || { echo "wrong:$bad" >&2; exit 1; }' sh "$PF" "$pf" > "$tmp/out.log" 2>&1 && pass "preflight: pf_url_is_repo knows github.com's URL forms, and nothing else (the host parsed and compared whole: no evil.com/@github.com, no evil.com:github.com, no second @, no U+0130 folded to i under UTF-8, no byte outside the URL alphabet, no bare github.com/O/R)" || { flunk "preflight: pf_url_is_repo knows github.com's URL forms, and nothing else"; sed 's/^/       | /' "$tmp/out.log"; }
 # a remote counts only when every url and pushurl is GitHub's and git fetches from exactly where it
 # pushes: a second url (git fetches from the first, pushes to all), a pushurl, a pushInsteadOf
 pg remote set-url --add github "$pf/origin.git"
@@ -2173,6 +2175,14 @@ if [ -z "$(cat "$tmp/out.log")" ]; then pass "preflight: ...the self-test's own 
 pfx env FIL_RELEASE_SELFTEST= bash -c 'source "$1" && PF_REPO=o/r && pf_init 0.9.0 && printf "%s\n" "$PF_GITHUB"' sh "$PF" > "$tmp/out.log" 2> /dev/null || true
 if [ -z "$(cat "$tmp/out.log")" ]; then pass "preflight: ...and never outside the self-test"; else flunk "preflight: ...and never outside the self-test (picked '$(cat "$tmp/out.log")')"; fi
 pfgh_is "...back to the stand-in's rewrite: found again" github
+# git runs git-remote-VCS for a remote with remote.NAME.vcs, whatever get-url prints; uploadpack and
+# receivepack have no use here either
+for k in vcs uploadpack receivepack; do
+  pg config "remote.github.$k" x
+  pfgh_is "a remote with remote.NAME.$k set: not GitHub's" ""
+  pg config --unset "remote.github.$k"
+done
+pfgh_is "...without them: found again" github
 # an explicit --github is held to the same rule, in the self-test too (only the stand-in's rewrite is
 # the self-test's own)
 pfx env FIL_RELEASE_SELFTEST= bash -c 'source "$1" && PF_REPO=o/r && PF_GITHUB=origin && pf_init 0.9.0 && PF_CUR=tree && pf_need_github' sh "$PF" > "$tmp/out.log" 2>&1 && st=0 || st=$?
@@ -2828,12 +2838,18 @@ expect_pass "release: ...saying so" grep -q "^release: --github nosuch: the clon
 expect_fail "release: --github names Gitea's remote: refused" rlg origin
 last
 expect_pass "release: ...saying it is not github.com's repo" grep -q "^release: --github origin: that remote is not github.com's o/r alone" "$rs/last.log"
-expect_pass "release: ...before any step (no state written)" test ! -e "$RSTATE"
+expect_fail "release: ...a real run with it is refused too" rl -- --github origin
+last
+expect_pass "release: ...with the same message, before any state is written" sh -c 'grep -q "^release: --github origin: that remote is not github.com.s o/r alone" "$1" && test ! -e "$2"' sh "$rs/last.log" "$RSTATE"
 pg config --rename-section "url.$pf/github.git" "url.$pf/origin.git"
 expect_fail "release: --github names a GitHub URL an insteadOf sends to Gitea: refused" rlg github
+last
+expect_pass "release: ...saying it is not github.com's repo" grep -q "^release: --github github: that remote is not github.com's o/r alone" "$rs/last.log"
 pg config --rename-section "url.$pf/origin.git" "url.$pf/github.git"
 pg remote set-url github https://evil.com:github.com/o/r
 expect_fail "release: --github names a remote whose URL's host only looks like github.com: refused" rlg github
+last
+expect_pass "release: ...saying it is not github.com's repo" grep -q "^release: --github github: that remote is not github.com's o/r alone" "$rs/last.log"
 pg remote set-url github git@github.com:o/r.git
 expect_pass "release: ...--github naming GitHub's remote is accepted" rlg github
 

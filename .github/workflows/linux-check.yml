@@ -103,6 +103,9 @@ jobs:
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: just@1.59.0
+      - name: Lint the release scripts (as release.yml does, so a warning shows up before a release)
+        # --norc: no .shellcheckrc of the tree turns a check off; ubuntu-24.04's shellcheck is release.yml's
+        run: shellcheck --norc -x -S warning tests/release/*.sh
       - name: The release scripts' own tests
         run: tests/release/just.sh release-test
 

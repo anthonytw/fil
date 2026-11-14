@@ -1983,10 +1983,27 @@ cat > "$pf/bin/df" << 'EOF2'
 #!/bin/sh
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/disk1 100 1 %s 1%% /\n' "${FAKE_KIB:-104857600}"
 EOF2
+# cargo: FAKE_CARGO_CACHE names a file that stands for a fetched cache (absent: nothing is fetched,
+# and an offline fetch or metadata fails as real cargo's does); an online fetch makes it, unless
+# FAKE_NO_NET; FAKE_CARGO_LOG logs the calls
 cat > "$pf/bin/cargo" << 'EOF2'
 #!/bin/sh
 [ "$1" = --version ] && { echo "cargo stub"; exit 0; }
-case "$*" in *"${FAKE_STALE_LOCK:-none}"*) echo "error: the lock file needs to be updated but --locked was passed" >&2; exit 101 ;; esac
+[ -z "${FAKE_CARGO_LOG:-}" ] || echo "$*" >> "$FAKE_CARGO_LOG"
+# a stale lock: cargo 1.99's words (the pinned toolchain), or the older ones with FAKE_CARGO_OLD_MSG
+case "$*" in *"${FAKE_STALE_LOCK:-none}"*)
+  if [ -n "${FAKE_CARGO_OLD_MSG:-}" ]; then echo "error: the lock file needs to be updated but --locked was passed" >&2
+  else echo "error: cannot update the lock file $PWD/Cargo.lock because --locked was passed to prevent this" >&2; fi
+  exit 101 ;;
+esac
+c=${FAKE_CARGO_CACHE:-}
+case " $* " in
+  *" fetch "*" --offline "* | *" metadata "*)
+    [ -z "$c" ] || [ -e "$c" ] || { echo "error: no matching package named \`bytes\` found" >&2; exit 101; } ;;
+  *" fetch "*)
+    [ -z "${FAKE_NO_NET:-}" ] || { printf 'error: failed to download from `https://index.crates.io/by/te/bytes`\n\nCaused by:\n  [6] Could not resolve hostname\n' >&2; exit 101; }
+    [ -z "$c" ] || : > "$c" ;;
+esac
 EOF2
 cat > "$pf/bin/curl" << 'EOF2'
 #!/bin/sh
@@ -2082,7 +2099,23 @@ pg remote set-url origin "$pf/origin.git"
 pf_class "--commit binds the run to another commit" "the release commit this run is bound to" sh -c 'exec "$1" 0.9.0 --repo o/r --commit 0123456789012345678901234567890123456789' sh "$PF"
 pf_class "the wrong version" "Cargo.toml's version is '0.9.0', not 0.9.1" sh -c 'exec "$1" 0.9.1 --repo o/r --only version' sh "$PF"
 pf_class "...and no changelog section for it" "CHANGELOG.md has no section for 0.9.1" sh -c 'exec "$1" 0.9.1 --repo o/r --only version' sh "$PF"
-pf_class "a stale exporter lock" "catches: stale exporter lock" FAKE_STALE_LOCK=exporter
+pf_class "a stale exporter lock (cargo 1.99's words)" "catches: stale exporter lock" FAKE_STALE_LOCK=exporter
+cp "$tmp/out.log" "$pf/stale.log"
+expect_pass "preflight: ...not read as the network, with set-version's fix" sh -c '! grep -q "the network or the registry" "$1" && grep -q "cannot update the lock file" "$1" && grep -q "just set-version 0.9.0" "$1"' sh "$pf/stale.log"
+pf_class "a stale exporter lock (older cargo's words)" "catches: stale exporter lock" FAKE_STALE_LOCK=exporter FAKE_CARGO_OLD_MSG=1
+cp "$tmp/out.log" "$pf/stale.log"
+expect_pass "preflight: ...not read as the network either" sh -c '! grep -q "the network or the registry" "$1" && grep -q "needs to be updated" "$1"' sh "$pf/stale.log"
+# an unfetched cargo cache is fetched first (cargo fetch --locked), not blamed on the lockfile
+rm -f "$pf/cargo-cache" "$pf/cargo.log"
+expect_pass "preflight: an unfetched cargo cache is fetched, and the lockfiles pass" pfx FAKE_CARGO_CACHE="$pf/cargo-cache" FAKE_CARGO_LOG="$pf/cargo.log" "$PF" 0.9.0 --repo o/r --only lockfiles
+expect_pass "preflight: ...with cargo fetch --locked (the stub's one cache then has the exporter's too)" sh -c 'grep -qx "fetch --locked --manifest-path Cargo.toml" "$1" && grep -qx "fetch --locked --offline --manifest-path tests/terminals/exporter/Cargo.toml" "$1"' sh "$pf/cargo.log"
+: > "$pf/cargo.log"
+expect_pass "preflight: a fetched cache passes again" pfx FAKE_CARGO_CACHE="$pf/cargo-cache" FAKE_CARGO_LOG="$pf/cargo.log" FAKE_NO_NET=1 "$PF" 0.9.0 --repo o/r --only lockfiles
+expect_pass "preflight: ...with offline fetches only (no network)" sh -c 'grep -q "^fetch " "$1" && ! grep "^fetch " "$1" | grep -qv -- --offline' sh "$pf/cargo.log"
+rm -f "$pf/cargo-cache"
+pf_class "an unfetched cache with no network: the fetch fails, saying it is the network" "that is the network or the registry, not the lockfile" FAKE_CARGO_CACHE="$pf/cargo-cache" FAKE_NO_NET=1
+cp "$tmp/out.log" "$pf/nonet.log"
+expect_pass "preflight: ...and not blaming the lockfile" sh -c '! grep -q "catches: stale exporter lock" "$1" && grep -q "failed to download" "$1"' sh "$pf/nonet.log"
 pf_class "gh logged in as someone else" "gh is logged in as 'other'" FAKE_GH_USER=other
 pf_class "gh without admin" "no admin rights" FAKE_ADMIN=false
 pf_class "ssh to GitHub as someone else" "did not say 'Hi anthonytw'" FAKE_SSH_USER=other
@@ -2310,6 +2343,14 @@ elif a[:2] == ["workflow", "run"]:
     open(nf, "w").write(str(nid + 1))
     json.dump(dict(id=nid, workflow=wf, name=wf[:-4], event="workflow_dispatch", branch="main", head=head, status="queued", conclusion="",
                    jobs=[], suite=fields.get("suite", ""), attempt=1), open(os.path.join(w, "runs", "%d.json" % nid), "w"))
+    if os.environ.get("FAKE_ORIGIN_MOVE") and not os.path.exists(os.path.join(w, "origin-moved")):
+        # two merges to Gitea's main while the run waits (once; the same tree, so at the version)
+        o = ["git", "--git-dir", os.environ["FAKE_ORIGIN_GIT"]]
+        c = subprocess.check_output(o + ["rev-parse", "refs/heads/main"]).decode().strip()
+        for m in ("merged meanwhile", "merged meanwhile, again"):
+            c = subprocess.check_output(o + ["commit-tree", c + "^{tree}", "-p", c, "-m", m]).decode().strip()
+        subprocess.check_call(o + ["update-ref", "refs/heads/main", c])
+        open(os.path.join(w, "origin-moved"), "w").write(c)
     if os.environ.get("FAKE_DISPATCH_MOVE"):
         # GitHub's main moves on past the commit just dispatched (another writer, in that moment)
         g = ["git", "--git-dir", os.environ["FAKE_GITHUB_GIT"]]
@@ -2607,7 +2648,7 @@ chmod +x "$rs/verify" "$rs/sign-macos" "$rs/sign-packages" "$rs/keys"
 RL_SOCK=$rs/none.sock
 rlx() {
   pfx env FIL_GH="$rs/gh" FIL_GPG="$rs/gpg" FIL_CARGO="$rs/cargo" FIL_CRATES_CURL="$rs/curl" FAKE_WORLD="$rs/world" FAKE_PF_GH="$pf/bin/gh" \
-    FIL_RELEASE_VERIFY="$rs/verify" FAKE_CALLS="$rs/calls.log" FAKE_GITHUB_GIT="$pf/github.git" \
+    FIL_RELEASE_VERIFY="$rs/verify" FAKE_CALLS="$rs/calls.log" FAKE_GITHUB_GIT="$pf/github.git" FAKE_ORIGIN_GIT="$pf/origin.git" \
     FIL_SIGN_MACOS="$rs/sign-macos" FIL_SIGN_PACKAGES="$rs/sign-packages" FIL_RELEASE_KEYS="$rs/keys" FIL_RELEASE_POLL=0 \
     FAKE_RW="$RW" FAKE_RELEASE_FILES="$rs/files0" FAKE_RELEASE_DIR="$RELEASE_DIR" FAKE_KEYS_LOCKED="$rs/keys-locked" \
     FIL_BREW="$rs/brew-stub" FAKE_BREW_PREFIX="$rs/brewprefix" FIL_RELEASE_SHARED="$rs/shared/fil-0.9.0" \
@@ -2681,9 +2722,9 @@ expect_pass "release run: ...and the lock is gone" test ! -e "$RW/.lock"
 # binding
 cp "$RSTATE" "$rs/state.saved"
 sed "s/^release_commit=.*/release_commit=0123456789012345678901234567890123456789/" "$rs/state.saved" > "$RSTATE"
-expect_fail "release run: a state bound to another commit is refused" rl
-last
-expect_pass "release run: ...saying there is no tag yet and --reset-state rebinds" sh -c 'grep -q "no v0.9.0 on GitHub yet" "$1" && grep -q -- "--reset-state (it rebinds)" "$1"' sh "$rs/last.log"
+rl_paused 2 mirror
+expect_pass "release run: ...a state bound to another commit, with no tag yet, is rebound by itself, saying so" sh -c 'grep -q "there is no v0.9.0 yet (in the clone or on github): the state is rebound to" "$1" && grep -qx "release_commit=$2" "$3"' sh "$rs/run.out" "$RR" "$RSTATE"
+sed "s/^release_commit=.*/release_commit=0123456789012345678901234567890123456789/" "$rs/state.saved" > "$RSTATE"
 rl_paused 2 mirror -- --reset-state
 expect_pass "release run: ...--reset-state before the tag rebinds" grep -qx "release_commit=$RR" "$RSTATE"
 # the lock
@@ -2827,6 +2868,9 @@ ra_reset
 ra_expect "release actions: no terminal at the confirmation: paused, exit 2" 2 'PAUSED at step 2/17 mirror' FIL_RELEASE_TTY= < /dev/null
 calls_are 0 0 0 0
 ra_expect "release actions: a declined confirmation: paused, exit 2" 2 'not confirmed: nothing was done' <<< "yes"
+expect_pass "release actions: ...saying what it received, quoted" grep -q "nothing was done (received 'yes', not 0.9.0)" "$rs/ra.out"
+ra_expect "release actions: an answer with a control character: paused, the character shown" 2 "received [$]'0[.]9[.]0[\\]E\\[A', not 0[.]9[.]0" <<< $'0.9.0\e[A'
+ra_expect "release actions: no answer at all: paused, saying it received an empty line" 2 'received an empty line, not 0[.]9[.]0' < /dev/null
 expect_pass "release actions: ...the confirmation shows what becomes public, mirror and tag" sh -c 'grep -q "CONFIRM tag, for 0.9.0" "$1" && grep -q "step 2 mirror: GitHub.s main fast-forwarded from .* to the release commit" "$1" && grep -q "step 5 tag (this answer covers it too)" "$1"' sh "$rs/ra.out"
 calls_are 0 0 0 0
 ra_expect "release actions: --confirm-each asks for the mirror on its own" 2 'CONFIRM mirror, for 0.9.0' -- --confirm-each <<< ""
@@ -2841,7 +2885,7 @@ expect_pass "release actions: ...with the known fix for a ruleset refusal" grep 
 expect_pass "release actions: ...and the log's tail and path" sh -c 'grep -q "GH006" "$1" && grep -q "logs/02-mirror.log" "$1"' sh "$rs/ra.out"
 calls_are 0 0 0 0
 rm -f "$rs/reject-push"
-ra_expect "release actions: ...the same command again goes on to step 5 (run ids found by listing)" 2 'PAUSED at step 5/17 tag' FAKE_NO_RUN_URL=1 -- --confirm-each <<< "0.9.0"
+ra_expect "release actions: ...the same command again goes on to step 5 (run ids found by listing; the answer's white space ignored)" 2 'PAUSED at step 5/17 tag' FAKE_NO_RUN_URL=1 -- --confirm-each <<< $'  0.9.0 \r'
 calls_are 1 3 0 1
 expect_pass "release actions: ...and recorded the runs it found by listing" sh -c 'grep -qx dry_run=101 "$1" && grep -qx checks_linux=102 "$1" && grep -qx checks_macos=103 "$1"' sh "$RSTATE"
 
@@ -2875,12 +2919,147 @@ ra_expect "release actions: ...the VM down fails at step 4 too" 1 'do: +limactl 
 calls_are 1 3 0 2
 ra_expect "release actions: ...the same command again: on to step 5" 2 'PAUSED at step 5/17 tag' < /dev/null
 calls_are 1 3 0 3
-# a state bound to another commit, mid-way: refused, nothing done
+# a state bound to another commit, mid-way: rebound by itself while there is no v0.9.0 and HEAD is
+# Gitea's main (as --reset-state); the runs are found again by listing, the dry run verified again
 cp "$RSTATE" "$rs/state.mid"
 sed "s/^release_commit=.*/release_commit=0123456789012345678901234567890123456789/" "$rs/state.mid" > "$RSTATE"
-ra_expect "release actions: a state bound to another commit is refused mid-way" 1 'the state is for 0.9.0 at 012345678901' < /dev/null
-calls_are 1 3 0 3
+ra_expect "release actions: a state bound to another commit, no tag yet: rebound to HEAD" 2 'PAUSED at step 5/17 tag' < /dev/null
+expect_pass "release actions: ...saying so" grep -q 'the state was bound to 0.9.0 at 012345678901, HEAD is .*, and there is no v0.9.0 yet .*: the state is rebound to' "$rs/ra.out"
+expect_pass "release actions: ...the state bound to HEAD" grep -qx "release_commit=$RR" "$RSTATE"
+calls_are 1 3 0 4
+# ...but not once a v0.9.0 exists: in the clone (an unpushed vV-gh, or Gitea's marker) or on GitHub
+sed "s/^release_commit=.*/release_commit=0123456789012345678901234567890123456789/" "$rs/state.mid" > "$RSTATE"
+cp "$RSTATE" "$rs/state.other"
+for t in v0.9.0-gh v0.9.0; do
+  pg tag "$t" "$RR"
+  ra_expect "release actions: ...a local $t: refused, nothing rebound" 1 "v0.9.0 exists in the clone \\(refs/tags/$t\\), not on github: it may be a tag" < /dev/null
+  expect_pass "release actions: ...saying how to delete it" grep -q "git tag -d $t, then run it again (it rebinds)" "$rs/ra.out"
+  pg tag -d "$t" > /dev/null
+done
+git --git-dir="$pf/github.git" update-ref refs/tags/v0.9.0 "$RR"
+ra_expect "release actions: ...v0.9.0 on GitHub: refused, nothing rebound" 1 'and v0.9.0 is on github: the tag binds its commit' < /dev/null
+git --git-dir="$pf/github.git" update-ref -d refs/tags/v0.9.0
+expect_pass "release actions: ...the state untouched by the refusals" cmp -s "$RSTATE" "$rs/state.other"
+# ...nor when HEAD is not Gitea's main (a checkout by mistake would lose the records)
+pg checkout -q --detach "$PF_BASE"
+ra_expect "release actions: ...HEAD not Gitea's main: refused, nothing rebound" 1 "which is not origin's main; no v0.9.0 yet" < /dev/null
+pg checkout -q main
+expect_pass "release actions: ...the state untouched" cmp -s "$RSTATE" "$rs/state.other"
+calls_are 1 3 0 4
+
+# Gitea's main moves on (a fix merged after the run above): a clean main behind it is
+# fast-forwarded and the state rebound; a dirty tree, a main with commits Gitea's lacks, or a vV
+# that exists stop as before, with nothing moved
 cp "$rs/state.mid" "$RSTATE"
+pg commit -q --allow-empty --no-gpg-sign -m ahead
+RAH=$(pg rev-parse HEAD)
+pg push -q origin main
+pg reset -q --hard "$RR"
+echo dirty >> "$pf/clone/CHANGELOG.md"
+ra_expect "release actions: main behind Gitea's, the tree dirty: not fast-forwarded, the tree check stops" 1 'FAILED at step 1/17 candidate' < /dev/null
+expect_pass "release actions: ...with the tree check's advice" grep -q 'uncommitted changes to tracked files' "$rs/ra.out"
+expect_pass "release actions: ...HEAD not moved" test "$(pg rev-parse HEAD)" = "$RR"
+# the mirror is done (GitHub's main is the release commit), the candidate is not: neither the
+# status nor the failure reads it as done
+expect_pass "release actions: ...the then line names the steps done, not 'steps 1-N'" sh -c 'grep -q "(step 1 candidate is not done; done already, and skipped: 2 mirror, 3 dry-run, 4 dry-verify)" "$1" && ! grep -q "steps 1-" "$1"' sh "$rs/ra.out"
+rl_kind 1 candidate next "a dirty tree, with the mirror done: not implied"
+pg checkout -q -- CHANGELOG.md
+pg commit -q --allow-empty --no-gpg-sign -m local
+ra_expect "release actions: main with a commit Gitea's lacks: not fast-forwarded, the tree check stops" 1 "is not origin's main" < /dev/null
+pg reset -q --hard "$RR"
+pg tag v0.9.0-gh "$RR"
+ra_expect "release actions: main behind Gitea's with a local v0.9.0-gh: not fast-forwarded" 1 "and v0.9.0 exists in the clone \\(refs/tags/v0.9.0-gh\\), not on github: not fast-forwarded" < /dev/null
+expect_pass "release actions: ...HEAD not moved" test "$(pg rev-parse HEAD)" = "$RR"
+pg tag -d v0.9.0-gh > /dev/null
+ra_expect "release actions: a clean main behind Gitea's: fast-forwarded, rebound, on to the mirror" 2 'PAUSED at step 2/17 mirror' < /dev/null
+expect_pass "release actions: ...saying so" sh -c 'grep -q "main was behind origin.s main: fast-forwarded from $(echo "$2" | cut -c1-12) to $(echo "$3" | cut -c1-12) (git merge --ff-only origin/main; new commits: 1)" "$1" && grep -q "the state is rebound to $(echo "$3" | cut -c1-12)" "$1"' sh "$rs/ra.out" "$RR" "$RAH"
+expect_pass "release actions: ...the mirror's confirmation names the change (one commit: singular)" sh -c 'grep -A20 "CONFIRM tag" "$1" | grep -qF -- "  - the release commit changed in this run: $2 -> $3 (1 new commit; the earlier records, any waiver included, were dropped)"' sh "$rs/ra.out" "$RR" "$RAH"
+expect_pass "release actions: ...HEAD and the state at Gitea's main" sh -c 'test "$(git -C "$1" rev-parse HEAD)" = "$3" && grep -qx "release_commit=$3" "$2"' sh "$pf/clone" "$RSTATE" "$RAH"
+# put Gitea's main back for the cases below (a scratch remote)
+pg reset -q --hard "$RR"
+pg push -q -f origin "$RR:refs/heads/main"
+
+# a mistyped version (Gitea's main is not at it) fast-forwards nothing
+pg commit -q --allow-empty --no-gpg-sign -m ahead
+pg push -q origin main
+pg reset -q --hard "$RR"
+st=0
+rlx FIL_RELEASE_TTY=1 "$RL" 0.9.1 --repo o/r --tap "$rs/tap" > "$rs/ra.out" 2>&1 < /dev/null || st=$?
+if [ "$st" != 0 ] && [ "$(pg rev-parse HEAD)" = "$RR" ] && grep -q "whose Cargo.toml is not at 0.9.1: not fast-forwarded" "$rs/ra.out"; then pass "release actions: a version Gitea's main is not at: main not fast-forwarded"; else
+  flunk "release actions: a version Gitea's main is not at: main not fast-forwarded (exit $st)"; sed 's/^/       | /' "$rs/ra.out" | tail -15
+fi
+rm -rf "$pf/clone/target/release-verify/0.9.1"
+pg push -q -f origin "$RR:refs/heads/main"
+
+# Gitea's main moves on while the run waits on the dry run: the run is not stopped (the candidate is
+# checked at its start), and goes on to the tag
+ra_reset
+rm -f "$rs/world/origin-moved"
+ra_expect "release actions: Gitea's main moves during the dry run: the run goes on to step 5" 2 'PAUSED at step 5/17 tag' FAKE_ORIGIN_MOVE=1 -- --confirm-each <<< "0.9.0"
+expect_pass "release actions: ...and Gitea's main did move" sh -c 'test "$(git --git-dir="$1" rev-parse refs/heads/main)" != "$2"' sh "$pf/origin.git" "$RR"
+OM=$(cat "$rs/world/origin-moved")
+# the agents fast-forward GitHub's main to it: the next run fast-forwards, rebinds, finds the
+# mirror done, dry-runs the new commit, and its first confirmation (the tag's) names the change
+pg fetch -q origin
+pg push -q github "$OM:refs/heads/main"
+ra_expect "release actions: ...the next run: fast-forwarded and rebound, the tag's confirmation names the change" 2 'PAUSED at step 5/17 tag' < /dev/null
+expect_pass "release actions: ...the change with full commits, in the confirmation" sh -c 'grep -A20 "CONFIRM tag" "$1" | grep -qF -- "  - the release commit changed in this run: $2 -> $3 (2 new commits; the earlier records, any waiver included, were dropped)"' sh "$rs/ra.out" "$RR" "$OM"
+pg reset -q --hard "$RR"
+pg push -q -f origin "$RR:refs/heads/main"
+rm -f "$rs/world/origin-moved"
+
+# the crates cannot be fetched (no network) at the start: the candidate is unknown, the failure
+# says it is the network
+ra_reset
+ra_expect "release actions: no network for the crates: a failure naming the network, not the candidate" 1 'that is the network or the registry, not the lockfile' FAKE_CARGO_CACHE="$rs/no-cache" FAKE_NO_NET=1 < /dev/null
+expect_pass "release actions: ...not 'not a candidate'" sh -c '! grep -q "is not a candidate" "$1"' sh "$rs/ra.out"
+
+# A real terminal: what was typed before the question (an Enter pressed during a long wait, or the
+# version itself) is discarded, never read as the answer. pty.py OUT AHEAD ANSWERS CMD...: CMD on a
+# pseudo-terminal, AHEAD typed at once, then one of ANSWERS (comma-separated) after each "to go
+# ahead" prompt, and an end of input (^D) once they run out; OUT is what the terminal showed.
+cat > "$rs/pty.py" << 'EOF2'
+import os, pty, select, signal, sys, time
+out, ahead, answers, cmd = sys.argv[1], sys.argv[2], [a for a in sys.argv[3].split(",") if a], sys.argv[4:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(cmd[0], cmd)
+os.write(fd, ahead.encode().decode("unicode_escape").encode())
+buf, seen, end = b"", 0, time.time() + 300
+while time.time() < end:
+    if not select.select([fd], [], [], 0.5)[0]:
+        continue
+    try:
+        d = os.read(fd, 4096)
+    except OSError:
+        break
+    if not d:
+        break
+    buf += d
+    while seen < buf.count(b"to go ahead"):
+        seen += 1
+        os.write(fd, (answers.pop(0) + "\n").encode() if answers else b"\x04")
+else:
+    os.kill(pid, signal.SIGKILL)
+st = os.waitpid(pid, 0)[1]
+open(out, "wb").write(buf)
+sys.exit(os.WEXITSTATUS(st) if os.WIFEXITED(st) else 99)
+EOF2
+ra_pty() { # NAME STATUS PATTERN AHEAD ANSWERS [-- ARGS]: ra_expect on a pseudo-terminal
+  local name=$1 want=$2 pat=$3 ahead=$4 ans=$5 st=0
+  shift 5
+  rl FIL_RELEASE_TTY= python3 -I "$rs/pty.py" "$rs/ra.out" "$ahead" "$ans" "$@" > /dev/null 2>&1 < /dev/null || st=$?
+  if [ "$st" = "$want" ] && grep -Eq -- "$pat" "$rs/ra.out"; then pass "$name"; else
+    flunk "$name (exit $st, wanted $want and /$pat/)"
+    sed 's/^/       | /' "$rs/ra.out" | tail -25
+  fi
+}
+ra_reset
+ra_pty "release actions: a terminal: the version typed ahead is discarded, not a confirmation" 2 'PAUSED at step 2/17 mirror' '0.9.0\n' '' -- --confirm-each
+expect_pass "release actions: ...it read the end of input, not the typed-ahead version" grep -q 'received an empty line, not 0.9.0' "$rs/ra.out"
+calls_are 0 0 0 0
+ra_pty "release actions: a terminal: Enter typed ahead is discarded, the answer after the question counts" 2 'PAUSED at step 5/17 tag' '\n\n' '0.9.0' -- --confirm-each
+calls_are 1 3 0 1
 
 # ra_midprompt ACTION [ENV=VALUE ...]: a run that waits at the confirmation (after the preflight)
 # while the test changes the world (ACTION, shell code), then gets 0.9.0 typed; RA_ST is its exit

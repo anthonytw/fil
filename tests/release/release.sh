@@ -10,12 +10,15 @@
 #                      [--ttl 8h] [--lock-keys] [--repo OWNER/REPO] [--origin REMOTE]
 #                      [--github REMOTE] [--tap DIR] [--vm NAME]
 #
-#   (default)      fetch `origin` and `github` (no tags), bind the state to VERSION and HEAD, take
-#                  the lock, detect every step, record the identifiers found (GitHub's commit,
-#                  run ids, the tag object) in the state, run the preflight for the next step and
-#                  the ones after it, at a terminal unlock the keys the remaining steps need (one
-#                  block, release-keys.sh unlock --ttl), then do the next step's action and the ones
-#                  after it, through finish:
+#   (default)      fetch `origin` and `github` (no tags); before vV exists (in the clone or on
+#                  GitHub), fast-forward a clean main that is behind Gitea's (git merge --ff-only) and
+#                  rebind a state bound to another commit to HEAD when HEAD is Gitea's main (as
+#                  --reset-state); bind the state to VERSION and HEAD, take the lock, detect every
+#                  step, record the identifiers found (GitHub's commit, run ids, the tag object) in
+#                  the state, run the preflight for the next step and the ones after it, at a
+#                  terminal unlock the keys the remaining steps need (one block, release-keys.sh
+#                  unlock --ttl), then do the next step's action and the ones after it, through
+#                  finish:
 #                    mirror      [confirmation] GitHub's main fast-forwarded to the release commit R
 #                                itself (git push github R:refs/heads/main, never forced); done when R
 #                                is on GitHub's main already (agents push it); refused when GitHub's
@@ -102,7 +105,8 @@
 #                  GitHub, it shows the commit on origin's main with the tag's tree. Exit 1 only for
 #                  a burned tag.
 #   --reset-state  forget the state (another release commit before the tag); refused once the tag
-#                  is on GitHub, which binds the commit forever.
+#                  is on GitHub, which binds the commit forever. A run rebinds by itself when HEAD is
+#                  Gitea's main and vV exists neither in the clone nor on GitHub.
 #   --from STEP    for a step done by hand: every step before STEP must detect as done (else the run
 #                  is refused); then as the default.
 #   --redo STEP    do STEP's action again although it detects as done, and the actions of the steps
@@ -308,8 +312,16 @@ step_no() { local s i=0; for s in $PF_STEPS; do i=$((i + 1)); [ "$s" = "$1" ] &&
 step_name() { local s i=0; for s in $PF_STEPS; do i=$((i + 1)); [ $i = "$1" ] && { echo "$s"; return; }; done; }
 NSTEPS=$(set -- $PF_STEPS; echo $#)
 LAST_DONE=0
+# A stop at a step that is not done, with a later step done already (GitHub's main at the release
+# commit makes mirror done before the candidate is): the done steps are named, not "1-N".
 then_line() {
-  if [ "$LAST_DONE" -gt 0 ]; then
+  local i d=''
+  if [ "$NEXT" -gt 0 ] && [ "$LAST_DONE" -ge "$NEXT" ]; then
+    for ((i = 1; i <= LAST_DONE; i++)); do
+      case ${KIND[i]:-} in checked | recorded | waived | implied) d="$d, $i $(step_name $i)" ;; esac
+    done
+    printf '  then:  %s          (step %s %s is not done; done already, and skipped: %s)\n' "$AGAIN" "$NEXT" "$(step_name "$NEXT")" "${d#, }"
+  elif [ "$LAST_DONE" -gt 0 ]; then
     printf '  then:  %s          (steps 1-%s are done and will be skipped)\n' "$AGAIN" "$LAST_DONE"
   else
     printf '  then:  %s\n' "$AGAIN"
@@ -535,8 +547,17 @@ NOTE='' UNKNOWN=0 HARD='' HARD_STEP='' NEXT=0
 R='' G='' GMAIN='' TAG_OBJ='' TAG_COMMIT='' TAG_OK=0
 DRY_RUN='' CHECKS_LINUX='' CHECKS_MACOS='' TAG_RUN=''
 
+# In a run, the candidate is checked once, at the first detection: a merge to Gitea's main while the
+# run waits (the dry run, the rebuild) is not the release commit failing its checks; the next run
+# fast-forwards to it and rebinds. A fetch of the crates that fails on the network is unknown, not
+# "not done".
+CAND_ONCE='' CAND_NOTE=''
 det_candidate() {
   local log=$scratch/candidate.log
+  if [ "$CAND_ONCE" = 1 ]; then
+    NOTE="$CAND_NOTE (checked at the start of this run)"
+    return 0
+  fi
   pf_init "$V"
   PF_REPO=$repo PF_ORIGIN=$origin PF_GITHUB=$github PF_AGAIN=$AGAIN PF_LOCK_OWNER=$$ PF_R='' PF_G=''
   [ -z "$vm" ] || PF_VM=$vm
@@ -544,9 +565,11 @@ det_candidate() {
   [ "$TAG_OK" = 0 ] || PF_COMMIT=$R
   if (PF_CUR=tree && pf_check_tree && PF_CUR=version && pf_check_version && PF_CUR=lockfiles && pf_check_lockfiles) 2> "$log"; then
     NOTE="R $(short "$R"): clean, at the version, lockfiles current"
+    [ "$mode" != run ] || CAND_ONCE=1 CAND_NOTE=$NOTE
     return 0
   fi
   NOTE=$(grep -m1 '^preflight: FAIL' "$log" | sed 's/^preflight: FAIL  //' | cut -c1-200)
+  ! grep -q '^preflight: FAIL  lockfiles: cargo fetch .*that is the network or the registry' "$log" || UNKNOWN=1
   return 1
 }
 
@@ -1056,8 +1079,11 @@ detect_all() {
     case ${KIND[i]} in
       checked | recorded | waived) ;;
       # verify-published is never implied: a release whose published files did not verify (or whose
-      # record was lost) verifies again, whatever reached crates.io or the tap meanwhile
-      *) if [ $i -lt "$LAST_DONE" ] && [ "${FORCED[i]}" = 0 ] && [ "$(step_name $i)" != verify-published ]; then KIND[i]=implied; elif [ "$NEXT" = 0 ]; then NEXT=$i; else KIND[i]=pending; fi ;;
+      # record was lost) verifies again, whatever reached crates.io or the tap meanwhile. Nor is the
+      # candidate before the tag: the mirror is done whenever the agents have pushed GitHub's main to
+      # the release commit, which says nothing of the clone, the version or the lockfiles
+      *) if [ $i -lt "$LAST_DONE" ] && [ "${FORCED[i]}" = 0 ] && [ "$(step_name $i)" != verify-published ] \
+        && { [ "$(step_name $i)" != candidate ] || [ "$TAG_OK" = 1 ]; }; then KIND[i]=implied; elif [ "$NEXT" = 0 ]; then NEXT=$i; else KIND[i]=pending; fi ;;
     esac
   done
 }
@@ -1241,11 +1267,34 @@ step_fail() {
 }
 
 # confirm POINT LINE...: shows what becomes public, then wants the version typed back. Input that is
-# not a terminal, or anything else typed, pauses the run (exit 2) with nothing done. CONFIRMED lists
+# not a terminal, or anything else typed, pauses the run (exit 2) with nothing done, saying what it
+# received. What was typed before the question is discarded (tty_flush), and the white space around
+# the answer is ignored. CONFIRMED lists
 # the points confirmed in this run, in this process only, never in the state: step tag asks again
 # unless this run confirmed `tag` (the default mirror confirmation is `tag`).
-CONFIRMED=''
+CONFIRMED='' R_CHANGED=''
 is_tty() { [ "${FIL_RELEASE_TTY:-}" = 1 ] || [ -t 0 ]; }
+# tty_flush: before a prompt reads its answer, what was typed ahead (an Enter pressed during a long
+# wait) is discarded, so it is not read as the answer. Only a real terminal has a queue to flush
+# (tcflush; bash 3.2's read -t takes whole seconds only, and read -t 0 reads nothing in bash 4 and
+# later); anything else (the self-test's answers) is read as it is.
+tty_flush() {
+  [ -t 0 ] || return 0
+  python3 -I -c 'import termios; termios.tcflush(0, termios.TCIFLUSH)' 2> /dev/null || true
+}
+# trim TEXT: TEXT without its leading and trailing white space (a CR, a tab, spaces).
+trim() {
+  local t=$1
+  t=${t#"${t%%[![:space:]]*}"}
+  printf '%s' "${t%"${t##*[![:space:]]}"}"
+}
+# shown TEXT: TEXT quoted for a message, non-printable characters visible (printf %q).
+shown() {
+  local q
+  [ -n "$1" ] || { printf 'an empty line'; return; }
+  q=$(printf '%q' "$1")
+  if [ "$q" = "$1" ]; then printf "'%s'" "$1"; else printf '%s' "$q"; fi
+}
 confirm() {
   local point=$1 ans
   shift
@@ -1253,12 +1302,17 @@ confirm() {
   {
     echo "release: CONFIRM $point, for $V. What happens and cannot be undone:"
     printf '  - %s\n' "$@"
+    # the first confirmation of a run that moved the release commit says so
+    [ -z "$R_CHANGED" ] || printf '  - %s\n' "$R_CHANGED"
   } >&2
+  R_CHANGED=''
   is_tty || report PAUSED "$NEXT" "step $(step_name "$NEXT") needs your confirmation ($point), and the input is not a terminal: nothing was done" \
     "run it in a terminal (there is no --yes)"
+  tty_flush
   printf 'release: type %s to go ahead (anything else stops here): ' "$V" >&2
   IFS= read -r ans || ans=''
-  [ "$ans" = "$V" ] || report PAUSED "$NEXT" "not confirmed: nothing was done" "run it again when you are ready"
+  ans=$(trim "$ans")
+  [ "$ans" = "$V" ] || report PAUSED "$NEXT" "not confirmed: nothing was done (received $(shown "$ans"), not $V)" "run it again when you are ready"
   CONFIRMED="$CONFIRMED $point"
 }
 
@@ -1419,6 +1473,7 @@ waive_prompt() {
   local x l=- m=- ans
   echo "release: the dry run (release.yml) passed, but suite=all checks failed:$list" >&2
   echo "release: a check that fails for a reason unrelated to what is released (a flaky harness, a runner) may be waived; anything else blocks the release" >&2
+  tty_flush
   printf 'release: waive them, i.e. they do NOT block the release (recorded with their run ids)? [y/N] ' >&2
   ans=''
   IFS= read -r ans || ans=''
@@ -1488,6 +1543,7 @@ act_dry_run() {
     echo "release: failed:$list (the end of each log is in $STEP_LOG)" >&2
     x=''
     if [ "$round" = first ]; then
+      tty_flush
       printf 'release: re-run the failed jobs (for a transient failure: a runner or the network)? [y/N] ' >&2
       IFS= read -r x || x=''
     fi
@@ -1690,6 +1746,7 @@ act_tag_run() {
         "if it is transient (a runner or the network): ${drafts:+delete the stale draft(s) first (gh api -X DELETE repos/$repo/releases/ID), then }gh run rerun $TR_ID --failed --repo $repo, then the same command; a real failure: the tag cannot move, so this version is burned: bump to the next patch version"
     fi
     echo "release: the tag's run $(run_url "$TR_ID") failed (the end of its log is in $STEP_LOG)" >&2
+    tty_flush
     printf 'release: re-run its failed jobs%s? [y/N] ' "${drafts:+, deleting first the stale draft(s) ${drafts% } that the failed attempt left (else publish makes a second one)}" >&2
     x=''
     IFS= read -r x || x=''
@@ -1730,6 +1787,7 @@ act_tag_run() {
   LAST_DONE=$((NEXT - 1))
   echo "release: $(printf '%s\n' "$rels" | grep -c .) drafts of $TAG (the double-draft trap): keeping the newest, $keep, which has every release file" >&2
   is_tty || report PAUSED "$NEXT" "stale drafts of $TAG to delete (${drafts% }), and the input is not a terminal: nothing was done" "run it in a terminal (it asks before deleting), or delete them yourself: gh api -X DELETE repos/$repo/releases/ID"
+  tty_flush
   printf 'release: delete the stale draft(s) %s? [y/N] ' "${drafts% }" >&2
   x=''
   IFS= read -r x || x=''
@@ -1926,6 +1984,7 @@ act_crates() {
           "if it is transient (crates.io or the network): run it again at a terminal and answer y to the rerun (publish-crates.sh skips the crates already on crates.io); a gate refusal: send the log to the coordinator"
       fi
       echo "release: the crates-io job of $(run_url "$id") ended ${x:--} (the end of its log is in $STEP_LOG)" >&2
+      tty_flush
       printf 'release: re-run it (publish-crates.sh skips the crates already on crates.io; its deployment is approved again)? [y/N] ' >&2
       x=''
       IFS= read -r x || x=''
@@ -2128,6 +2187,7 @@ if [ "$mode" = status ]; then
   if git -C "$tap" rev-parse --git-dir > /dev/null 2>&1; then
     git -C "$tap" fetch -q --no-tags origin 2> /dev/null || true
   fi
+  PF_CARGO_FETCH=0
   R=$(st_hex release_commit)
   has_commit "$R" || R=$(rg rev-parse -q --verify 'HEAD^{commit}' 2> /dev/null) || die "$ROOT is not a git clone with a commit"
   detect_all
@@ -2155,6 +2215,71 @@ FETCHED=1
 if git -C "$tap" rev-parse --git-dir > /dev/null 2>&1; then
   git -C "$tap" fetch -q --no-tags origin 2> /dev/null || log "note: could not fetch the tap ($tap); step brew reads it as it is"
 fi
+
+# tag_known: whether vV exists anywhere that binds the release commit: in the clone (vV, Gitea's
+# marker, or vV-gh, the local name of the tag this command makes) or on GitHub. 0: it does
+# (TAG_WHERE says where: GitHub first; TAG_LOCAL names a tag only the clone has); 1: it does not;
+# 2: GitHub could not be asked, and the clone has none.
+TAG_WHERE='' TAG_LOCAL=''
+tag_known() {
+  local n t gh=1
+  TAG_WHERE='' TAG_LOCAL=''
+  if t=$(rg ls-remote "$github" "refs/tags/$TAG" 2> /dev/null); then
+    [ -z "$t" ] || { TAG_WHERE="on $github"; return 0; }
+  else
+    gh=2
+  fi
+  for n in "$TAG" "$TAG-gh"; do
+    if rg rev-parse -q --verify "refs/tags/$n" > /dev/null 2>&1; then
+      TAG_WHERE="in the clone (refs/tags/$n)" TAG_LOCAL=$n
+      [ "$gh" = 2 ] || TAG_WHERE="$TAG_WHERE, not on $github"
+      return 0
+    fi
+  done
+  return "$gh"
+}
+
+# The clone behind Gitea's main: a clean main that Gitea's main fast-forwards (a fix merged there
+# after an earlier run) is fast-forwarded to it, before the tag only (once vV exists, the release
+# commit is the tagged one). Anything else (a dirty tree, a detached HEAD or another branch, a main
+# with commits Gitea's lacks) is left as it is, for the preflight's tree check to stop with its advice.
+ff_main() {
+  local head main rc=0
+  [ -z "$(rg status --porcelain --untracked-files=no 2> /dev/null)" ] || return 0
+  [ "$(rg symbolic-ref -q HEAD 2> /dev/null || true)" = refs/heads/main ] || return 0
+  head=$(rg rev-parse -q --verify 'HEAD^{commit}' 2> /dev/null) || return 0
+  main=$(rg rev-parse -q --verify "refs/remotes/$origin/main^{commit}" 2> /dev/null) || return 0
+  [ "$head" != "$main" ] || return 0
+  rg merge-base --is-ancestor "$head" "$main" || return 0
+  # a version Gitea's main is not at (mistyped, or a later one) changes nothing
+  if [ "$(pf_cargo_version "$main")" != "$V" ]; then
+    log "note: main ($(short "$head")) is behind $origin's main ($(short "$main")), whose Cargo.toml is not at $V: not fast-forwarded"
+    return 0
+  fi
+  tag_known || rc=$?
+  case $rc in
+    0) log "note: main ($(short "$head")) is behind $origin's main ($(short "$main")), and $TAG exists $TAG_WHERE: not fast-forwarded (the tag binds its commit)"; return 0 ;;
+    2) log "note: main ($(short "$head")) is behind $origin's main ($(short "$main")), and '$github' cannot be asked whether $TAG exists: not fast-forwarded"; return 0 ;;
+  esac
+  LC_ALL=C rg merge -q --ff-only "refs/remotes/$origin/main" > "$scratch/ff.log" 2>&1 \
+    || report FAILED 0 "main ($(short "$head")) is behind $origin's main ($(short "$main")), and git merge --ff-only $origin/main failed: $(head -n 1 "$scratch/ff.log" | cut -c1-200)" \
+      "git status; then git merge --ff-only $origin/main by hand"
+  log "main was behind $origin's main: fast-forwarded from $(short "$head") to $(short "$main") (git merge --ff-only $origin/main; new commits: $(rg rev-list --count "$head..$main"))"
+  r_changed "$head" "$main" ''
+}
+# r_changed FROM TO [DROPPED]: the line the first confirmation of this run shows when the run moved
+# the release commit (the fast-forward, the rebind), with full commits.
+r_changed() {
+  local n
+  if rg merge-base --is-ancestor "$1" "$2" 2> /dev/null; then
+    n=$(rg rev-list --count "$1..$2")
+    if [ "$n" = 1 ]; then n="1 new commit"; else n="$n new commits"; fi
+  else
+    n="not a descendant of it"
+  fi
+  R_CHANGED="the release commit changed in this run: $1 -> $2 ($n${3:+; $3})"
+}
+ff_main
 R=$(rg rev-parse -q --verify 'HEAD^{commit}' 2> /dev/null) || report FAILED 0 "$ROOT is not a git clone with a commit" "run it in your fil clone"
 
 # Binding: the state names one version and one release commit.
@@ -2167,13 +2292,36 @@ fi
 sv=$(st_get version)
 sr=$(st_get release_commit)
 [ -z "$sv" ] || [ "$sv" = "$V" ] || report FAILED 0 "$STATE is for version $sv, not $V" "rm '$STATE' (it holds nothing the world cannot tell again), then run it again"
+# A state bound to another commit is rebound to HEAD (as --reset-state) when HEAD is Gitea's main
+# and no vV exists yet; once vV exists (in the clone or on GitHub), or GitHub cannot say, or HEAD is
+# not Gitea's main (a checkout by mistake would lose the records), it is a stop.
 if [ -n "$sr" ] && [ "$sr" != "$R" ]; then
-  if t=$(rg ls-remote "$github" "refs/tags/$TAG" 2> /dev/null) && [ -z "$t" ]; then
-    report FAILED 0 "the state is for $V at $(short "$sr"), HEAD is $(short "$R"); no $TAG on GitHub yet" \
-      "git checkout $sr; or, for the new release commit: $AGAIN --reset-state (it rebinds)"
+  rc=0
+  tag_known || rc=$?
+  if [ "$rc" = 1 ] && [ "$R" != "$(rg rev-parse -q --verify "refs/remotes/$origin/main^{commit}" 2> /dev/null || true)" ]; then
+    report FAILED 0 "the state is for $V at $(short "$sr"), HEAD is $(short "$R"), which is not $origin's main; no $TAG yet" \
+      "git checkout $sr; or, for a new release commit: check out $origin's main (git checkout main && git merge --ff-only $origin/main), then run it again (it rebinds)"
   fi
-  report FAILED 0 "the state is for $V at $(short "$sr"), HEAD is $(short "$R"), and $TAG may be on GitHub: the tag binds its commit, and a new commit after it is a new version" \
-    "git checkout $sr"
+  case $rc in
+    1)
+      rm -f "$STATE"
+      log "the state was bound to $V at $(short "$sr"), HEAD is $(short "$R"), and there is no $TAG yet (in the clone or on $github): the state is rebound to $(short "$R") (as --reset-state would)"
+      r_changed "$sr" "$R" "the earlier records, any waiver included, were dropped"
+      sr=''
+      ;;
+    2)
+      report FAILED 0 "the state is for $V at $(short "$sr"), HEAD is $(short "$R"), and '$github' cannot be asked whether $TAG exists (the tag would bind its commit): nothing is rebound" \
+        "check the remote (git ls-remote $github refs/tags/$TAG), then run it again; or git checkout $sr"
+      ;;
+    *)
+      case $TAG_WHERE in
+        "on "*) report FAILED 0 "the state is for $V at $(short "$sr"), HEAD is $(short "$R"), and $TAG is $TAG_WHERE: the tag binds its commit, and a new commit after it is a new version" \
+          "git checkout $sr" ;;
+        *) report FAILED 0 "the state is for $V at $(short "$sr"), HEAD is $(short "$R"), and $TAG exists $TAG_WHERE: it may be a tag an earlier run made and did not push" \
+          "git checkout $sr; or, if it was never pushed and the new commit is the one to release: git tag -d $TAG_LOCAL, then run it again (it rebinds)" ;;
+      esac
+      ;;
+  esac
 fi
 
 # record_found: the identifiers the detections found, into the state. github_commit (the commit on
@@ -2284,8 +2432,14 @@ while :; do
   main_stop
   hard_stop
   record_found
-  if [ "$NEXT" -le "$prev" ]; then
+  if [ "$NEXT" -lt "$prev" ]; then
+    # an earlier step, done before this action, no longer detects as done: the world moved under the
+    # run (GitHub's main pushed, a run or release changed); say which step, not this one
+    rn=$NEXT
     NEXT=$prev
+    step_fail "after $name, step $rn $(step_name "$rn"), done before, no longer detects as done: ${NOTES[rn]}" \
+      "if Gitea's or GitHub's main moved during the run (a merge, the agents' push of main): run it again, it fast-forwards, rebinds and checks again from the new main; otherwise send the log to the coordinator"
+  elif [ "$NEXT" = "$prev" ]; then
     step_fail "the action of $name finished, but the step does not detect as done: ${NOTES[prev]}" "send the log to the coordinator (a bug in the command or a change in GitHub's answers)"
   fi
 done

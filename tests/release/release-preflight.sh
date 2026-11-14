@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # `tests/release/just.sh release-preflight X.Y.Z`: everything a release needs, checked before anything is done
 # (docs/m4/release.md section 9.4). Read-only: it changes nothing in the clone, on GitHub or on
-# Gitea, and pulls nothing. Its traces: a dangling signed commit object (the commit-signing check:
+# Gitea, and pulls nothing. Its traces: the crates the lockfiles name, fetched into the cargo cache
+# (outside the clone) when it lacks them; a dangling signed commit object (the commit-signing check:
 # `git commit-tree -S` of the empty tree), which `git gc` removes; in the VM, a removed container,
 # run only from the cross image if it is already there; and the keychain's "Always Allow" for
 # codesign if the test signature asks for it (meant: so it is not asked mid-release). It never
@@ -144,7 +145,7 @@ pf_tool() {
 }
 
 # ---- reporting (the settings default to empty until pf_init: the script runs under set -u)
-PF_FAILS=0 PF_CUR='' PF_LOCK_OWNER=${PF_LOCK_OWNER:-$$} PF_AGAIN=${PF_AGAIN:-} PF_COMMIT=${PF_COMMIT:-} PF_REPO=${PF_REPO:-} PF_VM=${PF_VM:-} PF_ORIGIN=${PF_ORIGIN:-} PF_GITHUB=${PF_GITHUB:-} PF_R='' PF_G=''
+PF_FAILS=0 PF_CUR='' PF_CARGO_FETCH=${PF_CARGO_FETCH:-1} PF_LOCK_OWNER=${PF_LOCK_OWNER:-$$} PF_AGAIN=${PF_AGAIN:-} PF_COMMIT=${PF_COMMIT:-} PF_REPO=${PF_REPO:-} PF_VM=${PF_VM:-} PF_ORIGIN=${PF_ORIGIN:-} PF_GITHUB=${PF_GITHUB:-} PF_R='' PF_G=''
 pf_ok() { echo "preflight: ok    $PF_CUR: $*" >&2; }
 pf_note() { echo "preflight: note  $PF_CUR: $*" >&2; }
 pf_warn() { echo "preflight: WARN  $PF_CUR: $*" >&2; }
@@ -327,13 +328,17 @@ pf_check_recipes() {
 # The release commit: what the tree check found, or HEAD.
 pf_r() { [ -n "$PF_R" ] || PF_R=$(pf_git rev-parse -q --verify 'HEAD^{commit}' 2> /dev/null || true); echo "$PF_R"; }
 
+# pf_cargo_version REV: the [workspace.package] version of Cargo.toml at REV ("" if none).
+pf_cargo_version() {
+  pf_git show "$1:Cargo.toml" 2> /dev/null | awk '
+    /^\[workspace\.package\]/ { p = 1; next }
+    /^\[/ { p = 0 }
+    p && /^version[ ]*=/ { v = $0; sub(/^version[ ]*=[ ]*"/, "", v); sub(/".*$/, "", v); print v; exit }'
+}
 pf_check_version() {
   local r v pins bad=0 vre
   r=$(pf_r)
-  v=$(pf_git show "$r:Cargo.toml" 2> /dev/null | awk '
-    /^\[workspace\.package\]/ { p = 1; next }
-    /^\[/ { p = 0 }
-    p && /^version[ ]*=/ { v = $0; sub(/^version[ ]*=[ ]*"/, "", v); sub(/".*$/, "", v); print v; exit }')
+  v=$(pf_cargo_version "$r")
   if [ "$v" != "$PF_VERSION" ]; then
     pf_fail "Cargo.toml's version is '${v:-none}', not $PF_VERSION" - "a PR on Gitea: just set-version $PF_VERSION (and the CHANGELOG.md section), merged to main"
     bad=1
@@ -352,15 +357,35 @@ pf_check_version() {
   return "$bad"
 }
 
+# The lockfiles: the crates each lock names are fetched into the cargo cache first (cargo fetch
+# --locked: offline when the cache has them, so a warm cache needs no network), then each lock must
+# resolve offline as it is. A --locked fetch that fails naming the lock file is a stale lock (cargo
+# 1.99: "cannot update the lock file ... because --locked was passed"; older: "the lock file needs
+# to be updated"); any other failure is the network or the registry, and says so. PF_CARGO_FETCH=0 (release.sh --status:
+# read-only) checks the cache as it is, with no fetch.
 pf_check_lockfiles() {
   local cargo m bad=0 err
   cargo=$(pf_tool cargo)
   for m in Cargo.toml tests/terminals/exporter/Cargo.toml; do
+    if [ "$PF_CARGO_FETCH" != 0 ] && ! (cd "$ROOT" && "$cargo" fetch --locked --offline --manifest-path "$m" > /dev/null 2>&1); then
+      if ! err=$(cd "$ROOT" && "$cargo" fetch --locked --manifest-path "$m" 2>&1 > /dev/null); then
+        if printf '%s' "$err" | grep -qiE 'lock ?file|--locked'; then
+          pf_fail "the lockfile of $m is not current: $(printf '%s' "$err" | grep -m1 -i 'error' | head -c 200)" "stale exporter lock" \
+            "a PR on Gitea with just set-version $PF_VERSION (it updates both locks; just exporter-lock checks the exporter's), merged to main"
+        else
+          pf_fail "cargo fetch --locked --manifest-path $m failed, so the crates its lockfile names are not in the cargo cache; that is the network or the registry, not the lockfile: $(printf '%s' "$err" | grep -m1 -i 'error' | head -c 200)" - \
+            "check the network (cargo fetch --locked --manifest-path $m shows the whole error), then run it again"
+        fi
+        bad=1
+        continue
+      fi
+      pf_note "fetched the crates of $m's lockfile into the cargo cache"
+    fi
     if err=$(cd "$ROOT" && "$cargo" metadata --locked --offline --format-version 1 --manifest-path "$m" 2>&1 > /dev/null); then
       pf_ok "the lockfile of $m is current"
     else
-      pf_fail "the lockfile of $m is not current, or not fetched: $(printf '%s' "$err" | grep -m1 -i 'error' | head -c 200)" "stale exporter lock" \
-        "if it says the lock needs updating: a PR on Gitea with just set-version $PF_VERSION (it updates both locks; just exporter-lock checks the exporter's); if it says offline: cargo fetch --locked --manifest-path $m"
+      pf_fail "the lockfile of $m is not current, or its crates are not fetched: $(printf '%s' "$err" | grep -m1 -i 'error' | head -c 200)" "stale exporter lock" \
+        "if it says the lock needs updating: a PR on Gitea with just set-version $PF_VERSION (it updates both locks; just exporter-lock checks the exporter's); if it names a missing package: cargo fetch --locked --manifest-path $m"
       bad=1
     fi
   done

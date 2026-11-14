@@ -88,7 +88,7 @@ The `remote` setting in the same file chooses the command fil runs on the host: 
 
 ## Upgrading
 
-Install the new version on your machine and on each host. Two builds talk to each other only if their wire numbers are equal (the `wire` in `fil --version`). Daemons of different wires run side by side on a host, so an upgrade breaks no running session: your old sessions stay on the old daemon until they end. A patch release (0.1.0 to 0.1.1) never changes the wire, and 0.2.0 kept 0.1.0's, so a new client reuses the running daemon, and daemon-side fixes take effect only once that daemon has exited. End your sessions on each host (or `fil kill` them) to pick up the fixes.
+Install the new version on your machine and on each host. Two builds talk to each other only if their wire numbers are equal (the `wire` in `fil --version`). Daemons of different wires run side by side on a host, so an upgrade breaks no running session: your old sessions stay on the old daemon until they end. A patch release (0.1.0 to 0.1.1) never changes the wire, and 0.2.0 kept 0.1.0's (0.3.0 changes it, to `wire 1.15`: upgrade both ends, and a 0.3.0 client starts a 0.3.0 daemon beside the old one). When the wire is unchanged, a new client reuses the running daemon, and daemon-side fixes take effect only once that daemon has exited. End your sessions on each host (or `fil kill` them) to pick up the fixes.
 
 ## Removing fil
 

@@ -51,7 +51,7 @@ Pasted text is never read as an escape.
 
 ## One client at a time: takeover
 
-At most one client is attached to a session. If you attach to a session that is attached elsewhere, fil first asks whether to take it over:
+At most one client is attached to a session. If you attach to a session that is attached elsewhere, fil first asks whether to take it over (new in 0.3.0; before, the attach took it over at once):
 
 ```
 fil: "build" is attached from laptop since 2026-11-13 14:02:00. Take it over?  y = yes, n = no

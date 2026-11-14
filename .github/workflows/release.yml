@@ -343,12 +343,17 @@ jobs:
           lipo -info "$bin"
           codesign -vv "$bin"
           "$bin" --version
-          # The Intel half under Rosetta, where the runner has it.
-          if arch -x86_64 /usr/bin/true 2> /dev/null; then
-            arch -x86_64 "$bin" --version
-          else
-            echo "::warning::no Rosetta on this runner: the x86_64 half was not run"
+          # The Intel half under Rosetta, which is required: since 0.2.1 no Intel test run is left in
+          # the check workflows, so this (and brew's Intel job) is where the x86_64 half runs. The
+          # runner image has Rosetta; install it if an image ever does not, and fail without it.
+          if ! arch -x86_64 /usr/bin/true 2> /dev/null; then
+            sudo softwareupdate --install-rosetta --agree-to-license || true
           fi
+          if ! arch -x86_64 /usr/bin/true 2> /dev/null; then
+            echo "::error::no Rosetta on this runner: the x86_64 half of the universal binary cannot be run"
+            exit 1
+          fi
+          arch -x86_64 "$bin" --version
           if [ "$RELEASE" = true ]; then
             tests/release/check.sh --tag "$TAG" --complete --no-tree out
           else

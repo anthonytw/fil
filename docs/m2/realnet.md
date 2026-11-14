@@ -10,13 +10,17 @@ The M2 scenarios of the real-network harness (`docs/m1/realnet.md`): port forwar
 just realnet fwd                                  # all of them: about 42 minutes (the stress cells about 20 of them)
 just realnet fwd f_fwd_cable_pull f_fwd_vs_ssh    # named ones
 just realnet fwd-cable                            # the cable pull alone (about 13 minutes)
-just realnet fwd-rest                             # everything else
+just realnet fwd-func                             # reconnect, swap, sleep, roam, many_short, other_user
+just realnet fwd-stress                           # ending_stress
+just realnet fwd-perf-a                           # vs_ssh, stuck (measurements)
+just realnet fwd-perf-b                           # parallel (measurements)
+just realnet fwd-rest                             # everything but the cable pull
 just realnet agent                                # the agent scenarios (about 3 minutes)
 just vm-realnet fwd                               # in the local Lima VM (docs/dev/vm.md), aarch64
 gh workflow run linux-check --ref BRANCH -f ref=BRANCH -f suite=realnet   # GitHub, x86_64
 ```
 
-`fwd` and `agent` are parts of `just realnet` (`all` runs them after ssh, udp, sysd and S1's policy). The workflow's `realnet` matrix runs seven jobs in parallel: `ssh`, `udp`, `sysd`, `policy` (S1), `fwd-cable` (the cable pull, about 16 minutes with the build), `fwd-rest` (the other forward scenarios, about 20 minutes with `FWD_STRESS_COUNT=4000`: at 5,000 the stress showed nothing that 20,000 did not, only its rate) and `agent`. Each job has its own time limit, about twice its usual time. It sources `latency.sh` (which sources `udp.sh`) for the topology and the keystroke cells, so it needs what both need: root, `iproute2`, `iptables`, `conntrack`, `ethtool`, `openssh-server`, `python3`. A third throwaway user, `rnmallory`, is made for `f_fwd_other_user` and removed at the end.
+`fwd` and `agent` are parts of `just realnet` (`all` runs them after ssh, udp, sysd and S1's policy). The workflow's `realnet` matrix runs its parts as parallel jobs (since the CI rework for 0.2.1): `ssh`, `udp`, `sysd`, `policy` (S1), `install`, `agent` and `fwd-func` in `suite=extended`, and in `suite=realnet` and `all` also `fwd-cable` (the cable pull, about 16 minutes with the build: the only cable pull in CI), `fwd-stress` (`f_fwd_ending_stress` with `FWD_STRESS_COUNT=4000`: at 5,000 the stress showed nothing that 20,000 did not, only its rate), `fwd-perf-a` (`f_fwd_vs_ssh`, `f_fwd_stuck`) and `fwd-perf-b` (`f_fwd_parallel`). Each job has its own time limit, about twice its usual time. It sources `latency.sh` (which sources `udp.sh`) for the topology and the keystroke cells, so it needs what both need: root, `iproute2`, `iptables`, `conntrack`, `ethtool`, `openssh-server`, `python3`. A third throwaway user, `rnmallory`, is made for `f_fwd_other_user` and removed at the end.
 
 Knobs: `FWD_PULL_SHORT` and `FWD_PULL_LONG` (30 and 300 s), `FWD_MANY` (10000), `FWD_STRESS_COUNT` and `FWD_STRESS_PAR` (20000 and 200; CI sets 4000).
 

@@ -75,7 +75,7 @@ mutate_wf() {
     expect_fail "mutation: $name" "$RELEASE_DIR/lint-workflow.sh" "$tmp/wf.yml"
   fi
 }
-# the check profile: the two manual check workflows
+# the check profile: the two check workflows (dispatch, pull_request, push of main)
 for cw in linux-check macos-check; do
   expect_pass "the $cw workflow passes the check-profile lint" "$RELEASE_DIR/lint-workflow.sh" --check "$REPO_ROOT/.github/workflows/$cw.yml"
 done
@@ -91,7 +91,20 @@ mutate_cw() {
 }
 mutate_cw "an action is pinned by a tag" 's/(uses: actions\/checkout@)[0-9a-f]{40}/${1}v7/'
 mutate_cw "a checkout keeps credentials" 's/persist-credentials: false/persist-credentials: true/'
-mutate_cw "a pull_request trigger" 's/(on:\n)/${1}  pull_request:\n/'
+mutate_cw "a pull_request_target trigger" 's/(\n  pull_request:\n)/\n  pull_request_target:\n/'
+mutate_cw "pull_request with types" 's/(\n  pull_request:\n)/${1}    types: [opened, synchronize, closed, labeled]\n/'
+mutate_cw "pull_request with branches" 's/(\n  pull_request:\n)/${1}    branches: [main]\n/'
+mutate_cw "push without the branch filter" 's/(\n  push:\n)    branches: \[main\]\n/$1/'
+mutate_cw "push to another branch" 's/(\n  push:\n    branches: \[)main\]/${1}main, release]/'
+mutate_cw "push to every branch" 's/(\n  push:\n    branches: \[)main\]/${1}"**"]/'
+mutate_cw "push of tags" 's/(\n  push:\n    branches: \[main\]\n)/${1}    tags: ["v*"]\n/'
+mutate_cw "push with a path filter" 's/(\n  push:\n    branches: \[main\]\n)/${1}    paths: ["**"]\n/'
+mutate_cw "an inline push trigger" 's/\n  push:\n    branches: \[main\]\n/\n  push: {branches: [main]}\n/'
+mutate_cw "a workflow_run trigger" 's/(on:\n)/${1}  workflow_run:\n    workflows: [release]\n/'
+mutate_cw "no workflow_dispatch" 's/\n  workflow_dispatch:\n(?:    .*\n)*/\n/'
+mutate_cw "a job gets an inline permissions map" 's/(\n  lint:\n)/${1}    permissions: {contents: write}\n/'
+mutate_cw "a job gets a quoted write permission" 's/(\n  lint:\n)/${1}    permissions:\n      contents: "write"\n/'
+mutate_cw "a job gets a single-quoted write permission" "s/(\\n  lint:\\n)/\${1}    permissions:\\n      actions: 'write'\\n/"
 mutate_cw "the workflow gets contents: write" 's/(permissions:\n  contents: )read/${1}write/'
 mutate_cw "a matrix value reaches a run: line" 's/run: just realnet "\$PART"/run: just realnet \${{ matrix.part }}/'
 mutate_cw "a secret is used" 's/(PART: )/SECRET_X: \${{ secrets.X }}\n          $1/'
@@ -2460,8 +2473,8 @@ elif a[:2] in (["run", "watch"], ["run", "rerun"]):
             allsuite = r.get("suite") == "all"
             skip = lambda c: c if allsuite else "skipped"
             r["jobs"] = {"release.yml": [["build-linux", res], ["publish", "skipped"]],
-                         "linux-check.yml": [["check", "success"], ["realnet (a)", skip("success")], ["aarch64", skip("success")], ["terminals", skip(res)]],
-                         "macos-check.yml": [["check (arm64)", res], ["remote (openssh)", skip("success")]]}[r["workflow"]]
+                         "linux-check.yml": [["check", "success"], ["realnet (a)", skip("success")], ["aarch64", skip("success")], ["terminals", skip(res)], ["full-scale (1/3)", skip("success")]],
+                         "macos-check.yml": [["check (arm64)", res], ["remote (openssh)", skip("success")], ["dropin (arm64)", skip("success")]]}[r["workflow"]]
             r.update(status="completed", conclusion=res)
         print("run %s completed: %s" % (r["id"], r["conclusion"]))
     json.dump(r, open(p, "w"))
@@ -3355,6 +3368,14 @@ mkrun 105 linux-check.yml linux-check workflow_dispatch main "$RG" completed suc
 grep -v '^checks_linux=' "$rs/state.k" > "$RSTATE"
 rl_kind 3 dry-run "done (checked)" "a newer suite=check run is passed over"
 expect_pass "release status: ...with the runs' URLs" sh -c 'grep -q "https://github.com/o/r/actions/runs/101" "$1" && grep -q "actions/runs/102" "$1"' sh "$rs/status.out"
+# a newer suite=extended run has check, aarch64, terminals (and realnet), or check and remote, all
+# green, but no full-scale (1/3) or dropin (arm64): it is not the release candidate either
+mkrun 106 linux-check.yml linux-check workflow_dispatch main "$RG" completed success check=success "realnet (a)=success" aarch64=success terminals=success "full-scale (1/3)=skipped"
+mkrun 107 macos-check.yml macos-check workflow_dispatch main "$RG" completed success "check (arm64)=success" "remote (user sshd)=success" "dropin (arm64)=skipped"
+grep -Ev '^checks_(linux|macos)=' "$rs/state.k" > "$RSTATE"
+rl_kind 3 dry-run "done (checked)" "newer suite=extended runs are passed over"
+expect_pass "release status: ...neither is named" sh -c '! grep -Eq "actions/runs/10[67]" "$1"' sh "$rs/status.out"
+rm -f "$rs/world/runs/106.json" "$rs/world/runs/107.json"
 # a green suite=all run on R from before the state was bound (R sat on GitHub's main for a while; the
 # run may have had another `ref` input, which GitHub does not report) is not this release's: the
 # window opens at bound_at, not at R's commit time

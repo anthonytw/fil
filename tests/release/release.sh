@@ -430,17 +430,18 @@ rv_no_failed_job() { ! grep -Eq '^job (failure|cancelled|timed_out|action_requir
 # The runs each step needs, as predicates on a viewed run.
 pred_dry() { rv_has "$1" "workflowName release" && rv_has "$1" "event workflow_dispatch" && rv_has "$1" "headSha $G" && rv_has "$1" "conclusion success"; }
 # suite=all is not in the run's metadata (inputs are not reported): its jobs are. linux-check runs
-# `check` with aarch64 and terminals only for suite=all; macos-check runs check and remote together
-# only for suite=all. The workflows' `ref` input is not reported either: a run dispatched on main
+# `full-scale (1/3)` only for suite=all (suite=extended has check, aarch64 and terminals too);
+# macos-check runs `dropin (arm64)` only for suite=all (extended has check and remote too). The workflows' `ref` input is not reported either: a run dispatched on main
 # (head G) with `-f ref=OTHER` tested OTHER, and only the run ids the command dispatches itself and
 # records (PR 4) close that gap; a discovered run is trusted to have tested its head.
 pred_linux_all() {
   rv_has "$1" "workflowName linux-check" && rv_has "$1" "event workflow_dispatch" && rv_has "$1" "headSha $G" && rv_has "$1" "conclusion success" \
-    && rv_has "$1" "job success check" && rv_has "$1" "job success aarch64" && rv_has "$1" "job success terminals" && rv_no_failed_job "$1"
+    && rv_has "$1" "job success check" && rv_has "$1" "job success aarch64" && rv_has "$1" "job success terminals" \
+    && rv_has "$1" "job success full-scale (1/3)" && rv_no_failed_job "$1"
 }
 pred_macos_all() {
   rv_has "$1" "workflowName macos-check" && rv_has "$1" "event workflow_dispatch" && rv_has "$1" "headSha $G" && rv_has "$1" "conclusion success" \
-    && rv_job_prefix "$1" "check (" && rv_job_prefix "$1" "remote (" && rv_no_failed_job "$1"
+    && rv_job_prefix "$1" "check (" && rv_job_prefix "$1" "remote (" && rv_has "$1" "job success dropin (arm64)" && rv_no_failed_job "$1"
 }
 pred_tag_run() { rv_has "$1" "workflowName release" && rv_has "$1" "event push" && rv_has "$1" "headSha $G" && rv_has "$1" "job success publish"; }
 # run_ours ID: a dispatched run that is this release's: triggered by the gh user running the command

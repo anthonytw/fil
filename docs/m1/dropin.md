@@ -29,7 +29,7 @@ just dropin --list                            # the scenario names
 just dropin --local                           # this machine, a private daemon, no targets needed
 ```
 
-`--scale smoke|full` (default `FIL_TEST_SCALE`, else `smoke`; `docs/dev/timing-tests.md` "Tiers"): the smoke run, macos-check's per-PR one, leaves out the scenarios in `FULL_ONLY` (`crates/fil/examples/dropin/main.rs`: the stress, the 90 s idle, the prediction scenarios but `predict_secret`) and runs `client_sleep` and `fwd_sleep` with the 12 s auto variant only; a scenario named in `--only` runs at either scale. The results below are full runs.
+`--scale smoke|full` (default `FIL_TEST_SCALE`, else `smoke`; `docs/dev/timing-tests.md` "Tiers"): the smoke run (the default; CI runs `--set quick` or full) leaves out the scenarios in `FULL_ONLY` (`crates/fil/examples/dropin/main.rs`: the stress, the 90 s idle, the prediction scenarios but `predict_secret`) and runs `client_sleep` and `fwd_sleep` with the 12 s auto variant only; a scenario named in `--only` runs at either scale. `--set NAME` runs a named set as `--only` would (`SETS` in `main.rs`: `quick`, every scenario under about 6 s and `predict_secret`, linux-check's per-PR run and the extended set's macOS and arm64 runs; `long`, the arm64 run's second shard; `realnet_fwd`, the four forward scenarios realnet covers), and `--skip NAME,@SET` leaves scenarios out. The results below are full runs.
 
 The Pi binary must be installed first (`docs/m1/pi.md`), and it must be built from the same tree as the client: the wire format moves between milestones, and a client and daemon from different trees stop at "protocol error".
 

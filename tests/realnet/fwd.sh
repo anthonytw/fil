@@ -1190,14 +1190,41 @@ FWD_SCENARIOS=(
   f_fwd_many_short f_fwd_ending_stress f_fwd_other_user f_fwd_vs_ssh f_fwd_parallel f_fwd_stuck
 )
 
+# The groups CI runs as jobs of their own (run.sh's fwd-* parts; docs/dev/timing-tests.md "Tiers"):
+# func, the functional scenarios (linux-check's extended set and release candidate); stress and the
+# two perf halves, the measurements (release candidate only); cable, the done-when's cable pulls.
+FWD_GROUP_CABLE=(f_fwd_cable_pull)
+FWD_GROUP_FUNC=(f_fwd_reconnect f_fwd_swap f_fwd_sleep f_fwd_roam f_fwd_many_short f_fwd_other_user)
+FWD_GROUP_STRESS=(f_fwd_ending_stress)
+FWD_GROUP_PERF_A=(f_fwd_vs_ssh f_fwd_stuck)
+FWD_GROUP_PERF_B=(f_fwd_parallel)
+
 # Sourced by agent.sh for the topology and the helpers; run directly, it is the fwd part.
-# `--rest` is every scenario but the cable pull (CI runs the two halves as two jobs, run.sh).
+# `--group NAME` (cable, func, stress, perf-a, perf-b) runs one group; `--rest` is every scenario
+# but the cable pull.
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-  if [[ ${1:-} == --rest ]]; then
-    shift
-    rest=()
-    for x in "${FWD_SCENARIOS[@]}"; do [[ $x == f_fwd_cable_pull ]] || rest+=("$x"); done
-    set -- "${rest[@]}" "$@"
-  fi
+  case ${1:-} in
+    --rest)
+      shift
+      rest=()
+      for x in "${FWD_SCENARIOS[@]}"; do [[ $x == f_fwd_cable_pull ]] || rest+=("$x"); done
+      set -- "${rest[@]}" "$@"
+      ;;
+    --group)
+      case ${2:-} in
+        cable) group=("${FWD_GROUP_CABLE[@]}") ;;
+        func) group=("${FWD_GROUP_FUNC[@]}") ;;
+        stress) group=("${FWD_GROUP_STRESS[@]}") ;;
+        perf-a) group=("${FWD_GROUP_PERF_A[@]}") ;;
+        perf-b) group=("${FWD_GROUP_PERF_B[@]}") ;;
+        *)
+          echo "fwd.sh: --group cable|func|stress|perf-a|perf-b" >&2
+          exit 2
+          ;;
+      esac
+      shift 2
+      set -- "${group[@]}" "$@"
+      ;;
+  esac
   part_main fwd fwd_setup fwd_teardown "${FWD_SCENARIOS[@]}" -- "$@"
 fi

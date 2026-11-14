@@ -33,10 +33,17 @@
 #  11. the `prepare` job runs `cargo deny --locked check` with at least `bans` and `sources`, so that
 #      deny.toml (owned) bounds the unowned Cargo.lock on the release path itself.
 #
-# The check profile (--check): these workflows run on a manual dispatch only and hold no secret.
+# The check profile (--check): these workflows run on a dispatch, a pull request or a push of main,
+# and hold no secret.
 #   C1. the workflow's `permissions:` is a block holding `contents: read` only; no job names a
-#       `write` or `write-all` permission;
-#   C2. the only trigger is workflow_dispatch (no push, pull_request*, workflow_run or issue_comment);
+#       `write` or `write-all` permission (quoted or not), and a job's `permissions:` is a block,
+#       `{}` or `read-all` (an inline map such as `{contents: write}` would hide a write);
+#   C2. the triggers are workflow_dispatch (required), `pull_request` with no settings (any base branch;
+#       no `types:`, `branches:` or `paths:` that would change which events run it; never
+#       pull_request_target, whose runs get a write token and the base repository's secrets) and
+#       `push` with exactly `branches: [main]` (no tags, paths or other branches); nothing else
+#       (workflow_run, issue_comment, schedule, ...). A pull_request run from a fork gets a
+#       read-only token and no secret, which C1 and C5 keep true for every run;
 #   C3. every `uses:` is pinned by a full 40-hex commit SHA, and every checkout sets
 #       `persist-credentials: false`;
 #   C4. no `${{ }}` expression inside a `run:` (an input or a matrix value reaches the shell through `env:`);
@@ -84,11 +91,24 @@ if [ "${1:-}" = --check ]; then
         if (section == "permissions" && indent == 2 && line !~ /^  contents:[ ]*read[ ]*$/) bad("top-level permissions allow more than contents: read: " line)
         if (section == "on" && indent == 2) {
           key = line; sub(/^ */, "", key); sub(/:.*/, "", key)
-          if (key != "workflow_dispatch") bad("trigger " key " is not allowed (workflow_dispatch only)")
+          trig = key
+          if (key == "workflow_dispatch") dispatch_seen = 1
+          else if (key == "push") push_seen = 1
+          else if (key != "pull_request") bad("trigger " key " is not allowed (workflow_dispatch, pull_request and a push of main only)")
           val = line; sub(/^[^:]*:[ ]*/, "", val)
           if (val != "") bad("trigger " key " must be a block, not inline: " line)
         }
-        if (section == "jobs" && line ~ /^ *[A-Za-z-]+:[ ]*write(-all)?[ ]*$/) bad("a write permission: " line)
+        if (section == "on" && indent > 2) {
+          if (trig == "pull_request") bad("pull_request takes no settings (types, branches or paths would change which events run it): " line)
+          if (trig == "push") {
+            if (indent == 4 && line ~ /^    branches:[ ]*\[[ ]*main[ ]*\][ ]*$/) push_main = 1
+            else bad("push may name exactly branches: [main] and nothing else: " line)
+          }
+        }
+        if (section == "jobs" && line ~ /^ *[A-Za-z-]+:[ ]*["\047]?write(-all)?["\047]?[ ]*$/) bad("a write permission: " line)
+        # Job permissions are a block (each scope on a line of its own, which the rule above
+        # reads) or one of the inline forms that grant nothing more: {} and read-all.
+        if (section == "jobs" && line ~ /^ +permissions:[ ]*[^ ]/ && line !~ /^ +permissions:[ ]*(\{[ ]*\}|read-all)[ ]*$/) bad("a job permissions value that is not a block, {} or read-all: " line)
         if (line ~ /write-all/) bad("write-all: " line)
         if (line ~ /uses:/) {
           u = line; sub(/^.*uses:[ ]*/, "", u); gsub(/["]/, "", u)
@@ -102,6 +122,8 @@ if [ "${1:-}" = --check ]; then
       END {
         finish_checkout()
         if (!top_seen) bad("no top-level permissions: contents: read")
+        if (!dispatch_seen) bad("no workflow_dispatch trigger")
+        if (push_seen && !push_main) bad("push without branches: [main] (it would run on every branch and tag)")
         exit fails ? 1 : 0
       }
     ' "$f" || rc=1

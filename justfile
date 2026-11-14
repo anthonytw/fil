@@ -24,18 +24,24 @@ default:
 # so that a missing cargo-about (the Notices section below) does too. Not in it: the wall-clock
 # tests (on a shared CI runner they measure the host), the `soak_` tests and the full sizes
 # (FIL_TEST_SCALE=full), and `release-test` (the release scripts' own tests, a parallel job of
-# linux-check; run it when you touch tests/release, packaging or the workflows). `ci-release` has
-# all of them.
-ci: deny notices ci-workflow-test exporter-lock fmt-check clippy check-default release-deps test
+# linux-check; run it when you touch tests/release, packaging or the workflows). `ci-release-full`
+# has all of them.
+ci: lint test
 
-# Before a release (docs/m4/release.md §9.2), on a quiet machine (an hour or more; not yet timed whole): `ci`, then
-# everything the per-PR tiers leave out: the release scripts' tests, every test at full size with
-# the `soak_` tests (`test-release`), the wall-clock tests alone, the full drop-in suite, the
-# prediction matrix, terminal pacing, the PTY and prediction harnesses, and the shipped (fat-LTO)
-# build's no-test-hooks check. GitHub's suite=all runs the rest (realnet, aarch64, terminals,
-# Intel macOS, macOS as the remote host). Every part runs even when an earlier one fails (one red
-# test must not hide the drop-in suite or pacing); the recipe fails at the end, listing the parts
-# that failed.
+# `ci` without the tests: linux-check's `lint` job (which then runs the drop-in quick set).
+lint: deny notices ci-workflow-test exporter-lock fmt-check clippy check-default release-deps
+
+# Before a release (docs/m4/release.md §9.2), on a quiet machine (about 20 min; docs/dev/timing-tests.md
+# "Tiers"): only what needs a quiet host and a real clock, which no shared runner gives: the
+# wall-clock tests alone, terminal pacing (K1, a DESIGN §8.5 P bound), the fidelity harness with its
+# performance checks, the prediction PTY harness at its defaults and the prediction suites (the
+# decided §2.5 bar). GitHub's release candidate (`suite=all` of linux-check and macos-check, which
+# `tests/release/just.sh release` dispatches) runs the rest: `ci`, the release scripts' tests, every
+# test at full size with the soaks, the PTY tests, the guard sweep, the full drop-in suite on macOS
+# and on arm64 Linux, realnet, the terminals; release.yml checks the shipped binaries for test hooks.
+# `ci-release-full` runs all of that here instead, for a release made without GitHub. Every part
+# runs even when an earlier one fails (one red test must not hide pacing); the recipe fails at the
+# end, listing the parts that failed.
 ci-release:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -43,18 +49,11 @@ ci-release:
     j=(just --justfile "{{source_file()}}" --working-directory "{{source_directory()}}")
     failed=()
     part() { echo "==== ci-release: $*"; "${j[@]}" "$@" || failed+=("$*"); }
-    part ci
-    part release-test
-    part test-release
     part test-wallclock
-    part client-pty
-    part predict-mutants
-    part shipped-no-test-hooks
+    part pacing
     part fidelity
     part predict-harness
     part predict-suites all
-    part pacing
-    part dropin --local --scale full
     if [ ${#failed[@]} -gt 0 ]; then
       echo "==== ci-release: FAILED: ${#failed[@]} part(s):" >&2
       printf '  just %s\n' "${failed[@]}" >&2
@@ -62,10 +61,37 @@ ci-release:
     fi
     echo "==== ci-release: every part passed"
 
+# Everything before a release on this machine alone (an hour or more): `ci`, then everything the
+# per-PR tiers leave out: the release scripts' tests, every test at full size with the `soak_` tests
+# (`test-release`), the wall-clock tests alone, the full drop-in suite, the prediction matrix,
+# terminal pacing, the PTY and prediction harnesses, and the shipped (fat-LTO) build's no-test-hooks
+# check. GitHub's suite=all runs the rest (realnet, aarch64, terminals, macOS as the remote host).
+ci-release-full:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cd "{{source_directory()}}"
+    j=(just --justfile "{{source_file()}}" --working-directory "{{source_directory()}}")
+    failed=()
+    part() { echo "==== ci-release-full: $*"; "${j[@]}" "$@" || failed+=("$*"); }
+    part ci
+    part release-test
+    part test-release
+    part ci-release
+    part client-pty
+    part predict-mutants
+    part shipped-no-test-hooks
+    part dropin --local --scale full
+    if [ ${#failed[@]} -gt 0 ]; then
+      echo "==== ci-release-full: FAILED: ${#failed[@]} part(s):" >&2
+      printf '  just %s\n' "${failed[@]}" >&2
+      exit 1
+    fi
+    echo "==== ci-release-full: every part passed"
+
 # The release binary as shipped (the release profile: fat LTO, one codegen unit) has no test hooks.
 # The per-PR check builds the `ci` profile instead (`no-test-hooks` checks feature unification,
-# which the profile does not change); this one runs in `ci-release` and the check workflows'
-# suite=all.
+# which the profile does not change); this one runs in `ci-release-full`. release.yml checks the
+# shipped binaries itself.
 shipped-no-test-hooks:
     cargo build --release -p fil-shell --bins
     just no-test-hooks "{{target_dir}}/release/fil"
@@ -125,13 +151,24 @@ test-os: _nextest
 # apart and one test at a time (`forward-soak`), since its full sizes use up the machine's ephemeral
 # ports and listen queues. The wall-clock tests are `test-wallclock`'s. Both halves run even when
 # the first fails; the recipe fails at the end, naming them.
-test-release: _nextest
+#
+# `just test-release K/N` runs one of N shards (nextest's `--partition hash:K/N`; linux-check's
+# full-scale jobs), with forward-soak in shard 1 only.
+test-release shard="": _nextest
     #!/usr/bin/env bash
     set -uo pipefail
     cd "{{source_directory()}}"
     failed=()
-    FIL_TEST_SCALE=full cargo nextest run --workspace --all-features --cargo-profile ci -P release -E 'not package(fil-forward) and not test(/(^|::)wallclock_/)' || failed+=("every test but fil-forward, at full size")
-    just --justfile "{{source_file()}}" --working-directory "{{source_directory()}}" forward-soak || failed+=("forward-soak")
+    shard="{{shard}}"
+    part=()
+    if [ -n "$shard" ]; then
+      [[ $shard =~ ^[1-9][0-9]*/[1-9][0-9]*$ ]] || { echo "test-release: the shard is K/N, e.g. 1/3" >&2; exit 2; }
+      part=(--partition "hash:$shard")
+    fi
+    FIL_TEST_SCALE=full cargo nextest run --workspace --all-features --cargo-profile ci -P release ${part[@]+"${part[@]}"} -E 'not package(fil-forward) and not test(/(^|::)wallclock_/)' || failed+=("every test but fil-forward, at full size${shard:+, shard $shard}")
+    if [ -z "$shard" ] || [ "${shard%%/*}" = 1 ]; then
+      just --justfile "{{source_file()}}" --working-directory "{{source_directory()}}" forward-soak || failed+=("forward-soak")
+    fi
     if [ ${#failed[@]} -gt 0 ]; then
       printf 'test-release: FAILED: %s\n' "${failed[@]}" >&2
       exit 1
@@ -397,8 +434,9 @@ pi-e2e *args:
 # needed; a development aid). Targets as for pi-e2e. A skipped scenario or a
 # missing tool fails the run unless allowed. The M2 forward scenarios (docs/m2/dropin.md) also use
 # this machine's fwdprobe, built here, and the host's, installed through the gate. `--scale
-# smoke|full` (default FIL_TEST_SCALE, else smoke): smoke, macos-check's per-PR run, leaves out
-# the long scenarios; `ci-release` and suite=all run full. Built in the `ci` profile. Never part of `ci`.
+# smoke|full` (default FIL_TEST_SCALE, else smoke): smoke leaves out the long scenarios; suite=all
+# and `ci-release-full` run full. `--set quick` (per PR on Linux, per merge batch on macOS and arm64)
+# and `--skip NAME,@SET`: crates/fil/examples/dropin/main.rs's SETS. Built in the `ci` profile. Never part of `ci`.
 dropin *args:
     cargo build -q --profile ci -p fil-shell --bins
     cargo build -q --profile ci -p fil-shell --example dropin

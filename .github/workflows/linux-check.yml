@@ -1,8 +1,26 @@
-# Linux check, dispatched by hand. `suite=check` on the PR head is part of the merge gate (CLAUDE.md § Delivery),
-# and the coordinator dispatches it on `main` after each owner push there, which is what saves the
-# rust-cache every other run restores (save-if below). The tiers: docs/dev/timing-tests.md "Tiers".
-# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|realnet|aarch64|arm64-remote|latency|terminals|all`),
+# Linux check: the PR gate on every pull request, the extended set on every push of main, and any
+# suite by hand. The tiers (docs/dev/timing-tests.md "Tiers"; the CI rework for
+# 0.2.1, three suites by what a run is for):
+#   check     the PR gate, on every PR head (CLAUDE.md § Delivery), about 10 min: `lint` (`just lint`,
+#             then the drop-in quick set against a private daemon on Linux), `check` (`just test` and
+#             the per-PR harnesses) and `release-test` (the release scripts' own tests, only when the
+#             change touches the release paths, tests/ci/release-paths.sh).
+#   extended  once per merge batch, on `main` (the run of each push of main,
+#             which is also what saves the rust-cache every other run restores; save-if below), about
+#             15 min: the gate's jobs, realnet's functional parts, the terminals, and the arm64 smoke
+#             (the static aarch64 build installed through the gate, pi_e2e, the drop-in quick set).
+#   all       the release candidate (`tests/release/just.sh release` dispatches it), about 20 min:
+#             extended's jobs, release-test always, every test at full size in three shards, realnet
+#             with the cable pulls and the measurements, and the arm64 run in two shards (the full
+#             drop-in suite with prediction on, but the forward scenarios realnet runs).
+# realnet, aarch64, arm64-remote, terminals and latency run one area on its own.
+# Run with `gh workflow run linux-check` (optionally `-f ref=BRANCH -f suite=check|extended|all|realnet|aarch64|arm64-remote|latency|terminals`),
 # then `gh run watch`.
+#
+# Triggers: the jobs read the suite as `inputs.suite`, else `extended` for a push (of main: the
+# only push this runs on) and `check` for a pull request (tests/release/lint-workflow.sh's check
+# profile allows exactly these forms, C2; never pull_request_target).
+# The gate's job names (`lint`, `check`, `release-test`) are what a ruleset requires: keep them.
 #
 # Supply chain: every action is pinned by full commit SHA (the comment names the release tag), the
 # tools install-action fetches are pinned to a version, and every checkout drops its token. To bump
@@ -18,51 +36,109 @@ on:
         required: false
         default: main
       suite:
-        description: "check (just ci: lint and every test but the soaks at smoke size; the per-PR harnesses; the release scripts' tests in a parallel job), realnet (real OpenSSH and Linux network tests, static x86_64 musl build), aarch64 (the static aarch64 fil binary, docs/m1/pi.md), arm64-remote (that binary as the remote host on GitHub's arm64 Linux runner: pi_e2e and the full drop-in suite with prediction on, the run the Pis used to be; docs/m1/pi.md), latency (only the latency lab, docs/m2/latency.md: keystroke latency and TCP_NODELAY under netem, and M3's prediction cells, docs/m3/plan.md §5.5; two jobs, never part of the others), terminals (fil's terminal writes replayed into real xterm, kitty, WezTerm and tmux under Xvfb and read back, docs/m3/terminals.md) or all (check, realnet, aarch64, arm64-remote, terminals, and every test at full size with the soaks)"
+        description: "check (the PR gate: lint and the drop-in quick set; every test but the soaks at smoke size and the per-PR harnesses; the release scripts' tests when the release paths change), extended (per merge batch on main: the gate, realnet's functional parts, terminals, the arm64 smoke), all (the release candidate: extended, every test at full size, realnet with the cable pulls and measurements, the arm64 full drop-in suite with prediction on), or one area: realnet, aarch64 (the static aarch64 fil binary, docs/m1/pi.md), arm64-remote (that binary as the remote host on GitHub's arm64 Linux runner: pi_e2e and the drop-in suite with prediction on), latency (the latency lab and M3's prediction cells, never part of the others), terminals (real xterm, kitty, WezTerm and tmux under Xvfb, docs/m3/terminals.md)"
         type: choice
-        options: [check, realnet, aarch64, arm64-remote, latency, terminals, all]
+        options: [check, extended, all, realnet, aarch64, arm64-remote, latency, terminals]
         default: check
       strict:
         description: "realnet: fail on known findings in fil (KNOWN-BUG in the results) instead of recording them"
         type: boolean
         default: false
+  # The PR gate on every pull request (suite=check: the jobs read the suite from the event), and
+  # the extended set on every push of main (each merge batch; the run that saves the rust-cache).
+  # A fork's pull request runs with a read-only token and no secret (none is used here). Only these
+  # two forms are allowed (tests/release/lint-workflow.sh --check, C2).
+  pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
 
+# One run per PR (or branch) and suite: a newer push to a PR cancels its older run. A dispatch is
+# keyed by its `ref` input as well (a re-dispatch of the same head replaces the older one; another
+# head or suite runs beside it), and a push of main by its commit, so that nothing on main is ever
+# cancelled or replaced while it waits: each merge batch's run, and the release's suite=all, run to
+# the end.
+concurrency:
+  group: linux-check-${{ github.event.pull_request.number || github.ref }}-${{ inputs.suite || github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event_name == 'push' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
-  check:
-    if: inputs.suite != 'realnet' && inputs.suite != 'aarch64' && inputs.suite != 'arm64-remote' && inputs.suite != 'latency' && inputs.suite != 'terminals'
+  lint:
+    # The PR gate's first half (suite check, extended, all): `just lint` (cargo deny with the fetched
+    # RustSec database, the notices, the CI workflow test, the exporter lock, fmt, clippy, the
+    # default-features check, release-deps), then the drop-in quick set (`dropin --set quick`:
+    # every scenario under about 6 s, and predict_secret) against a private daemon on Linux: the
+    # end-to-end run per PR now that macOS's drop-in is per merge batch.
+    if: contains(fromJSON('["check","extended","all"]'), (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')))
     runs-on: ubuntu-24.04
-    # About 7 min with main's cache, 9 cold (the test-suite sweep's estimate, 2026-11-11: `just ci`
-    # with the emulators optimized in tests and nextest, the harnesses in the `ci` profile). It
-    # took 26.7 of a 30 min limit when it also ran release-test and the netsim soak; those are the
-    # `release-test` job and `test-release` now. Twice the cold time.
+    # About 7 min with main's cache (an estimate: 3 of lint, a ci-profile build, 2 of scenarios).
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
-          # The ref's build scripts and tests run in this job; leave no token in .git/config.
           persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          tool: just@1.59.0,cargo-deny@0.20.2,cargo-about@0.9.3,cargo-nextest@0.9.149
+          tool: just@1.59.0,cargo-deny@0.20.2,cargo-about@0.9.3
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Restore always; save only from a dispatch on main that checks main (the coordinator's,
-          # after each owner push): a run on any other ref must not seed a cache that a later run
-          # of main restores, and a cache saved under another branch's ref would not be restored
-          # by the PR runs.
-          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
-      # The steps after `just ci` run even when an earlier one failed, so one run shows every red
+          # Restore always; save only from main's own run (the extended set after each push of main):
+          # a run on any other ref must not seed a cache that a later run of main restores.
+          save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
+      - name: Drop-in tools (htop; top, git and ssh-add come with the image)
+        run: sudo apt-get update && sudo apt-get install -y htop vim less
+      # The steps after the first run even when an earlier one failed, so one run shows every red
       # step; the job is red if any of them is.
-      - name: just ci (lint; logic and OS tests at smoke size, no soaks, no wall-clock tests)
-        run: just ci
-      # Feature unification, which the profile does not change: the fat-LTO build of the same
-      # check is `shipped-no-test-hooks` (suite=all, `just ci-release`).
+      - name: just lint (deny, notices, workflow test, exporter lock, fmt, clippy, default features, release-deps)
+        run: just lint
+      - name: Drop-in quick set, local (a private daemon on Linux, real PTYs, no ssh)
+        if: ${{ !cancelled() }}
+        run: just dropin --local --set quick
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lint-dropin
+          path: |
+            ~/.local/state/fil
+            target/dropin
+            !target/dropin/agentkey-*
+            !target/dropin/agent-*.sock
+          if-no-files-found: ignore
+          retention-days: 14
+
+  check:
+    # The PR gate's second half (suite check, extended, all): `just test` (every test, logic and OS,
+    # at smoke size, without the wallclock_ and soak_ tests; doctests) and the per-PR harnesses.
+    # The job keeps the name `check`: release.sh recognizes a suite=all run by it.
+    if: contains(fromJSON('["check","extended","all"]'), (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')))
+    runs-on: ubuntu-24.04
+    # About 7 min with main's cache (an estimate: `just ci` was 6.1-7.5 of an 8-10 min job with lint in it).
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: just@1.59.0,cargo-nextest@0.9.149
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # full-scale restores this job's cache (`shared-key: check` there is this job's own key).
+          # Restore always, save only from main's own run (see lint).
+          save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
+      - name: just test (logic and OS tests at smoke size, no soaks, no wall-clock tests)
+        run: just test
+      # Feature unification, which the profile does not change: release.yml checks the shipped
+      # (fat-LTO) binaries itself.
       - name: The fil binary built on its own has no test hooks (ci profile)
         if: ${{ !cancelled() }}
         run: |
@@ -84,45 +160,61 @@ jobs:
 
   release-test:
     # The release scripts' own tests (`tests/release/just.sh release-test`: the workflow lint and
-    # its mutations, tag signers, release-check on synthetic releases, ...), 1,045 checks of bash,
-    # beside `check` rather than in it. Platform-independent but for the macOS signing fakes, which
-    # macos-check runs when a change touches the release paths. release.yml's own release-test job
-    # runs them again for a release.
-    if: inputs.suite == 'check' || inputs.suite == 'all'
+    # its mutations, tag signers, release-check on synthetic releases, ...), beside the gate. In
+    # check and extended only when the change touches the release paths (tests/ci/release-paths.sh;
+    # main's own run has no change, so it ends after that step); in all, always: the one run of
+    # them per release candidate (macos-check runs them per PR on the release paths, release.yml
+    # its own). The job always exists in the gate, so a ruleset can require it.
+    if: contains(fromJSON('["check","extended","all"]'), (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')))
     runs-on: ubuntu-24.04
     # About 11 min (632 s of release-test on 2026-11-11, with the setup). Twice that, rounded.
     timeout-minutes: 25
+    env:
+      SUITE: ${{ (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
+          # The whole history: the merge base the paths step diffs against, and selftest's git cases.
           fetch-depth: 0
           persist-credentials: false
+      - name: Does the change touch the release paths?
+        id: relpaths
+        run: |
+          if [ "$SUITE" = all ]; then echo "run=true" >> "$GITHUB_OUTPUT"; else tests/ci/release-paths.sh; fi
       - name: Toolchain (from rust-toolchain.toml)
+        if: steps.relpaths.outputs.run == 'true'
         run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        if: steps.relpaths.outputs.run == 'true'
         with:
           tool: just@1.59.0
       - name: Lint the release scripts (as release.yml does, so a warning shows up before a release)
+        if: steps.relpaths.outputs.run == 'true'
         # --norc: no .shellcheckrc of the tree turns a check off; ubuntu-24.04's shellcheck is release.yml's
-        run: shellcheck --norc -x -S warning tests/release/*.sh
+        run: shellcheck --norc -x -S warning tests/release/*.sh tests/ci/release-paths.sh
       - name: The release scripts' own tests
+        if: steps.relpaths.outputs.run == 'true'
         run: tests/release/just.sh release-test
 
   full-scale:
     # suite=all: every test at full size (FIL_TEST_SCALE=full), the `soak_` tests included
-    # (`just test-release`: the fil-predict, status and MUX soaks, channel churn at 20,000, the
-    # netsim soak, then fil-forward at 256 MiB and 20,000 connections one test at a time), on
-    # Linux, where the logic tests live. `just ci-release` runs the same on the Mac.
-    # Then the prediction performance budget's bench on this x86_64 runner (done-when 7 of
-    # docs/m3/plan.md; the arm64 runner's is in the arm64-remote job): it prints, it does not judge.
-    if: inputs.suite == 'all'
+    # (`just test-release K/3`: the fil-predict, status and MUX soaks, channel churn at 20,000, the
+    # netsim soak), in three nextest partitions, on Linux, where the logic tests live; fil-forward
+    # at 256 MiB and 20,000 connections (`forward-soak`) in shard 1. Then, in shard 2, the
+    # prediction performance budget's bench on this x86_64 runner (done-when 7 of docs/m3/plan.md;
+    # the arm64 runner's is in arm64-remote): it prints, it does not judge.
+    if: (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')) == 'all'
+    name: full-scale (${{ matrix.shard }}/3)
     runs-on: ubuntu-24.04
-    # Not measured on a runner yet (an estimate). On the dev Mac (14 cores) the first full-size pass
-    # took 17 min, most of it one test (the prior-ack rule at 200 seeds; over 40 min on a runner);
-    # that test now runs 16 seeds at full size, about 86 s on the Mac, so the pass is shorter (not
-    # re-measured as a whole). The forward soak took 83 s; a 4-vCPU runner builds and runs slower.
-    timeout-minutes: 60
+    # Unsharded it took 28.9 min (linux-check 43302205328); a third of the tests and a build each.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      SHARD: ${{ matrix.shard }}/3
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -135,12 +227,14 @@ jobs:
           tool: just@1.59.0,cargo-nextest@0.9.149
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Restore always, save only from main (see the check job).
-          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
-      - name: Every test at full size, the soaks included
-        run: just test-release
+          # check's cache (main's; its key is its job id), restored only: three shards must not race
+          # to save one key.
+          shared-key: check
+          save-if: false
+      - name: Every test at full size, the soaks included (one shard of 3)
+        run: just test-release "$SHARD"
       - name: The prediction performance budget on this runner (docs/m3/plan.md §2.10, done-when 7)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.shard == 2 }}
         run: |
           # Without pipefail tee's status would win: a bench that fails to build or panics must
           # fail the step, not leave an empty summary.
@@ -152,26 +246,30 @@ jobs:
     # Tier 1 of the environment tests (docs/m1/realnet.md), on the real `fil` binary: real OpenSSH
     # in Docker containers (ssh part), the real Linux network stack with NAT and tc netem in
     # network namespaces (udp part), a systemd host in a privileged container (sysd part), the
-    # server-policy mirror of the runner's real sshd_config (policy part, plan S1), and the M2 port
-    # forwards and agent relay in the udp part's topology (docs/m2/realnet.md): the forward part as
-    # two jobs, `fwd-cable` (the done-when's cable pulls, about 13 min) and `fwd-rest` (everything
-    # else, with a smaller MAX_ENDING stress than the VM's and the Pis' 20,000), and the `agent`
-    # part. Seven jobs, run in parallel, each through `just realnet PART`. With suite=latency the matrix is
-    # the parts `latency` (the latency lab, docs/m2/latency.md) and `predict` (M3's prediction cells,
-    # docs/m3/plan.md §5.5) instead. It builds `fil` and the test
-    # programs as static x86_64 musl binaries (tests/realnet/build.sh), which is the x86_64 musl
-    # release-target check.
+    # server-policy mirror of the runner's real sshd_config (policy part, plan S1), getting fil onto
+    # a host (install), the agent relay (agent), and the M2 port forwards in the udp part's topology
+    # (docs/m2/realnet.md) as fwd.sh's groups: `fwd-func` (reconnect, swap, sleep, roam,
+    # many_short, other_user), `fwd-cable` (the done-when's cable pulls, about 15 min: the only
+    # cable pull in CI; the arm64 drop-in run leaves its own out), `fwd-stress` (ending_stress, with
+    # a smaller MAX_ENDING stress than the VM's and the Pis' 20,000) and the measurements in two
+    # halves, `fwd-perf-a` (vs_ssh, stuck) and `fwd-perf-b` (parallel). suite=extended runs the
+    # functional parts (ssh, udp, sysd, policy, install, agent, fwd-func); realnet and all add
+    # fwd-cable, fwd-stress and the perf halves. Each part is a job of its own, through
+    # `just realnet PART`. With suite=latency the matrix is the parts `latency` (the latency lab,
+    # docs/m2/latency.md) and `predict` (M3's prediction cells, docs/m3/plan.md §5.5) instead. It
+    # builds `fil` and the test programs as static x86_64 musl binaries (tests/realnet/build.sh),
+    # which is the x86_64 musl release-target check.
     # The sysd part runs a PRIVILEGED container (root on the machine). That is fine on a
     # GitHub-hosted runner, which is a throwaway VM; never run this job on a self-hosted or shared
     # runner.
-    if: inputs.suite != 'check' && inputs.suite != 'aarch64' && inputs.suite != 'arm64-remote' && inputs.suite != 'terminals'
+    if: contains(fromJSON('["extended","all","realnet","latency"]'), (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')))
     runs-on: ubuntu-24.04
     # Each part its own limit: about twice its usual time.
-    timeout-minutes: ${{ fromJSON('{"ssh":20,"udp":30,"sysd":15,"fwd-cable":30,"fwd-rest":40,"agent":20,"policy":30,"install":30,"latency":45,"predict":45}')[matrix.part] }}
+    timeout-minutes: ${{ fromJSON('{"ssh":20,"udp":30,"sysd":15,"fwd-cable":30,"fwd-func":20,"fwd-stress":20,"fwd-perf-a":25,"fwd-perf-b":30,"agent":20,"policy":30,"install":30,"latency":45,"predict":45}')[matrix.part] }}
     strategy:
       fail-fast: false
       matrix:
-        part: ${{ fromJSON(inputs.suite == 'latency' && '["latency","predict"]' || '["ssh","udp","sysd","fwd-cable","fwd-rest","agent","policy","install"]') }}
+        part: ${{ fromJSON((inputs.suite || (github.event_name == 'push' && 'extended' || 'check')) == 'latency' && '["latency","predict"]' || (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')) == 'extended' && '["ssh","udp","sysd","policy","install","agent","fwd-func"]' || '["ssh","udp","sysd","policy","install","agent","fwd-func","fwd-cable","fwd-stress","fwd-perf-a","fwd-perf-b"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -186,8 +284,8 @@ jobs:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Restore always, save only from main (see the check job).
-          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
+          # Restore always, save only from main's own run (see lint).
+          save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
       - name: Lint the harness scripts
         run: shellcheck -x -S warning tests/realnet/*.sh tests/realnet/docker/entrypoint.sh
       - name: Real-network suite (${{ matrix.part }})
@@ -219,7 +317,7 @@ jobs:
     # `gh run download RUN -n fil-aarch64-musl`.
     # No rust-cache here: this job produces the artifact that gets installed, and a cache entry
     # saved by a run of any other ref could otherwise seed what a later release build restores.
-    if: inputs.suite == 'aarch64' || inputs.suite == 'arm64-remote' || inputs.suite == 'all'
+    if: contains(fromJSON('["aarch64","arm64-remote","extended","all"]'), (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -255,24 +353,36 @@ jobs:
           retention-days: 14
 
   arm64-remote:
-    # The remote side on arm64 Linux, automated (docs/m1/pi.md "On GitHub's arm64 runner"; owner
-    # decision 2026-11-11: the test Pis are no longer a 0.2.0 gate, this run replaces them). The
-    # static aarch64 `fil` and `fwdprobe` from the `aarch64` job (the bytes that would go on a Pi)
-    # are installed through the Pis' gate verbs into a throwaway `fil-test` account behind a real
-    # sshd in a network namespace of its own, a veth pair away (tests/arm64/remote.sh,
-    # tests/arm64/gate.sh; 10.0.9.2 is that private test address); this runner's own build is the
-    # client. Then the Pis' two runs: `pi_e2e` (the M1 scenarios, docs/m1/pi.md) and the full
-    # drop-in suite with `--predict always` (every M1 and M2 scenario, plus the seven prediction
-    # scenarios through the 75 ms relay with their own modes; docs/m3/dropin.md, plan §5.6).
-    # Last, the prediction performance budget's bench on this arm64 runner (done-when 7).
+    # The remote side on arm64 Linux (docs/m1/pi.md "On GitHub's arm64 runner"; owner decision
+    # 2026-11-11: this run replaced the test Pis as a gate). The static aarch64 `fil` and `fwdprobe`
+    # from the `aarch64` job (the bytes that would go on a Pi) are installed through the Pis' gate
+    # verbs into a throwaway `fil-test` account behind a real sshd in a network namespace of its
+    # own, a veth pair away (tests/arm64/remote.sh, tests/arm64/gate.sh; 10.0.9.2 is that private
+    # test address); this runner's own build is the client. What only aarch64 Linux covers is that
+    # build, the install and the exec of the fixed remote command, and a PTY and a systemd scope on
+    # that kernel (the CI rework's analysis): pi_e2e covers them, once per run.
+    #   smoke (suite=extended): pi_e2e, then the drop-in quick set.
+    #   a, b  (suite=arm64-remote, all): the full drop-in suite with `--predict always` (every M1 and
+    #         M2 scenario, plus the prediction scenarios through the 75 ms relay with their own
+    #         modes; docs/m3/dropin.md, plan §5.6) in two shards, without the four forward
+    #         scenarios realnet runs on the real network (`@realnet_fwd`: the cable pull, reconnect,
+    #         swap, sleep; nothing in them is arch-specific): a is pi_e2e and the short scenarios,
+    #         b the long ones (`--set long`) and the prediction performance budget's bench on this
+    #         arm64 runner (done-when 7).
     # The runner is a throwaway VM: setup creates a user and changes sshd's config as root.
-    if: inputs.suite == 'arm64-remote' || inputs.suite == 'all'
+    if: contains(fromJSON('["arm64-remote","extended","all"]'), (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')))
+    name: arm64-remote (${{ matrix.shard }})
     needs: aarch64
     runs-on: ubuntu-24.04-arm
-    # Not measured on a runner yet (an estimate): two client builds (release for pi_e2e, ci for the
-    # drop-in suite) on 4 arm64 vCPUs, pi_e2e about 4 min and the full drop-in suite about 15 on a
-    # Pi. About twice that.
-    timeout-minutes: 90
+    # Before the split: 43.8 min in one job, 30 of it drop-in scenarios (12.9 the cable pull).
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON((inputs.suite || (github.event_name == 'push' && 'extended' || 'check')) == 'extended' && '["smoke"]' || '["a","b"]') }}
+    env:
+      SHARD: ${{ matrix.shard }}
+      FIL_PI_TARGETS: arm64=fil-test@10.0.9.2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -290,8 +400,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # The client builds only; the remote binary comes from the uncached aarch64 job.
-          # Restore always, save only from main (see the check job).
-          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
+          # Restore always, save only from main's own run (see lint).
+          save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
       - name: The fil-test account behind the gate (throwaway runner)
         run: |
           uname -m
@@ -299,16 +409,20 @@ jobs:
       - name: Install the static aarch64 binaries through the gate
         run: tests/arm64/remote.sh install remote-bin
       - name: pi_e2e against this host (the M1 scenarios of docs/m1/pi.md)
-        env:
-          FIL_PI_TARGETS: arm64=fil-test@10.0.9.2
+        if: matrix.shard != 'b'
         run: just pi-e2e --hosts arm64
-      - name: The drop-in suite, full, with prediction on (every M1 and M2 scenario with --predict always; the prediction scenarios)
+      - name: The drop-in suite (this shard's scenarios)
         if: ${{ !cancelled() }}
-        env:
-          FIL_PI_TARGETS: arm64=fil-test@10.0.9.2
-        run: just dropin --hosts arm64 --scale full --predict always --dump target/arm64-remote/dump
+        run: |
+          case $SHARD in
+            smoke) set -- --set quick ;;
+            a) set -- --scale full --predict always --skip @long,@realnet_fwd ;;
+            b) set -- --scale full --predict always --set long ;;
+            *) echo "unknown shard $SHARD" >&2; exit 2 ;;
+          esac
+          just dropin --hosts arm64 "$@" --dump target/arm64-remote/dump
       - name: The prediction performance budget on this runner (docs/m3/plan.md §2.10, done-when 7)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.shard == 'b' }}
         run: |
           # Without pipefail tee's status would win: a bench that fails to build or panics must
           # fail the step, not leave an empty summary.
@@ -325,7 +439,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: arm64-remote
+          name: arm64-remote-${{ matrix.shard }}
           path: |
             target/arm64-remote
             target/pi-e2e
@@ -341,7 +455,7 @@ jobs:
     # back by each terminal's own command, compared with the shadow model (alacritty_terminal).
     # xterm, kitty and tmux come from Ubuntu; WezTerm is the upstream release, pinned by its
     # SHA-256. Nothing here is privileged and nothing needs a secret.
-    if: inputs.suite == 'terminals' || inputs.suite == 'all'
+    if: contains(fromJSON('["terminals","extended","all"]'), (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -364,9 +478,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # The exporter is its own workspace (tests/terminals/exporter). Restore always, save
-          # only from main (see the check job).
+          # only from main's own run (see lint).
           workspaces: tests/terminals/exporter
-          save-if: ${{ github.ref == 'refs/heads/main' && inputs.ref == 'main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cargo-deny@0.20.2

@@ -19,11 +19,15 @@
 //! ```text
 //! dropin [--hosts pi1,pi2 | --local] [--only NAME[,NAME]] [--fil PATH] [--fwdprobe PATH]
 //!        [--verbose] [--list] [--require vim,less,...] [--allow-missing] [--allow-skip] [--strict]
-//!        [--predict off|adaptive|always] [--scale smoke|full]
+//!        [--predict off|adaptive|always] [--scale smoke|full] [--set quick|long|realnet_fwd]
+//!        [--skip NAME|@SET[,...]]
 //! ```
 //!
-//! `--scale` (default: `FIL_TEST_SCALE`, else `smoke`; fil_testkit::scale): `smoke`, the per-PR
-//! run (macos-check), leaves out the scenarios in [`FULL_ONLY`] (stress, long idles, the
+//! `--set NAME` runs a named set ([`SETS`]) as `--only` would; `--skip` leaves scenarios out
+//! (`@NAME` for a whole set). A run's skip list is printed, so a shortened run says what it left out.
+//!
+//! `--scale` (default: `FIL_TEST_SCALE`, else `smoke`; fil_testkit::scale): `smoke`, the default
+//! for a run by hand (CI runs `--set quick` or full), leaves out the scenarios in [`FULL_ONLY`] (stress, long idles, the
 //! prediction scenarios but `predict_secret`) and runs the sleeping-client scenarios with the 12 s
 //! auto variant only; `full`, before a release, runs everything, including the 45 s pipe sleeps
 //! past the liveness timeout. A scenario named in `--only` runs at either scale.
@@ -477,7 +481,7 @@ impl Local {
 
 type Scenario = fn(&Ctx, &str) -> common::Res;
 
-/// What a smoke run (`--scale smoke`, every PR) leaves out, by its cost (the test-suite sweep,
+/// What a smoke run (`--scale smoke`, the default) leaves out, by its cost (the test-suite sweep,
 /// 2026-11-11, arm64 seconds): the stress scenarios (`fwd_churn` 75, `fwd_bulk_typing` 36), the
 /// 90 s idle, and the prediction scenarios but `predict_secret`, the one that guards a secret
 /// rule (`predict_shell` 66, the rest 14 to 25 each). The full run, before a release, has them.
@@ -492,6 +496,98 @@ const FULL_ONLY: &[&str] = &[
     "predict_resize",
     "predict_takeover",
 ];
+
+/// Named sets for `--set NAME` and for `@NAME` in `--skip` (docs/dev/timing-tests.md "Tiers").
+///
+/// - `quick`: every scenario under about 6 s on GitHub's Apple silicon runner and its arm64 Linux
+///   runner (macos-check and linux-check, 2026-11-13), plus `predict_secret`, the prediction
+///   scenario that guards a secret rule. About 2 min of scenarios: the per-PR Linux run, and the
+///   extended set's macOS and arm64 runs. The relay scenarios in it skip under `--local`.
+/// - `long`: the scenarios over about 25 s on the arm64 runner but the four of `realnet_fwd`: the
+///   second shard of the arm64 release-candidate run (`--set long`; the first is `--skip
+///   @long,@realnet_fwd`).
+/// - `realnet_fwd`: the forward scenarios that linux-check's realnet runs on the real network
+///   (`f_fwd_cable_pull`, `f_fwd_reconnect`, `f_fwd_swap`, `f_fwd_sleep`), whose real `ip link down`
+///   is the stronger test; the arm64 run leaves them out. Nothing in them is arch-specific.
+const SETS: &[(&str, &[&str])] = &[
+    (
+        "quick",
+        &[
+            "tools",
+            "vim_edit",
+            "less_pager",
+            "git_tools",
+            "history_completion",
+            "ctrl_c_d",
+            "flood",
+            "unicode",
+            "title",
+            "resize",
+            "term_colors",
+            "paste_big",
+            "binary_garbage",
+            "session_commands",
+            "exit_status",
+            "vim_session_life",
+            "terminal_modes",
+            "terminal_sane_after_detach",
+            "escape_handling",
+            "fwd_local_http",
+            "fwd_parallel",
+            "fwd_halfclose",
+            "fwd_rst",
+            "fwd_remote_detached",
+            "fwd_dynamic",
+            "fwd_inside_add_rm",
+            "fwd_hostile_remote",
+            "fwd_ports_view",
+            "detach_inside",
+            "agent_list_sign",
+            "agent_off_default",
+            "agent_detached",
+            "agent_filter",
+            "agent_confirm",
+            "predict_secret",
+        ],
+    ),
+    (
+        "long",
+        &[
+            "idle",
+            "client_sleep",
+            "client_kill9",
+            "fwd_bulk_typing",
+            "fwd_churn",
+            "predict_shell",
+            "predict_reconnect",
+        ],
+    ),
+    (
+        "realnet_fwd",
+        &["fwd_cable_pull", "fwd_reconnect", "fwd_swap", "fwd_sleep"],
+    ),
+];
+
+fn set(name: &str) -> Option<&'static [&'static str]> {
+    SETS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+}
+
+/// `--skip`'s list: scenario names, and `@NAME` for every scenario of a set.
+fn expand(list: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for x in list {
+        match x.strip_prefix('@') {
+            Some(n) => out.extend(
+                set(n)
+                    .ok_or_else(|| format!("no set \"{n}\" (sets: quick, long, realnet_fwd)"))?
+                    .iter()
+                    .map(|s| s.to_string()),
+            ),
+            None => out.push(x.clone()),
+        }
+    }
+    Ok(out)
+}
 
 fn scenarios() -> Vec<(&'static str, Scenario)> {
     vec![
@@ -568,7 +664,7 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... dropin [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--fwdprobe PATH] [--verbose] [--list]\n       dropin --local [--only NAME,..] [--fil PATH] [--verbose]   (a private daemon on this machine)\n       [--require vim,less,..] [--allow-missing] [--allow-skip] [--strict]\n       [--dump DIR]   (a client whose output sequence fails the check: its transcript goes to DIR)\n       [--predict off|adaptive|always]   (every client that sets no mode of its own)\n       [--scale smoke|full]   (default FIL_TEST_SCALE, else smoke: smoke leaves out the long scenarios)"
+        "usage: FIL_PI_TARGETS=pi1=fil-test@HOST,... dropin [--hosts pi1,..] [--only NAME,..] [--fil PATH] [--fwdprobe PATH] [--verbose] [--list]\n       dropin --local [--only NAME,..] [--fil PATH] [--verbose]   (a private daemon on this machine)\n       [--require vim,less,..] [--allow-missing] [--allow-skip] [--strict]\n       [--dump DIR]   (a client whose output sequence fails the check: its transcript goes to DIR)\n       [--predict off|adaptive|always]   (every client that sets no mode of its own)\n       [--scale smoke|full]   (default FIL_TEST_SCALE, else smoke: smoke leaves out the long scenarios)\n       [--set quick|long|realnet_fwd]   (a named set, as --only)   [--skip NAME|@SET,..]   (leave these out)"
     );
     std::process::exit(2);
 }
@@ -591,6 +687,7 @@ enum End {
 fn main() {
     let mut hosts: Option<Vec<String>> = None;
     let mut only: Option<Vec<String>> = None;
+    let mut skip: Vec<String> = Vec::new();
     let mut fil = PathBuf::from("target/release/fil");
     let mut fwdprobe: Option<PathBuf> = None;
     let mut strict = false;
@@ -606,6 +703,15 @@ fn main() {
         match a.as_str() {
             "--hosts" => hosts = Some(csv(args.next())),
             "--only" => only = Some(csv(args.next())),
+            "--set" => {
+                let n = args.next().unwrap_or_else(|| usage());
+                let Some(s) = set(&n) else {
+                    eprintln!("--set: no set \"{n}\" (sets: quick, long, realnet_fwd)");
+                    std::process::exit(2);
+                };
+                only = Some(s.iter().map(|x| x.to_string()).collect());
+            }
+            "--skip" => skip.extend(csv(args.next())),
             "--require" => require = csv(args.next()),
             "--fil" => fil = PathBuf::from(args.next().unwrap_or_else(|| usage())),
             "--fwdprobe" => fwdprobe = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
@@ -647,14 +753,35 @@ fn main() {
         eprintln!("FULL_ONLY names \"{bad}\", which is not a scenario");
         std::process::exit(2);
     }
-    // A typo in --only must not give a green run that tested nothing.
-    if let Some(o) = &only
-        && let Some(bad) = o
+    // So must every name in a set.
+    for (set_name, names) in SETS {
+        if let Some(bad) = names
+            .iter()
+            .find(|x| !scenarios().iter().any(|(n, _)| n == *x))
+        {
+            eprintln!("set {set_name} names \"{bad}\", which is not a scenario");
+            std::process::exit(2);
+        }
+    }
+    let skip = expand(&skip).unwrap_or_else(|e| {
+        eprintln!("--skip: {e}");
+        std::process::exit(2);
+    });
+    // A typo in --only or --skip must not give a green run that tested nothing (or everything).
+    for (flag, list) in [
+        ("--only", only.as_deref().unwrap_or(&[])),
+        ("--skip", &skip[..]),
+    ] {
+        if let Some(bad) = list
             .iter()
             .find(|x| !scenarios().iter().any(|(n, _)| *n == x.as_str()))
-    {
-        eprintln!("--only: \"{bad}\" is not a scenario (`--list` shows them)");
-        std::process::exit(2);
+        {
+            eprintln!("{flag}: \"{bad}\" is not a scenario (`--list` shows them)");
+            std::process::exit(2);
+        }
+    }
+    if !skip.is_empty() {
+        println!("left out (--skip): {}", skip.join(", "));
     }
     // The targets are required and are the whole list of hosts this program may touch.
     let raw = if local {
@@ -742,6 +869,9 @@ fn main() {
                 continue;
             }
             if only.is_none() && !full && FULL_ONLY.contains(&name) {
+                continue;
+            }
+            if skip.iter().any(|x| x == name) {
                 continue;
             }
             if let Err(e) = ctx.reset(host) {
@@ -1048,6 +1178,27 @@ mod tests {
             "read -s, typed: SKIP: is not a prefix here"
         ])));
         assert!(!all_variants_skipped(&[]));
+    }
+
+    #[test]
+    fn every_set_names_scenarios_and_skip_expands_sets() {
+        let all: Vec<&str> = super::scenarios().iter().map(|(n, _)| *n).collect();
+        for (n, s) in super::SETS {
+            for x in *s {
+                assert!(all.contains(x), "set {n} names {x}, not a scenario");
+            }
+        }
+        let e = super::expand(&["@realnet_fwd".to_string(), "idle".to_string()]).unwrap();
+        assert_eq!(e.len(), 5);
+        assert!(e.contains(&"fwd_cable_pull".to_string()) && e.contains(&"idle".to_string()));
+        assert!(super::expand(&["@nope".to_string()]).is_err());
+        // The arm64 shards: `--set long` and `--skip @long,@realnet_fwd` share nothing.
+        let long = super::set("long").unwrap();
+        assert!(
+            !long
+                .iter()
+                .any(|x| super::set("realnet_fwd").unwrap().contains(x))
+        );
     }
 
     #[test]

@@ -441,3 +441,160 @@ fn the_adversarial_bar_catches_writing_after_a_misprediction() {
         "nothing written after a misprediction with `tentative` off"
     );
 }
+
+/// A steady typist (`SimConfig::steady`, the latency lab's `keyprobe keys --screen --line`): `KEYS`
+/// letters, one every `gap_ms`, into a 100-column line editor at `rtt` ms, in lines of `line`
+/// (0: one line through the margin). With `wait`, after each Enter the typist waits a round trip
+/// (its echo) and 200 ms more, as keyprobe does; without, it types the next line straight on
+/// (`keyprobe --ahead`). Every run is held to the faithful bar.
+fn steady_run(
+    b: &'static str,
+    seed: u64,
+    rtt: u64,
+    writes: Writes,
+    gap_ms: u64,
+    line: usize,
+    wait: bool,
+) -> fil_predict::overlay::PredictStats {
+    use fil_predict::sim::Steady;
+    use fil_term::Size;
+    use std::time::Duration;
+    let mut cfg = SimConfig::new(Scenario::Echo, seed, b);
+    cfg.keys = KEYS;
+    cfg.one_way = Duration::from_millis(rtt / 2);
+    cfg.jitter = Duration::from_millis(5);
+    cfg.writes = writes;
+    cfg.run.size = Size {
+        cols: 100,
+        rows: 30,
+    };
+    cfg.run.bar = Some(Category::Faithful);
+    let gap = Duration::from_millis(gap_ms);
+    let pause = if wait {
+        Duration::from_millis(rtt + 200)
+    } else {
+        gap
+    };
+    cfg.steady = Some(Steady { gap, line, pause });
+    let out = run(&cfg);
+    if let Some(f) = &out.failure {
+        panic!(
+            "{b} seed {seed} {rtt} ms {} gap {gap_ms} line {line} wait {wait}: {}",
+            writes.name(),
+            f.violation.detail
+        );
+    }
+    out.predict
+}
+
+/// Keys per [`steady_run`].
+const KEYS: usize = 210;
+
+/// The latency lab's typing (`keyprobe keys --screen --line 40`, `tests/realnet/predict.sh`) in
+/// the sim: 210 letters at 20 a second, in lines of 40 with Enter and a wait for the output
+/// between them. At 150 and 400 ms RTT nearly every key is written, with no visible
+/// misprediction (the faithful bar).
+///
+/// Counted, not judged (`docs/m3/latency.md`, "Lines"): the same keys as one line through the
+/// margin, and in lines typed ahead with no wait. Prediction stops three columns before the
+/// margin, or at the Enter, and does not start again while the typing outruns the echoes: each
+/// new epoch's first guess goes at the shadow cursor (§2.3), which lags the keys in flight, and
+/// the echo of an earlier key contradicts it. So only the first line is written until the
+/// typist pauses for about a round trip.
+#[test]
+fn steady_typing_in_lines_is_guessed_at_150_and_400_ms() {
+    // 210 keys a run, six runs a seed and backend: 1 seed, or 8 at full scale.
+    let n = fil_testkit::scale::pick("FIL_PREDICT_SEEDS", 1, 8);
+    for b in backends() {
+        for seed in base()..base() + n {
+            for rtt in [150, 400] {
+                for writes in [Writes::Whole, Writes::Boundaries] {
+                    let p = steady_run(b.name, seed, rtt, writes, 50, 40, true);
+                    assert_eq!(p.mispredicted.total(), 0, "{p:?}");
+                    assert!(
+                        p.written as usize * 100 >= KEYS * 95,
+                        "{} seed {seed} {rtt} ms {}: {} of {KEYS} keys written: {p:?}",
+                        b.name,
+                        writes.name(),
+                        p.written
+                    );
+                    if seed != base() {
+                        continue;
+                    }
+                    let one = steady_run(b.name, seed, rtt, writes, 50, 0, true);
+                    let ahead = steady_run(b.name, seed, rtt, writes, 50, 40, false);
+                    eprintln!(
+                        "steady {} seed {seed} {rtt} ms {}: written {} in lines, {} as one line, {} typed ahead",
+                        b.name,
+                        writes.name(),
+                        p.written,
+                        one.written,
+                        ahead.written
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The rate sweep (counted, not judged): lines of 40 typed ahead at 3 to 20 keys a second, at
+/// 150 and 400 ms RTT, whole writes, the default backend. Prints the guesses written of the 210
+/// keys for each rate; every run is still held to the faithful bar.
+#[test]
+fn steady_typing_rate_sweep() {
+    let b = backends()[0].name;
+    for rtt in [150, 400] {
+        let row: Vec<String> = [3u64, 5, 7, 10, 20]
+            .iter()
+            .map(|&rate| {
+                let p = steady_run(b, base(), rtt, Writes::Whole, 1000 / rate, 40, false);
+                format!("{rate}/s {}", p.written)
+            })
+            .collect();
+        eprintln!(
+            "rate sweep {rtt} ms, typed ahead, written of {KEYS}: {}",
+            row.join(", ")
+        );
+    }
+}
+
+/// Rule 2's anchor after the keys in flight, against a program that echoes late: in this run (a
+/// slow echo, writes joined) the predictor takes the program for a fast one, and an epoch's first
+/// key, `9`, waits while the `9` before it is still to be echoed after its acknowledgement. An
+/// anchor at that acknowledgement would put the new guess where the late `9` lands, which would
+/// confirm the epoch one key off: `Guards::anchor_echoed` refuses an anchor whose first key
+/// repeats one of the two typed just before it.
+#[test]
+fn an_anchor_does_not_take_a_late_echo_of_the_same_letter() {
+    let b = backends()
+        .into_iter()
+        .find(|b| b.name == "alacritty")
+        .or_else(|| backends().into_iter().next())
+        .expect("a backend");
+    let mut cfg = SimConfig::new(Scenario::SlowEcho, 258, b.name);
+    cfg.keys = 50;
+    cfg.writes = Writes::Joined;
+    cfg.run.bar = Some(Category::Slow);
+    let out = run(&cfg);
+    assert!(
+        out.failure.is_none(),
+        "{:?}",
+        out.failure.map(|f| f.violation.detail)
+    );
+}
+
+/// While an epoch waits for its anchor, the default predictor still notes a suggestion the shell
+/// draws: once one is seen, every append goes alone. In this run (fish, writes cut at sequence
+/// boundaries) a missed one let two appends be in flight when the next suggestion appeared:
+/// it contradicted the first and ended the epoch under the second (`ended`, which fish's named
+/// residual does not cover). Only the residual's own kinds may show.
+#[test]
+fn a_suggestion_seen_while_waiting_for_an_anchor_is_noted() {
+    for b in backends() {
+        let mut cfg = SimConfig::new(Scenario::Fish, 370, b.name);
+        cfg.keys = 50;
+        cfg.writes = Writes::Boundaries;
+        let m = run(&cfg).predict.mispredicted;
+        assert_eq!(m.total(), m.contradicted + m.hidden, "{}: {m:?}", b.name);
+    }
+}

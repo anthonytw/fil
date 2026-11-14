@@ -14,6 +14,9 @@
 //! `tests/overlay.rs` (`at_most_1024_guesses_are_outstanding`): no adversary fits 1,024 guesses
 //! on a scenario's screen. `keep_on_boundary` keeps what is already written, so it is no secrecy
 //! rule: it is shown needed by the faithful bar (`tests/sim.rs`) and in `tests/overlay.rs`.
+//! `anchor_echoed` and `anchor_gap` (rule 2, anchoring after the keys in flight) guard against
+//! a visible misprediction, not a secret: each is shown needed by its trace in `tests/overlay.rs`
+//! (`an_anchor_after_an_own_echo_is_refused`, `an_anchor_for_a_key_sent_inside_the_echo_window_is_refused`).
 
 mod support;
 

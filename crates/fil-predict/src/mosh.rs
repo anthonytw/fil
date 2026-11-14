@@ -12,7 +12,10 @@
 //!   rest right) only in a confirmed epoch, only when the row's text ends at least two columns
 //!   before the last column and does not end in a right-aligned run.
 //! - **Backspace** only over a character it typed on this row in this epoch and already echoed,
-//!   at the end of the line, never over the prompt.
+//!   at the end of the line, not over a blank (its erase shows nothing), never over the prompt.
+//! - **Anchoring** (`on_anchor`, proposed 2026-11-12): while the keys before a tentative epoch are
+//!   in flight (`CoreView::deferring`) it guesses nothing at the key, and guesses the waiting keys
+//!   when the core offers them, from the shadow cursor then.
 //! - **Left, right, Ctrl-B, Ctrl-F** move the predicted cursor within the span it typed.
 //! - **One guess in flight** for a key whose echo moves the cursor through other places or
 //!   redraws cells right of it (a Backspace, a mid-line insert, a key in front of a suggestion):
@@ -697,7 +700,12 @@ impl MoshPredictor {
                 // not in front of a suggestion (it is redrawn).
                 // And only over a character already echoed: nothing pending on the row (`Shifty`).
                 let end_of_line = !mid && matches!(here, Tail::Blank | Tail::Rprompt(_));
+                // Not over a blank (a typed space): its erase changes no glyph, so nothing can
+                // show its echo came, and the next key's echo, in the same chunk, would be taken
+                // for a contradiction of it.
+                let over_blank = v.cell(row, col - 1).is_none_or(|c| blank(c.text));
                 if !end_of_line
+                    || over_blank
                     || self.suggests
                     || self.row_pending(row)
                     || Self::disputed_near(v, row, col)
@@ -782,6 +790,18 @@ impl Predictor for MoshPredictor {
             self.unacked.pop_front();
         }
         self.observe(ctx);
+        if ctx.core.deferring && !matches!(classify(key), KeyClass::Boundary) {
+            // The keys before the epoch are in flight: the shadow cursor lags them, and the core
+            // offers this key again once they are acknowledged (`on_anchor`). A suggestion the
+            // shell draws is still noted, as at a key it guesses: once seen, every append goes
+            // alone (one in flight), and missing it here would let two be in flight when the next
+            // suggestion appears.
+            let c = ctx.screen.cursor();
+            if matches!(tail(ctx.screen, c.row, c.col), Tail::Suggestion(_)) {
+                self.suggests = true;
+            }
+            return Vec::new();
+        }
         let edits = match classify(key) {
             c @ (KeyClass::Printable(_)
             | KeyClass::Backspace
@@ -795,6 +815,25 @@ impl Predictor for MoshPredictor {
                 Vec::new()
             }
         };
+        self.expose(ctx);
+        edits
+    }
+
+    fn on_anchor(&mut self, keys: &[(KeyClass, InputPos)], ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        self.observe(ctx);
+        // The epoch starts here, from the shadow cursor, as at its first key.
+        self.line = None;
+        self.follow = Follow::Live;
+        self.chain = Chain::Shadow;
+        let mut edits = Vec::new();
+        for &(class, at) in keys {
+            match class {
+                KeyClass::Printable(_) | KeyClass::Backspace | KeyClass::Left | KeyClass::Right => {
+                    edits.extend(self.key(class, at, ctx))
+                }
+                _ => break,
+            }
+        }
         self.expose(ctx);
         edits
     }

@@ -4,6 +4,15 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+### Changed
+
+- **Predictive echo after an interruption.** In 0.2.0, once something interrupted the run of guesses (Enter, Tab, Ctrl-W, a Backspace while keys were still on their way, reaching the end of the line), prediction stayed off until your typing slowed below about one key per round trip. Now fil waits until the keys before the interruption have reached the host, about one round trip, then guesses the keys typed since and goes on, while you keep typing. Still not guessed: typing steadily faster than about 12 keys a second, until it slows, and fish or zsh's autosuggestions while more than one key is on its way. Nothing wrong is shown in either case; fil just does not guess.
+
+### Fixed
+
+- A Backspace typed over a space is no longer guessed: its erase shows nothing, so a later key's echo in the same output could count as a wrong guess.
+- An echo that arrives in output the client handles just after the 250 ms late-echo grace, before its timer runs, now counts as an echo: it no longer takes the guesses after it off the screen until their own echoes bring them back (seen once in three runs at a bash prompt on a loaded host).
+
 ## [0.2.0] - 2026-11-12
 
 Predictive local echo, on by default.

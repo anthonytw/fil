@@ -17,6 +17,10 @@
 #   p_roam    fil on QUIC, adaptive, 75 ms each way, three NAT moves while the keys are typed
 #   p_shells  fil, adaptive, 75 ms each way: typing at the prompt of bash, zsh and fish (those
 #             installed; bash is required)
+#   p_ahead   fil on the pipe and on QUIC, adaptive, 75 and 200 ms each way: the lines typed
+#             straight through (`keyprobe --ahead`), at 20 keys/s and at 5: the hard case for
+#             prediction (docs/m3/latency.md "Lines"). Judged as p_keys but for done-when 3; how
+#             many keys a guess showed is recorded, not a bar
 #
 # **The prediction mode.** Every fil cell reads a config file of its own: with `[defaults] predict =
 # "off"` when the client has the flag (the built-in default is adaptive), so an off cell is off
@@ -48,6 +52,10 @@
 # writes a guess's glyph as a byte, so the bytes line then times the guess, not the echo); the
 # client's counts (guesses written, visible mispredictions). Knobs (environment):
 #   PR_RATE=20 PR_COUNT=200   keys per second and measured keys per cell (10 more are a warm-up)
+#   PR_LINE=40                keys per line into a raw `cat` (`keyprobe --line`): Enter after each
+#                             line, a wait for its echo and 200 ms more, as a person types commands
+#                             (0: one line through the margin, which no one types: see
+#                             docs/m3/latency.md "Lines"; p_ahead does not wait)
 #   PR_JITTER_MS=5            netem jitter each way (not in p_fast)
 #
 # fish runs as `fish --no-config --private`: the `\r~.` that ends a cell runs the typed line at the
@@ -61,6 +69,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/latency.sh"
 
 PR_RATE=${PR_RATE:-20}
 PR_COUNT=${PR_COUNT:-200}
+PR_LINE=${PR_LINE:-40}
 PR_JITTER_MS=${PR_JITTER_MS:-5}
 PR_CELLS=$OUT/results-predict-cells.tsv
 PR_DELAYS=(25 75 200)
@@ -148,8 +157,11 @@ pr_modes() { if [[ ${PR_HAS_FLAG:-0} == 1 ]]; then echo off adaptive always; els
 # $OUT/run/SCENARIO-TAG.keyprobe (and .err); the fil client logs at debug into a state directory of
 # its own. Returns keyprobe's status.
 pr_kp() {
-  local tag=$1 kind=$2 mode=$3 delay=$4 settle=500 flag=(--config "$PR_CONFIG") cmd
+  local tag=$1 kind=$2 mode=$3 delay=$4 settle=500 flag=(--config "$PR_CONFIG") cmd lines=()
   shift 4
+  # `--shell` (a raw `cat`) is typed into in lines; a shell's prompt (`--setup`) is not: the
+  # Enter is `\r\n`, which would run the line there.
+  if [[ " $* " == *" --shell "* && $PR_LINE -gt 0 ]]; then lines=(--line "$PR_LINE"); fi
   if [[ ${PR_HAS_FLAG:-0} == 1 ]]; then flag+=(--predict "$mode"); fi
   case $kind in
     ssh) cmd=(ssh -tt -o ObscureKeystrokeTiming=no srv) ;;
@@ -162,7 +174,7 @@ pr_kp() {
   # `~.` after a carriage return: fil detaches (and ssh disconnects) by itself.
   client_exec_on x timeout 600 env FIL_LOG=debug "XDG_STATE_HOME=$PD/state-$SCENARIO-$tag" \
     keyprobe keys --screen --rate "$PR_RATE" --count "$PR_COUNT" --warmup 10 --settle-ms "$settle" \
-    --fast-ms "$delay" --quit $'\r~.' "$@" -- "${cmd[@]}" \
+    --fast-ms "$delay" "${lines[@]}" --quit $'\r~.' "$@" -- "${cmd[@]}" \
     > "$OUT/run/$SCENARIO-$tag.keyprobe" 2> "$OUT/run/$SCENARIO-$tag.err"
 }
 
@@ -363,7 +375,26 @@ p_shells() {
   ok "typed at the prompt of: ${ran[*]}"
 }
 
-PR_SCENARIOS=(p_keys p_fast p_loss p_roam p_shells)
+# p_ahead: the lines typed straight through, the next command typed before the last one's output
+# is back. Every key must still show and nothing be shown wrong; the keys a guess showed (`fast`)
+# are recorded as a share of the keys, the number prediction loses when the typing outruns the
+# echoes (docs/m3/latency.md "Lines").
+p_ahead() {
+  local d kind mode rate tag
+  mode=$(pr_mode adaptive)
+  for d in 75 200; do
+    pr_net "$d" "$PR_JITTER_MS"
+    for kind in pipe quic; do
+      for rate in "$PR_RATE" 5; do
+        tag="t_${kind}_${mode}_${d}_r$rate"
+        pr_cell "$tag" "$kind" "$mode" "$d" 0 -- --shell --ahead --rate "$rate"
+        note "$tag.shown_by_a_guess=$PR_FAST/$PR_COUNT"
+      done
+    done
+  done
+}
+
+PR_SCENARIOS=(p_keys p_fast p_loss p_roam p_shells p_ahead)
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   part_main predict pr_setup pr_teardown "${PR_SCENARIOS[@]}" -- "$@"

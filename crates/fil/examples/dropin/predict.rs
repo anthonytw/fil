@@ -492,7 +492,7 @@ fn end_quietly(ctx: &Ctx, host: &str, session: &str, mut c: Client) -> Result<St
 pub struct Residual {
     pub reasons: &'static [&'static str],
     pub cap: u64,
-    /// Why, for the note: the decision, or the known bug and its fix.
+    /// Why, for the note: the decision.
     pub why: &'static str,
 }
 
@@ -510,17 +510,6 @@ pub const FISH_RESIDUAL: Residual = Residual {
     reasons: &["contradicted", "hidden"],
     cap: 2,
     why: "fish's named residual, plan §2.5, decided, owner 2026-11-11",
-};
-
-/// bash's known residual for 0.2.0: a late echo that arrives after the grace tick (the 250 ms after
-/// an `EchoAck` that left the key unechoed) takes a correct guess down and brings it back with the
-/// echo, a `hidden` (a gate retraction; nothing wrong is drawn). It showed once in three local
-/// arm64 runs (`docs/m1/pi.md`). The fix is `Core::expire`'s rule-5 change in #91, which is 0.2.1
-/// work (owner: non-core work goes to 0.2.x), so 0.2.0 accepts at most 1 per run and nothing else.
-pub const BASH_LATE_ECHO: Residual = Residual {
-    reasons: &["hidden"],
-    cap: 1,
-    why: "a late echo after the grace tick; fixed in 0.2.1 (#91)",
 };
 
 /// The counts' bar for a client that typed into faithful programs: none visible, but up to the
@@ -642,8 +631,7 @@ pub fn predict_shell(ctx: &Ctx, host: &str) -> Res {
         let s = end(c)?;
         let residual = match sh {
             Sh::Fish => Some(&FISH_RESIDUAL),
-            Sh::Bash => Some(&BASH_LATE_ECHO),
-            Sh::Zsh => None,
+            Sh::Bash | Sh::Zsh => None,
         };
         bar(&mut notes, sh.name(), &s, true, residual);
         notes.push(format!(
@@ -1195,12 +1183,9 @@ mod tests {
         for other in ["ended", "echo_ack", "expired", "password", "withdrawn"] {
             let s = stats(&format!("contradicted: 1, {other}: 1"));
             assert!(miss(&s, Some(&FISH_RESIDUAL)), "{other}");
-            assert!(miss(&s, Some(&BASH_LATE_ECHO)), "{other}");
         }
-        // bash: one `hidden`, nothing more, and no `contradicted`.
-        assert!(!miss(&stats("hidden: 1"), Some(&BASH_LATE_ECHO)));
-        assert!(miss(&stats("hidden: 2"), Some(&BASH_LATE_ECHO)));
-        assert!(miss(&stats("contradicted: 1"), Some(&BASH_LATE_ECHO)));
+        // bash and zsh have none: one `hidden` is a miss.
+        assert!(miss(&stats("hidden: 1"), None));
         let mut notes = Vec::new();
         bar(&mut notes, "fish", &fish, true, Some(&FISH_RESIDUAL));
         assert!(

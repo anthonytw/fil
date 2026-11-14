@@ -41,6 +41,15 @@ pub const MAX_CUTS: usize = 16;
 /// is not explained by any of them, and its cell is left to the shadow after the chunk, as
 /// without the cuts. So the cap can only cost a confirmation, never add one.
 pub const TYPED: usize = 64;
+/// Rule 2, anchoring after the keys in flight: an epoch that waited is anchored only if its first
+/// key was sent at least this long after the input before it (`Guards::anchor_gap`). The
+/// `EchoAck` that lets it anchor is made the daemon's 50 ms echo window after that input was
+/// taken; a key sent sooner can be taken before then, and its output (a glyph, or a cursor
+/// move, a bell) be in the shadow already. The rest is margin for the link's jitter. Measured
+/// at the client: it assumes the transport keeps the keys' spacing, which a retransmit or TCP
+/// coalescing can squeeze (DESIGN.md §9); an acknowledgement that covers the key itself is
+/// refused too, which catches the full squeeze.
+pub const ANCHOR_GAP: Duration = Duration::from_millis(80);
 
 /// What the core counts (`docs/m3/plan.md` §2.5). Counts only: no glyph, cell or key.
 ///
@@ -275,9 +284,14 @@ enum Step {
     /// A one-character move (`KeyClass::Left`, `Right`): touches no cell.
     Left,
     Right,
-    /// Anything else (Enter, Tab, another boundary key, a pasted key): the cursor is not followed
+    /// Anything else (Tab, another boundary key, a pasted key): the cursor is not followed
     /// past it.
     Stop,
+    /// Enter: as `Stop`, and the line after it starts empty (a shell's next prompt), so its end
+    /// is known: a Right past what was typed since is a no-op. That is readline's rule, not a
+    /// fact about every line editor: fish and zsh-autosuggestions accept a suggestion there
+    /// (see [`Core::touched_later`] for why erring that way is safe).
+    Enter,
 }
 
 /// A written guess's cell during one server-output chunk cut at its scrolls, erases and
@@ -306,6 +320,9 @@ struct Key {
     end: InputPos,
     class: KeyClass,
     sent: Time,
+    /// How long after the input before it this key was sent (zero for a key that is not the
+    /// first of its read): [`ANCHOR_GAP`].
+    gap: Duration,
     guess: Option<Guess>,
 }
 
@@ -386,6 +403,13 @@ pub(crate) struct Core {
     awaiting_ack: Option<InputPos>,
     /// The last input sent or output received (the `Idle` boundary).
     pub last_activity: Option<Time>,
+    /// When the last input read came, and where the current one starts (`Core::note_read`).
+    last_read: Option<Time>,
+    read_at: InputPos,
+    /// The last printable keys typed (at most [`TYPED`]), for [`Core::anchor`]: a program that echoes late can
+    /// draw one of them on the cell where a waiting epoch's first guess goes. Held as the core
+    /// holds every key's glyph while it matters, and not logged (`docs/m3/plan.md` §4.3).
+    recent: VecDeque<(InputPos, char)>,
     /// A resume or swap happened: the next key is a boundary.
     pub resumed: bool,
     /// The predictor shows nothing right now (`Show::Hide`).
@@ -449,6 +473,9 @@ impl Core {
             dirty: false,
             awaiting_ack: None,
             last_activity: None,
+            last_read: None,
+            read_at: 0,
+            recent: VecDeque::new(),
             resumed: false,
             hidden: false,
             link_down: false,
@@ -625,7 +652,10 @@ impl Core {
                             .any(|&(r, c)| r != d.cursor.0 || c < d.cursor.1)
                 }
             };
-            if unexplained {
+            // Keys waiting for their anchor have nothing to explain: the output is the keys in
+            // flight being echoed, or anything else, and the anchor is taken from the shadow
+            // after it (rule 2, "Anchoring after the keys in flight").
+            if unexplained && !self.deferring() {
                 self.end(Why::Unexplained, Some(v), now);
             }
         }
@@ -653,13 +683,35 @@ impl Core {
     /// Records a typed key the predictor may guess.
     pub fn push_key(&mut self, at: InputPos, end: InputPos, class: KeyClass, now: Time) {
         self.prune();
+        let gap = match self.last_read {
+            Some(t) if at <= self.read_at => now.saturating_sub(t),
+            Some(_) => Duration::ZERO,
+            None => Duration::MAX,
+        };
         self.keys.push(Key {
             at,
             end,
             class,
             sent: now,
+            gap,
             guess: None,
         });
+        if let KeyClass::Printable(c) = class {
+            if self.recent.len() == TYPED {
+                self.recent.pop_front();
+            }
+            self.recent.push_back((at, c));
+        }
+    }
+
+    /// An input read starts at `at` (the first byte of a key held from the last read included).
+    pub fn begin_read(&mut self, at: InputPos) {
+        self.read_at = at;
+    }
+
+    /// The input read is done, at `now`.
+    pub fn end_read(&mut self, now: Time) {
+        self.last_read = Some(now);
     }
 
     /// In a tentative epoch, a key with no edit by the next key or output is a boundary.
@@ -667,6 +719,7 @@ impl Core {
         if self.state == State::Tentative
             && self.g.every_key
             && self.keys.iter().any(|k| k.guess.is_none())
+            && !self.deferring()
         {
             self.boundary(Why::Skipped, Some(v), now);
         }
@@ -999,6 +1052,113 @@ impl Core {
     /// Every key before the current epoch's first key is acknowledged (`CoreView::prior_acked`).
     pub fn prior_acked(&self) -> bool {
         self.first_key_at().is_none_or(|a| self.acked >= a)
+    }
+
+    /// Rule 2, anchoring after the keys in flight (proposed, 2026-11-12): the epoch is tentative,
+    /// it has keys and none has an edit, and a key typed before it is not acknowledged. Its first
+    /// guess would go at the shadow cursor, which lags those keys, so it waits: its keys are not
+    /// a boundary for want of an edit, and output is not checked against it (it has no guess to
+    /// explain anything). Every other boundary still ends it, and nothing of it is written
+    /// before a confirmation, as for any tentative epoch.
+    pub fn deferring(&self) -> bool {
+        if self.confirmed() {
+            return false;
+        }
+        let mut own = self
+            .keys
+            .iter()
+            .filter(|k| !k.guess.as_ref().is_some_and(|g| g.kept));
+        let Some(first) = own.next() else {
+            return false;
+        };
+        first.guess.is_none() && own.all(|k| k.guess.is_none()) && self.acked < first.at
+    }
+
+    /// The keys of an epoch that waited ([`Core::deferring`]) once the keys before it are
+    /// acknowledged: `Some` with them, in order, to offer to the predictor at the shadow cursor
+    /// as it is now. With [`Guards::anchor_echoed`], only if none of the epoch's own echoes can
+    /// be in the shadow already: every key printable, and no run of cells just left of the
+    /// cursor (in reading order, across a wrap from the row above) that shows the epoch's first
+    /// keys in order (their echoes, which came before the acknowledgement). Otherwise the epoch
+    /// ends (`Skipped`) and the next key waits again.
+    pub fn anchor(&mut self, v: &dyn ScreenView, now: Time) -> Option<Vec<(KeyClass, InputPos)>> {
+        if self.confirmed() || self.deferring() {
+            return None;
+        }
+        let own: Vec<(KeyClass, InputPos)> = self
+            .keys
+            .iter()
+            .filter(|k| !k.guess.as_ref().is_some_and(|g| g.kept))
+            .map(|k| (k.class, k.at))
+            .collect();
+        let waited = !own.is_empty()
+            && self
+                .keys
+                .iter()
+                .filter(|k| !k.guess.as_ref().is_some_and(|g| g.kept))
+                .all(|k| k.guess.is_none());
+        if !waited {
+            return None;
+        }
+        let (first_gap, first_at) = self
+            .keys
+            .iter()
+            .find(|k| !k.guess.as_ref().is_some_and(|g| g.kept))
+            .map_or((Duration::ZERO, 0), |k| (k.gap, k.at));
+        // The acknowledgement already covers the epoch's own first key: the PTY took it at least
+        // the echo window before `output_at`, so its effect is in the shadow, whatever the gap at
+        // the client (a transport that delivered it with the input before it: a QUIC retransmit,
+        // TCP coalescing on the pipe).
+        let own_acked = self.acked > first_at;
+        if self.g.anchor_gap && (own_acked || first_gap < ANCHOR_GAP) {
+            self.boundary(Why::Skipped, Some(v), now);
+            return None;
+        }
+        // A program that echoes late (after its `EchoAck`) can still draw a key typed before the
+        // epoch where the epoch's first guess goes, and the same letter would confirm the epoch
+        // one key off: the hazard rule 2's prior-ack condition is for, which the anchor, taken
+        // at that acknowledgement, cannot lean on. So not when the first key repeats one of the
+        // two typed just before it.
+        let first_at = own.first().map_or(0, |k| k.1);
+        let repeats = match own.first() {
+            Some((KeyClass::Printable(c), _)) => self
+                .recent
+                .iter()
+                .rev()
+                .filter(|&&(a, _)| a < first_at)
+                .take(2)
+                .any(|&(_, r)| r == *c),
+            _ => false,
+        };
+        if self.g.anchor_echoed && (repeats || !Self::anchor_clear(&own, v)) {
+            self.boundary(Why::Skipped, Some(v), now);
+            return None;
+        }
+        Some(own)
+    }
+
+    /// No echo of the waiting keys can be in the shadow ([`Core::anchor`]).
+    fn anchor_clear(keys: &[(KeyClass, InputPos)], v: &dyn ScreenView) -> bool {
+        let mut glyphs = Vec::with_capacity(keys.len());
+        for (class, _) in keys {
+            match class {
+                KeyClass::Printable(c) => glyphs.push(text_of(*c)),
+                _ => return false,
+            }
+        }
+        let (row, col) = cursor_of(v);
+        if v.cursor().pending_wrap {
+            return false;
+        }
+        // The cells before the cursor in reading order, so a run that wrapped from the end of
+        // the row above is looked at too (an echo of several waiting keys across a wrap).
+        let cols = usize::from(v.size().cols.max(1));
+        let here = usize::from(row) * cols + usize::from(col);
+        let text_at = |p: usize| {
+            let (r, c) = (p / cols, p % cols);
+            v.cell(r as u16, c as u16).map_or("", |c| c.text)
+        };
+        (1..=glyphs.len()).all(|j| here < j || (0..j).any(|i| text_at(here - j + i) != glyphs[i]))
     }
 
     fn is_kept(&self, i: usize) -> bool {
@@ -1334,13 +1494,14 @@ impl Core {
 
     /// A typed key, remembered for [`Core::touched_later`]; a pasted key is noted as a
     /// [`KeyClass::Boundary`].
-    pub fn note_key(&mut self, at: InputPos, class: KeyClass) {
+    pub fn note_key(&mut self, at: InputPos, class: KeyClass, enter: bool) {
         let step = match class {
             KeyClass::Release => return,
             KeyClass::Printable(_) => Step::Char,
             KeyClass::Backspace => Step::Back,
             KeyClass::Left => Step::Left,
             KeyClass::Right => Step::Right,
+            KeyClass::Boundary if enter => Step::Enter,
             KeyClass::PasteStart | KeyClass::PasteEnd | KeyClass::Boundary => Step::Stop,
         };
         if self.typed.len() == TYPED {
@@ -1360,41 +1521,72 @@ impl Core {
     ///
     /// A Left or a Backspace stops at the start of that line, where readline's are no-ops: the
     /// cursor can only be at or right of where the line's known part starts, so stopping there
-    /// keeps the walk's cursor no further left than readline's. A Right at the line's end is not
-    /// stopped, since the end is not known (`docs/m3/plan.md` §2.5).
+    /// keeps the walk's cursor no further left than readline's. A Right past what was typed is a
+    /// no-op after an Enter, where the line started empty and its end is known (proposed,
+    /// 2026-11-12); after any other boundary it is not stopped, since the end is not known
+    /// (`docs/m3/plan.md` §2.5).
     fn touched_later(&self, at: InputPos, class: KeyClass) -> bool {
         let Some(p) = self.typed.iter().position(|&(a, _)| a == at) else {
             return false;
         };
-        let start = self
+        let stop = self
             .typed
             .range(..p)
-            .rposition(|&(_, s)| s == Step::Stop)
-            .map_or(0, |i| i + 1);
-        // The cursor, in characters right of where the line's known part starts.
+            .rposition(|&(_, s)| matches!(s, Step::Stop | Step::Enter));
+        let start = stop.map_or(0, |i| i + 1);
+        // After an Enter the line's end is known (it started empty): a Right past it is a no-op.
+        // That is readline's rule. fish and zsh-autosuggestions differ: there a Right at the end
+        // accepts the suggestion and moves the cursor far right. The walk then errs permissively
+        // (a later key is taken to draw a cell it does not), which can only change the bucket of
+        // a guess whose cell this chunk changed (a glimpsed echo, a blank drawn over), never what
+        // is drawn: every written guess's cell ends showing the shadow either way.
+        let known_end = stop.is_some_and(|i| self.typed[i].1 == Step::Enter);
+        // The cursor, in characters right of where the line's known part starts, and how far
+        // right the keys have put characters.
         let mut cur: u64 = 0;
+        let mut end: u64 = 0;
         for &(_, step) in self.typed.range(start..p) {
             match step {
-                Step::Char | Step::Right => cur += 1,
-                Step::Back | Step::Left => cur = cur.saturating_sub(1),
-                Step::Stop => {} // none after `start`
+                Step::Char => {
+                    cur += 1;
+                    end += 1;
+                }
+                Step::Right if cur < end || !known_end => cur += 1,
+                Step::Right => {}
+                Step::Back => {
+                    cur = cur.saturating_sub(1);
+                    end = end.saturating_sub(1);
+                }
+                Step::Left => cur = cur.saturating_sub(1),
+                Step::Stop | Step::Enter => {} // none after `start`
             }
         }
         // The guess's cell: a Backspace leaves the cursor on its blank, a character one past it.
         let cell = if class == KeyClass::Backspace {
             cur = cur.saturating_sub(1);
+            end = end.saturating_sub(1);
             cur
         } else {
             cur += 1;
+            end += 1;
             cur - 1
         };
         for &(_, step) in self.typed.range(p + 1..) {
             match step {
                 Step::Char if cur <= cell => return true,
                 Step::Back if cur > 0 && cur <= cell + 1 => return true,
-                Step::Char | Step::Right => cur += 1,
-                Step::Back | Step::Left => cur = cur.saturating_sub(1),
-                Step::Stop => return false,
+                Step::Char => {
+                    cur += 1;
+                    end += 1;
+                }
+                Step::Right if cur < end || !known_end => cur += 1,
+                Step::Right => {}
+                Step::Back => {
+                    cur = cur.saturating_sub(1);
+                    end = end.saturating_sub(1);
+                }
+                Step::Left => cur = cur.saturating_sub(1),
+                Step::Stop | Step::Enter => return false,
             }
         }
         false
@@ -1562,6 +1754,7 @@ impl Core {
     /// The visible mispredictions other than `hidden` as each was first counted, including the
     /// held guesses: it only grows (a held guess settled as `hidden` does not take one back),
     /// for the driver's run check.
+    #[cfg(feature = "testkit")]
     pub fn ending_seen(&self) -> u64 {
         self.stats.mispredicted.ending() + self.holds.0 - self.holds.1
     }
@@ -1626,13 +1819,17 @@ impl Core {
 
     /// The backstop and the late-echo grace (rule 5).
     pub fn expire(&mut self, v: &dyn ScreenView, now: Time) {
+        // A guess whose late echo the output chunk being handled brought (at or just after its
+        // deadline, before a tick came) is not expired: the chunk is checked next, as an echo
+        // within the grace would be. Expiring it would count it confirmed (its cell shows its
+        // glyph) and still end the epoch as a contradiction, taking the written guesses after it
+        // off the screen until their echoes bring them back.
         let late = (0..self.keys.len()).find(|&i| {
             self.is_pending(i)
                 && self.keys[i]
                     .guess
                     .as_ref()
-                    .and_then(|g| g.grace)
-                    .is_some_and(|t| now >= t)
+                    .is_some_and(|g| g.grace.is_some_and(|t| now >= t) && !self.echo_in_chunk(g, v))
         });
         if let Some(i) = late {
             self.retire_as(i, Why::Contradiction, Some(v), now, true);
@@ -1649,6 +1846,34 @@ impl Core {
                 self.end(Why::Contradiction, Some(v), now);
             }
         }
+    }
+
+    /// The output chunk being handled changed a glyph guess's cell to its glyph, which the cell
+    /// did not show before the guess (a space over a blank proves nothing): its echo came in it.
+    ///
+    /// The baseline clause is the one that decides: the cell shows the glyph now and did not
+    /// before this chunk. The other two are defense in depth, equivalent today: `in_server` (only
+    /// `on_output` sets it, and with guesses pending the baseline is current on every other path)
+    /// and `seen` (a guess typed over its own glyph has a baseline that already shows it).
+    fn echo_in_chunk(&self, g: &Guess, v: &dyn ScreenView) -> bool {
+        let GKind::Glyph {
+            row,
+            col,
+            glyph,
+            seen,
+        } = &g.kind
+        else {
+            return false;
+        };
+        let want = text_of(*glyph);
+        let text = v.cell(*row, *col).map_or("", |c| c.text);
+        self.in_server
+            && text == want
+            && !seen.iter().any(|s| s == text)
+            && self
+                .baseline
+                .as_ref()
+                .is_some_and(|b| b.glyph(*row, *col) != Some(cell_hash(&want)))
     }
 
     // ---- output ----------------------------------------------------------------------
@@ -1686,6 +1911,7 @@ impl Core {
         let mut contradicted = Vec::new();
         let mut matched = Vec::new();
         let mut matched_changed = Vec::new();
+        let mut drawn_over = Vec::new();
         for (&(r, c), &i) in &expect {
             let now_text = v.cell(r, c).map_or("", |c| c.text);
             let (want, seen) = glyph_of(i);
@@ -1695,9 +1921,29 @@ impl Core {
                     matched_changed.push(i);
                 }
             } else if !seen.iter().any(|s| s == now_text) {
-                contradicted.push(i);
+                // A blank over a blank (a typed space, or a Backspace's erase of one) whose cell
+                // a key typed after it draws (`touched_later`): its echo changes no glyph, so
+                // nothing shows it came, and the glyph now there is that later key's. The screen
+                // showed the blank and then that glyph, as it should; the guess is settled as
+                // replaced by the user's own key (proposed, 2026-11-12), not contradicted.
+                let blank_on_blank =
+                    want.trim().is_empty() && seen.iter().any(|s| s.trim().is_empty());
+                let k = &self.keys[i];
+                // And the glyph is one a key typed after it puts there: anything else is still
+                // a contradiction.
+                let later_glyph = self
+                    .recent
+                    .iter()
+                    .any(|&(a, c)| a > k.at && text_of(c) == now_text);
+                if blank_on_blank && later_glyph && self.touched_later(k.at, k.class) {
+                    drawn_over.push(i);
+                } else {
+                    contradicted.push(i);
+                }
             }
         }
+        // Its cell is the later key's now: output there is what that key's echo explains or not.
+        expect.retain(|_, j| !drawn_over.contains(j));
         // Rule 3: glyph changes outside the exemptions (right of the cursor on its row; and
         // attributes, which a glyph comparison never sees).
         let exempt = |r: u16, c: u16| r == cur.0 && c >= cur.1;
@@ -1718,6 +1964,9 @@ impl Core {
                 }
                 None => unexplained = true,
             }
+        }
+        for &i in &drawn_over {
+            self.retire(i, Why::Lifecycle(WithdrawReason::Superseded), Some(v), now);
         }
         let moved = cur != base.cursor;
         let contradict = |core: &mut Core, list: &[usize]| {
@@ -1758,6 +2007,30 @@ impl Core {
             .copied()
             .filter(|&i| self.is_kept(i))
             .collect();
+        if self.deferring() {
+            // Keys waiting for their anchor (rule 2): the chunk ends nothing for them. The ended
+            // epoch's kept guesses settle by their glyph as on any chunk; if the chunk is more
+            // than their echo, they are withdrawn, as the unexplained output would withdraw them.
+            let kept_after_cur = self.keys.iter().any(|k| {
+                k.guess
+                    .as_ref()
+                    .is_some_and(|g| g.kept && g.state == GState::Pending && g.after == cur)
+            });
+            let kept_only = !unexplained
+                && !stray
+                && (!moved || kept_after_cur || self.kept_echoed_at.contains(&cur));
+            self.confirm_reached(&kept_matched, &matched_changed, cur, v, now);
+            if !kept_only && self.g.unexplained {
+                for i in 0..self.keys.len() {
+                    if self.is_pending(i) && self.is_kept(i) {
+                        self.retire(i, Why::Lifecycle(WithdrawReason::Ended), Some(v), now);
+                    }
+                }
+                self.keys
+                    .retain(|k| k.guess.as_ref().is_none_or(|g| g.state == GState::Pending));
+            }
+            return self.take_baseline(v);
+        }
         if !changed && !moved {
             // Nothing outside the exemptions changed: a chunk that explains nothing and
             // contradicts nothing (a bell, a title, a pen change, half a sequence). A kept

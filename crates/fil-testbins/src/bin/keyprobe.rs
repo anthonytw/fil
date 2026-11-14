@@ -3,8 +3,8 @@
 //!
 //! ```text
 //! keyprobe keys  [--rate 20] [--count 200] [--warmup 10] [--shell | --setup LINE] [--ready TEXT]
-//!                [--settle-ms 500] [--ready-timeout 60] [--drain-ms 5000] [--screen [--fast-ms MS]]
-//!                [--quit TEXT] -- COMMAND [ARG]...
+//!                [--settle-ms 500] [--ready-timeout 60] [--drain-ms 5000] [--screen [--fast-ms MS]
+//!                [--line N [--line-pause-ms 200 | --ahead]]] [--quit TEXT] -- COMMAND [ARG]...
 //! keyprobe drain [--shell | --setup LINE] [--ready TEXT] [--settle-ms 500] [--ready-timeout 60]
 //!                --run LINE --end TEXT [--mark TEXT] [--tally TEXT] [--repeat 1]
 //!                [--timeout 180] [--quiet-ms 500] -- COMMAND [ARG]...
@@ -55,6 +55,20 @@
 //! KEYPROBE-BYTES rate=20 warmup=10 sent=200 echoed=200 lost=0 unexpected=0 first_key_ms=.. min_ms=.. ... mean_ms=..
 //! KEYPROBE mode=screen rate=20 warmup=10 sent=200 echoed=200 lost=0 unexpected=0 first_key_ms=.. min_ms=.. ... mean_ms=.. vs_bytes_max_ms=.. vanished=0 final_wrong=0 final_extra=0 final_cursor=1
 //! ```
+//!
+//! **`--line N`** (with `--screen`) types the keys in lines of N, as a person types commands:
+//! after every N keys it types Enter (`\r\n`, for a raw `cat`), waits for its echo to put the
+//! cursor at the start of the next line (the command's output), then `--line-pause-ms` more, and
+//! types the next line on the same schedule. Enter is `\r\n`, two control keys, which only a raw
+//! `cat` (no line discipline: `stty raw`) turns into a new line; at a shell's prompt it would run
+//! the line. **`--ahead`** types the lines straight through instead: Enter in the next key's
+//! slot and the next line one slot later, without waiting for anything, as a person types the
+//! next command before the last one's output is back. Key `j` then belongs on line `j / N` (the first line
+//! from where the cursor was, the others from column 0), and the first line must end at least
+//! three columns before the margin. Without it the keys are one line, wrapping at the margin:
+//! fil's prediction stops three columns before the margin and, while the typing outruns the
+//! echoes, does not start again until the typing pauses for about a round trip, so most keys of
+//! a 200-key line are not guessed on a slow link (`docs/m3/latency.md`).
 //!
 //! `--fast-ms MS` adds `fast=N fast_p50_ms=.. fast_p99_ms=..`: the measured keys whose glyph
 //! appeared within MS (`-` when none). At half the round trip, they are the keys a guess showed,
@@ -116,7 +130,7 @@ fn main() -> ExitCode {
         return usage("a mode is required");
     }
     let mode = args.remove(0);
-    let parsed = match Args::parse(args, &["shell", "screen"]) {
+    let parsed = match Args::parse(args, &["shell", "screen", "ahead"]) {
         Ok(a) => a,
         Err(e) => return usage(&e),
     };
@@ -148,7 +162,7 @@ impl From<String> for Fail {
 
 fn usage(msg: &str) -> ExitCode {
     eprintln!(
-        "keyprobe: {msg}\nusage: keyprobe keys [--rate N] [--count N] [--warmup N] [--shell | --setup LINE] [--ready TEXT] [--settle-ms MS] [--ready-timeout S] [--drain-ms MS] [--screen [--fast-ms MS]] [--quit TEXT] -- COMMAND...\n       keyprobe drain [--shell | --setup LINE] [--ready TEXT] --run LINE --end TEXT [--mark TEXT] [--tally TEXT] [--repeat N] [--timeout S] [--quiet-ms MS] -- COMMAND..."
+        "keyprobe: {msg}\nusage: keyprobe keys [--rate N] [--count N] [--warmup N] [--shell | --setup LINE] [--ready TEXT] [--settle-ms MS] [--ready-timeout S] [--drain-ms MS] [--screen [--fast-ms MS] [--line N [--line-pause-ms MS | --ahead]]] [--quit TEXT] -- COMMAND...\n       keyprobe drain [--shell | --setup LINE] [--ready TEXT] --run LINE --end TEXT [--mark TEXT] [--tally TEXT] [--repeat N] [--timeout S] [--quiet-ms MS] -- COMMAND..."
     );
     ExitCode::from(2)
 }
@@ -476,6 +490,8 @@ struct ScreenMatcher {
     line0: usize,
     col0: usize,
     cols: usize,
+    /// Keys per line (`--line`), 0 for one line wrapping at the margin.
+    line: usize,
     lat: Vec<Option<Duration>>,
     /// Whether each key's cell held its glyph at the last look.
     held: Vec<bool>,
@@ -527,7 +543,7 @@ fn cursor_at(s: &TermState) -> (usize, usize) {
 
 impl ScreenMatcher {
     /// From the screen before the first key.
-    fn new(s: &TermState, keys: usize) -> Self {
+    fn new(s: &TermState, keys: usize, line: usize) -> Self {
         let (mut line0, mut col0) = cursor_at(s);
         // At the last column with a wrap pending, the next glyph starts the next line.
         if s.cursor.pending_wrap {
@@ -538,6 +554,7 @@ impl ScreenMatcher {
             line0,
             col0,
             cols: usize::from(s.size.cols),
+            line,
             lat: vec![None; keys],
             held: vec![false; keys],
             lo: 0,
@@ -551,8 +568,23 @@ impl ScreenMatcher {
     }
 
     fn cell(&self, j: usize) -> (usize, usize) {
+        if let Some(l) = j.checked_div(self.line) {
+            let c = j % self.line;
+            return (self.line0 + l, if l == 0 { self.col0 + c } else { c });
+        }
         let p = self.col0 + j;
         (self.line0 + p / self.cols, p % self.cols)
+    }
+
+    /// The cell after the last of `n` keys, where the glyphs after them would start.
+    fn end(&self, n: usize) -> (usize, usize) {
+        match n.checked_sub(1) {
+            Some(last) if self.line > 0 => {
+                let (l, c) = self.cell(last);
+                (l, c + 1)
+            }
+            _ => self.cell(n),
+        }
     }
 
     fn shows(&self, s: &TermState, j: usize) -> bool {
@@ -596,7 +628,7 @@ impl ScreenMatcher {
     fn final_check(&self, s: &TermState) -> Final {
         let n = self.lat.len();
         let wrong = (0..n).filter(|&j| !self.shows(s, j)).count();
-        let (end_line, end_col) = self.cell(n);
+        let (end_line, end_col) = self.end(n);
         let lines = s.history.len() + s.screen.len();
         let extra = (end_line..lines)
             .filter_map(|l| line_at(s, l).map(|line| (l, line)))
@@ -671,6 +703,15 @@ fn keys(a: &Args) -> Result<u8, Fail> {
     let warmup: usize = a.num("warmup", 10)?;
     let drain = Duration::from_millis(a.num("drain-ms", 5000u64)?);
     let screen = a.flag("screen");
+    let per_line: usize = a.num("line", 0)?;
+    let line_pause = Duration::from_millis(a.num("line-pause-ms", 200u64)?);
+    let ahead = a.flag("ahead");
+    if per_line > 0 && !screen {
+        return Err(Fail::Usage("--line needs --screen".into()));
+    }
+    if ahead && per_line == 0 {
+        return Err(Fail::Usage("--ahead needs --line".into()));
+    }
     let fast_ms: Option<f64> = a
         .get("fast-ms")
         .map(|_| a.num("fast-ms", 0.0))
@@ -690,12 +731,79 @@ fn keys(a: &Args) -> Result<u8, Fail> {
     let period = Duration::from_secs_f64(1.0 / rate);
     let total = warmup + count;
     // Where the keys go: the screen as it is before the first one.
-    let mut on_screen = term.state().map(|s| ScreenMatcher::new(&s, total));
+    let mut on_screen = term
+        .state()
+        .map(|s| ScreenMatcher::new(&s, total, per_line));
+    if let Some(sm) = on_screen.as_ref()
+        && per_line > 0
+        && sm.col0 + per_line + 3 > sm.cols
+    {
+        term.finish();
+        return Err(Fail::Run(format!(
+            "a line of {per_line} keys from column {} does not end three columns before the margin ({} columns)",
+            sm.col0, sm.cols
+        )));
+    }
     let mut sent: Vec<(u8, Instant)> = Vec::with_capacity(total);
-    let start = Instant::now();
+    let mut m = Matcher::new(total);
+    let mut start = Instant::now();
+    let mut from = 0;
     let first_key_ms = epoch_ms();
     for i in 0..total {
-        let due = start + period.mul_f64(i as f64);
+        if let Some(sm) = on_screen.as_mut()
+            && per_line > 0
+            && i > 0
+            && i % per_line == 0
+        {
+            // `--ahead`: Enter in the key's slot, and the next line straight on, one slot later.
+            if ahead {
+                let due = start + period.mul_f64((i - from) as f64);
+                let now = Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                }
+                if let Err(e) = term.send(b"\r\n") {
+                    term.finish();
+                    return Err(Fail::Run(format!("cannot type Enter before key {i}: {e}")));
+                }
+                start += period;
+                // Fall through to the key on the same schedule.
+            } else {
+                // Enter, and wait for the command's output (its echo, here) as a person would.
+                if let Err(e) = term.send(b"\r\n") {
+                    term.finish();
+                    return Err(Fail::Run(format!("cannot type Enter before key {i}: {e}")));
+                }
+                let want = sm.cell(i);
+                let mut quiet_since = Instant::now();
+                while term.state().is_some_and(|s| cursor_at(&s) != want) {
+                    if quiet_since.elapsed() >= drain {
+                        term.finish();
+                        return Err(Fail::Run(format!(
+                            "the Enter before key {i} did not put the cursor at the next line within {drain:?}"
+                        )));
+                    }
+                    match term.recv(Duration::from_millis(50)) {
+                        Ok((at, bytes)) => {
+                            m.feed(&sent, at, &bytes);
+                            if let Some(s) = term.state() {
+                                sm.feed(&sent, at, &s);
+                            }
+                            quiet_since = Instant::now();
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => {
+                            term.finish();
+                            return Err(Fail::Run(format!("the program ended before key {i}")));
+                        }
+                    }
+                }
+                std::thread::sleep(line_pause);
+                start = Instant::now();
+                from = i;
+            }
+        }
+        let due = start + period.mul_f64((i - from) as f64);
         let now = Instant::now();
         if due > now {
             std::thread::sleep(due - now);
@@ -712,7 +820,6 @@ fn keys(a: &Args) -> Result<u8, Fail> {
 
     // Collect the echoes until the last key's is back, or nothing has come for `--drain-ms`. (Not
     // "until as many bytes as keys": strays would end it early.)
-    let mut m = Matcher::new(total);
     let mut quiet_since = Instant::now();
     while (m.next < total || on_screen.as_ref().is_some_and(|sm| !sm.done()))
         && quiet_since.elapsed() < drain
@@ -1003,7 +1110,7 @@ mod tests {
         // wrap scrolls the screen.
         let mut e = screen(3, 10, b"\r\n\r\n$ ");
         let sent = sent_every_10ms(b, 20);
-        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 20);
+        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 20, 0);
         let echoes: Vec<(Instant, Vec<u8>)> = (0..20)
             .map(|i| (t(b, 10 * i as u64 + 4), vec![key_for(i)]))
             .collect();
@@ -1032,7 +1139,7 @@ mod tests {
         let b = Instant::now();
         let mut e = screen(5, 20, b"");
         let sent = sent_every_10ms(b, 3);
-        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 3);
+        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 3, 0);
         let chunks: [(Instant, &[u8]); 3] = [
             // A guess for `a`, underlined, the cursor put back: counts.
             (t(b, 3), b"\x1b[4ma\x1b[24m\x1b[1;1H"),
@@ -1054,7 +1161,7 @@ mod tests {
         let b = Instant::now();
         let mut e = screen(5, 20, b"");
         let sent = sent_every_10ms(b, 2);
-        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 2);
+        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 2, 0);
         let chunks: [(Instant, &[u8]); 3] = [
             // A guess for `a`, then the overlay erases it (a withdrawal), then the echo.
             (t(b, 1), b"a\x1b[1;1H"),
@@ -1073,7 +1180,7 @@ mod tests {
         let b = Instant::now();
         let mut e = screen(5, 20, b"");
         let sent = sent_every_10ms(b, 2);
-        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 2);
+        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 2, 0);
         // `b` drawn in its cell at 5 ms, before it is typed at 10 ms; the echo of both at 30 ms
         // leaves that cell as it was, so the screen cannot time `b`.
         let chunks: [(Instant, &[u8]); 2] = [(t(b, 5), b"\x1b[1;2Hb\x1b[1;1H"), (t(b, 30), b"ab")];
@@ -1082,21 +1189,51 @@ mod tests {
         assert!(!sm.done());
         // A cell that showed the glyph before the typing started is the same.
         let e = screen(5, 20, b"\x1b[1;2Hb\x1b[1;1H");
-        let sm = ScreenMatcher::new(&e.state(HISTORY), 2);
+        let sm = ScreenMatcher::new(&e.state(HISTORY), 2, 0);
         assert_eq!(sm.held, [false, true]);
     }
 
     #[test]
     fn a_pending_wrap_puts_the_first_key_on_the_next_line() {
         let e = screen(3, 10, b"0123456789");
-        let sm = ScreenMatcher::new(&e.state(HISTORY), 3);
+        let sm = ScreenMatcher::new(&e.state(HISTORY), 3, 0);
         assert_eq!((sm.cell(0), sm.cell(2)), ((1, 0), (1, 2)));
+    }
+
+    #[test]
+    fn keys_typed_in_lines_go_on_their_lines_and_end_after_the_last() {
+        let b = Instant::now();
+        // Lines of three, the first from column 2, the next from column 0 of the rows below
+        // (the last row scrolls).
+        let mut e = screen(3, 10, b"\r\n\r\n$ ");
+        let sent = sent_every_10ms(b, 7);
+        let mut sm = ScreenMatcher::new(&e.state(HISTORY), 7, 3);
+        assert_eq!(
+            (sm.cell(0), sm.cell(2), sm.cell(3), sm.cell(6)),
+            ((2, 2), (2, 4), (3, 0), (4, 0))
+        );
+        let chunks: [(Instant, &[u8]); 3] = [
+            (t(b, 25), b"abc\r\n"),
+            (t(b, 55), b"def\r\n"),
+            (t(b, 65), b"g"),
+        ];
+        show_all(&mut e, &mut sm, &sent, &chunks);
+        assert!(sm.done());
+        let s = e.state(HISTORY);
+        assert_eq!(
+            sm.final_check(&s),
+            Final {
+                wrong: 0,
+                extra: 0,
+                cursor: true
+            }
+        );
     }
 
     #[test]
     fn the_final_screen_counts_wrong_cells_extra_glyphs_and_a_misplaced_cursor() {
         let mut e = screen(5, 10, b"");
-        let sm = ScreenMatcher::new(&e.state(HISTORY), 3);
+        let sm = ScreenMatcher::new(&e.state(HISTORY), 3, 0);
         // `c`'s cell shows `x`, two glyphs below the line, the cursor at the top left.
         e.feed(b"abx\r\nzz\x1b[H");
         assert_eq!(
@@ -1109,7 +1246,7 @@ mod tests {
         );
         // Three keys that fill a row from column 7 leave the cursor on its last column.
         let mut e = screen(5, 10, b"\x1b[1;8H");
-        let sm = ScreenMatcher::new(&e.state(HISTORY), 3);
+        let sm = ScreenMatcher::new(&e.state(HISTORY), 3, 0);
         e.feed(b"abc");
         assert_eq!(
             sm.final_check(&e.state(HISTORY)),

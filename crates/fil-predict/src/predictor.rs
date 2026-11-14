@@ -18,6 +18,7 @@ use std::time::Duration;
 use fil_term::model::{Attrs, Cursor, Modes};
 use fil_term::{Size, TermState};
 
+use crate::keys::KeyClass;
 use crate::overlay::PtyMode;
 
 /// A point in time: the offset from an epoch the caller chooses (fixed per session).
@@ -190,6 +191,14 @@ pub struct CoreView {
     /// `Guards::prior_acked` enforces it: the default predictor acts on it itself, which is why
     /// that guard is shown needed with another predictor (`tests/sim.rs`).
     pub prior_acked: bool,
+    /// The current epoch is tentative, none of its keys has an edit yet, and a key typed before
+    /// it is not acknowledged (proposed, 2026-11-12; `docs/m3/plan.md` §2.4 rule 2, "Anchoring
+    /// after the keys in flight"): the shadow cursor lags the keys in flight, so a guess at it now
+    /// would be behind. The core waits: the epoch's keys are not a boundary for want of an edit,
+    /// and once the keys before it are acknowledged it offers them all to
+    /// [`Predictor::on_anchor`]. A predictor may still guess at the key (the core checks the plain
+    /// form as always); the default one waits.
+    pub deferring: bool,
     /// Origin mode (DECOM) is on, or may be: in the shadow, or unknown to the tracker after a
     /// soft reset or a cursor restore. WezTerm intermittently loses origin mode across the
     /// overlay's `?6l`/`?6h` toggling (`docs/m3/terminals.md`, finding 8).
@@ -326,6 +335,15 @@ pub trait Predictor: Send {
     fn on_settled(&mut self, settled: &[Settled], ctx: &Ctx<'_>);
     /// An `EchoAck` was applied (after the core settled what it could): for timing only.
     fn on_echo_ack(&mut self, input_upto: InputPos, ctx: &Ctx<'_>);
+    /// The keys of a tentative epoch that waited for the keys before it to be acknowledged
+    /// ([`CoreView::deferring`]), in order, now that they are: the predictor may guess them, as
+    /// at [`Predictor::on_key`], against the shadow as it is now. The core accepts only the plain
+    /// forms from the shadow cursor, and a key left without an edit is a boundary. The default
+    /// guesses none.
+    fn on_anchor(&mut self, keys: &[(KeyClass, InputPos)], ctx: &Ctx<'_>) -> Vec<OverlayEdit> {
+        let _ = (keys, ctx);
+        Vec::new()
+    }
     /// Time passed (at [`Predictor::next_deadline`], or periodically).
     fn on_tick(&mut self, ctx: &Ctx<'_>) -> Vec<OverlayEdit>;
     fn next_deadline(&self) -> Option<Time>;

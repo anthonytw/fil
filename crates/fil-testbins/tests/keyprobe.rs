@@ -116,6 +116,87 @@ fn wallclock_the_screen_agrees_with_the_bytes_on_a_raw_cat() {
     assert_eq!(val(&screen, "fast"), 300.0, "{screen}");
 }
 
+/// `--line`: 95 keys in lines of 40 into the same raw `cat`, an Enter after each line and a wait
+/// for its echo: every key on its line, the final screen exact, the Enters not counted as keys.
+#[test]
+fn keys_typed_in_lines_land_on_their_lines() {
+    let out = run(&[
+        "keys",
+        "--screen",
+        "--line",
+        "40",
+        "--line-pause-ms",
+        "20",
+        "--rate",
+        "200",
+        "--count",
+        "90",
+        "--warmup",
+        "5",
+        "--ready",
+        "KP-READY-42",
+        "--settle-ms",
+        "100",
+        "--drain-ms",
+        "3000",
+        "--",
+        "/bin/sh",
+        "-c",
+        ECHO,
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let screen = line(&out, "KEYPROBE mode=screen ");
+    assert_eq!(val(&screen, "echoed"), 90.0, "{screen}");
+    assert_eq!(val(&screen, "lost"), 0.0, "{screen}");
+    assert_eq!(val(&screen, "final_wrong"), 0.0, "{screen}");
+    assert_eq!(val(&screen, "final_extra"), 0.0, "{screen}");
+    assert_eq!(val(&screen, "final_cursor"), 1.0, "{screen}");
+    // `--line` needs the screen, and `--ahead` needs `--line`.
+    let out = run(&["keys", "--line", "40", "--", "/bin/cat"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let out = run(&["keys", "--screen", "--ahead", "--", "/bin/cat"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
+/// `--line --ahead`: the same lines typed straight through, no wait for the Enter's echo.
+#[test]
+fn keys_typed_ahead_in_lines_land_on_their_lines() {
+    let out = run(&[
+        "keys",
+        "--screen",
+        "--line",
+        "40",
+        "--ahead",
+        "--rate",
+        "200",
+        "--count",
+        "90",
+        "--warmup",
+        "5",
+        "--ready",
+        "KP-READY-42",
+        "--settle-ms",
+        "100",
+        "--drain-ms",
+        "3000",
+        "--",
+        "/bin/sh",
+        "-c",
+        ECHO,
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let screen = line(&out, "KEYPROBE mode=screen ");
+    for (k, v) in [
+        ("echoed", 90.0),
+        ("lost", 0.0),
+        ("final_wrong", 0.0),
+        ("final_extra", 0.0),
+        ("final_cursor", 1.0),
+    ] {
+        assert_eq!(val(&screen, k), v, "{k}: {screen}");
+    }
+}
+
 /// `--quit` types its text at the end and waits for the program to end by itself.
 #[test]
 fn quit_ends_the_program_and_says_so() {

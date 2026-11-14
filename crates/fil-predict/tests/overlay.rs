@@ -421,6 +421,250 @@ fn a_late_echo_within_the_grace_is_confirmed() {
     assert_eq!((s.confirmed, s.mispredicted.total()), (1, 0), "{s:?}");
 }
 
+/// A late echo that lands after its grace's deadline but before a tick has run (the client was
+/// busy, or the timer lost the race with the output) is an echo: the chunk that brings it
+/// confirms the guess, and the written guess after it stays on the screen. Expiring it first
+/// counted it confirmed and still ended the epoch as a contradiction, so `c` went off the
+/// screen and came back with its echo, a gate retraction (`hidden`) on a faithful program.
+#[test]
+fn a_late_echo_that_beats_the_grace_tick_is_still_an_echo() {
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    let b_end = t.at;
+    t.key(b"c", 210);
+    assert!(t.painted());
+    // The ack covers `b` only, before its echo: `b`'s grace ends at 550.
+    t.o.on_echo_ack(b_end, ms(300));
+    assert!(t.painted(), "the written guesses stay for the grace");
+    // `b`'s echo at 551, with no tick since the deadline.
+    t.server(b"b", 551);
+    assert!(t.painted(), "`c` was taken off the screen");
+    t.server(b"c", 600);
+    let s = t.o.stats();
+    assert_eq!((s.confirmed, s.mispredicted.total()), (2, 0), "{s:?}");
+    // With a tick at the deadline first, the same echo is late: contradicted, as before.
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    let b_end = t.at;
+    t.o.on_echo_ack(b_end, ms(300));
+    t.o.on_tick(ms(550));
+    t.server(b"b", 551);
+    assert_eq!(t.o.stats().mispredicted.echo_ack, 1);
+}
+
+/// The other half of the rule: a chunk after the deadline that does not bring the guess's echo
+/// (a bell here) still expires it, as before, whatever the client's timer does.
+#[test]
+fn a_chunk_without_the_echo_after_the_deadline_still_expires_it() {
+    let mut t = T::trusted();
+    t.key(b"b", 200);
+    let b_end = t.at;
+    t.key(b"c", 210);
+    t.o.on_echo_ack(b_end, ms(300));
+    assert!(t.painted());
+    t.server(b"\x07", 551);
+    assert!(!t.painted());
+    assert_eq!(t.o.stats().mispredicted.echo_ack, 1);
+}
+
+/// Rule 2, anchoring after the keys in flight (proposed, 2026-11-12): keys typed while an Enter
+/// is in flight wait for its acknowledgement and are then guessed from the shadow cursor, after
+/// the prompt, and the epoch confirms on their echo.
+#[test]
+fn keys_typed_ahead_of_the_prompt_are_anchored_after_it() {
+    let mut t = T::trusted(); // `$ a`
+    t.ack(130);
+    t.key(b"\r", 200);
+    let enter_end = t.at;
+    t.key(b"x", 290);
+    t.key(b"y", 300);
+    assert_eq!(
+        t.o.stats().guessed,
+        1,
+        "a key was guessed behind the Enter's echo"
+    );
+    t.server(b"\r\n$ ", 380);
+    t.o.on_echo_ack(enter_end, ms(390));
+    assert_eq!(
+        t.o.stats().guessed,
+        3,
+        "the waiting keys were not guessed at the ack"
+    );
+    t.server(b"x", 400);
+    assert!(t.painted(), "y is written once x's echo confirms the epoch");
+    t.server(b"y", 410);
+    let s = t.o.stats();
+    assert_eq!((s.mispredicted.total(), s.written), (0, 1), "{s:?}");
+}
+
+/// `Guards::anchor_echoed` is needed: the first waiting key's echo (`b`) comes before the
+/// acknowledgement of the Enter (the link's jitter took more than `ANCHOR_GAP`'s margin).
+/// Anchored at the shadow cursor anyway, the guesses sit one cell right of their echoes; the
+/// second `b`'s echo matches the first guess, the epoch confirms one key off, and the second
+/// guess is written where no echo comes.
+#[test]
+fn an_anchor_after_an_own_echo_is_refused() {
+    let trial = |guards: Guards| {
+        let mut t = T::guarded(guards);
+        t.confirm();
+        t.ack(130);
+        t.key(b"\r", 200);
+        let enter_end = t.at;
+        t.key(b"b", 290);
+        t.key(b"b", 300);
+        t.server(b"\r\n$ ", 350);
+        t.server(b"b", 355);
+        t.o.on_echo_ack(enter_end, ms(360));
+        t.server(b"b", 370);
+        t.ack(450);
+        t.o.on_tick(ms(800));
+        t.o.stats()
+    };
+    let on = trial(Guards::ALL);
+    assert_eq!(on.mispredicted.total(), 0, "{on:?}");
+    let mut off = Guards::ALL;
+    off.disable("anchor_echoed");
+    let off = trial(off);
+    assert!(off.mispredicted.total() > 0, "{off:?}");
+}
+
+/// `Guards::anchor_gap` is needed: a waiting key sent 10 ms after the Enter is taken before the
+/// Enter's acknowledgement is made, and its effect is not a glyph (a cursor move, as vi's `a` in
+/// normal mode makes), so no look at the cells finds it. Anchored after it, the next key's echo
+/// lands on the first guess, the same letter, and confirms the epoch one key off.
+#[test]
+fn an_anchor_for_a_key_sent_inside_the_echo_window_is_refused() {
+    let trial = |guards: Guards| {
+        let mut t = T::guarded(guards);
+        t.confirm(); // `$ a`, the cursor at (0, 3)
+        t.ack(130);
+        t.key(b"\r", 200);
+        let enter_end = t.at;
+        t.key(b"x", 210);
+        t.server(b"\x1b[C", 300); // the `x`: the cursor to (0, 4)
+        t.o.on_echo_ack(enter_end, ms(310));
+        t.key(b"x", 400);
+        t.server(b"x", 480); // the second `x`, at (0, 4)
+        t.ack(560);
+        t.o.on_tick(ms(900));
+        t.o.stats()
+    };
+    let on = trial(Guards::ALL);
+    assert_eq!(on.mispredicted.total(), 0, "{on:?}");
+    let mut off = Guards::ALL;
+    off.disable("anchor_gap");
+    let off = trial(off);
+    assert!(off.mispredicted.total() > 0, "{off:?}");
+}
+
+/// `Guards::anchor_gap`'s second half (review of #91): the key was sent 90 ms after the Enter,
+/// past `ANCHOR_GAP`, but the transport delivered the two together (a retransmit, coalescing),
+/// so its effect (a cursor move) came before the acknowledgement. The acknowledgement that lets
+/// the epoch anchor covers the waiting key itself: that proves the key was taken, and the anchor
+/// is refused. With the Enter's acknowledgement alone the gap is all the core has, which is the
+/// stated assumption (DESIGN.md §9: the guard assumes the transport keeps the keys' spacing).
+#[test]
+fn an_anchor_whose_own_key_is_acknowledged_is_refused() {
+    let trial = |guards: Guards| {
+        let mut t = T::guarded(guards);
+        t.confirm(); // `$ a`, the cursor at (0, 3)
+        t.ack(130);
+        t.key(b"\r", 200);
+        t.key(b"x", 290);
+        let x_end = t.at;
+        t.server(b"\x1b[C", 500); // the Enter and the `x` taken together: the cursor to (0, 4)
+        t.o.on_echo_ack(x_end, ms(560)); // covers the `x` itself
+        t.key(b"x", 600);
+        t.server(b"x", 680); // the second `x`, at (0, 4)
+        t.ack(760);
+        t.o.on_tick(ms(1100));
+        t.o.stats()
+    };
+    let on = trial(Guards::ALL);
+    assert_eq!((on.mispredicted.total(), on.written), (0, 0), "{on:?}");
+    let mut off = Guards::ALL;
+    off.disable("anchor_gap");
+    let off = trial(off);
+    assert!(off.mispredicted.total() > 0, "{off:?}");
+}
+
+/// The default predictor guesses no Backspace over a blank (a typed space): its erase changes no
+/// glyph, so nothing can show its echo came. Over a character it does.
+#[test]
+fn no_backspace_is_guessed_over_a_blank() {
+    let mut t = T::trusted(); // `$ a`, the cursor at (0, 3)
+    t.ack(130);
+    t.key(b" ", 200);
+    t.server(b" ", 300);
+    t.ack(330);
+    let before = t.o.stats().guessed;
+    t.key(b"\x7f", 400);
+    assert_eq!(
+        t.o.stats().guessed,
+        before,
+        "a Backspace over the space was guessed"
+    );
+    t.server(b"\x08 \x08", 500);
+    t.ack(530);
+    t.key(b"b", 600);
+    t.server(b"b", 700);
+    t.ack(730);
+    let before = t.o.stats().guessed;
+    t.key(b"\x7f", 800);
+    assert_eq!(
+        t.o.stats().guessed,
+        before + 1,
+        "a Backspace over `b` was not guessed"
+    );
+}
+
+/// A blank guessed over a blank (a typed space) whose cell a later typed key draws, in the same
+/// chunk, is settled as replaced (`withdrawn.superseded`), not contradicted: the screen showed
+/// the blank, then that key's glyph. Only that key's glyph: anything else there is still a
+/// contradiction.
+#[test]
+fn a_blank_over_a_blank_drawn_over_by_a_later_key_is_replaced_not_contradicted() {
+    let trial = |echo: &[u8]| {
+        let mut t = T::trusted(); // `$ a`, the cursor at (0, 3)
+        t.ack(130);
+        t.key(b" ", 200); // a blank over the blank at (0, 3), written
+        t.key(b"\x1b[D", 210); // Left, back over it
+        t.key(b"z", 220); // an insert there, which draws its cell
+        t.server(echo, 400);
+        t.o.stats()
+    };
+    // readline's echo: the space, the Left, then `z` inserted in front of the space.
+    let s = trial(b" \x08z \x08");
+    assert_eq!(s.mispredicted.total(), 0, "{s:?}");
+    assert_eq!(s.withdrawn.superseded, 1, "{s:?}");
+    // The same, but the cell shows a glyph no key typed after it put there.
+    let s = trial(b" \x08Q \x08");
+    assert_eq!(s.mispredicted.contradicted, 1, "{s:?}");
+}
+
+/// After an Enter the line starts empty, so a Right past what was typed is a no-op (readline's
+/// rule): the key typed after it draws the cell a Backspace's blank was guessed on, and the
+/// Backspace's echo and that key's, in one chunk, are the echo and its overwrite, not a
+/// contradiction of the blank.
+#[test]
+fn a_right_past_the_typed_text_after_an_enter_moves_nothing() {
+    let mut t = T::trusted(); // `$ a`
+    t.ack(130);
+    t.key(b"\r", 140);
+    t.server(b"\r\n$ ", 200);
+    t.ack(210);
+    t.key(b"q", 300);
+    t.server(b"q", 400);
+    t.ack(420);
+    t.key(b"\x7f", 500); // a blank over `q`, written
+    assert!(t.painted(), "the Backspace was not written");
+    t.key(b"\x1b[C", 510); // Right at the end of the line: nothing
+    t.key(b"m", 520); // drawn where `q` was
+    t.server(b"\x08 \x08m", 600);
+    let s = t.o.stats();
+    assert_eq!(s.mispredicted.total(), 0, "{s:?}");
+}
+
 #[test]
 fn an_echo_ack_beyond_the_input_sent_is_ignored() {
     let mut t = T::trusted();
@@ -508,7 +752,9 @@ fn an_unmarked_split_paste_is_never_written_and_keeps_the_offsets() {
             // The offsets were counted: an ack for all of it is not "beyond the input sent".
             assert_eq!(t.at, 1 + 1024);
             t.key(b"b", 300);
-            t.o.on_echo_ack(t.at, ms(350));
+            // The paste's acknowledgement, up to `b`: `b` waited for it (rule 2's anchoring
+            // after the keys in flight) and is guessed now.
+            t.o.on_echo_ack(t.at - 1, ms(350));
             assert_eq!(t.o.outstanding(), 1, "the paste moved the offsets");
             // The next key was tentative: nothing was written for it.
             assert_eq!(t.o.stats().written, 0);
@@ -818,10 +1064,13 @@ fn a_marker_cut_across_a_gap_is_not_a_marker() {
     assert!(types_again(&mut t, 400), "prediction never came back");
 }
 
-/// The key right after an end marker, in the same read, is typed.
+/// The key right after an end marker, in the same read, is typed. (A predictor that guesses at
+/// the key: the default one waits for the paste's acknowledgement, rule 2's anchoring after the
+/// keys in flight, and then does not anchor a key sent with the paste, `Guards::anchor_gap`.)
 #[test]
 fn a_key_after_an_end_marker_in_the_same_read_is_typed() {
-    let mut t = T::trusted();
+    let mut t = fixed(vec![(0, 2), (0, 3)]);
+    t.confirm();
     t.key(b"\x1b[200~xy", 200);
     let guessed = t.o.stats().guessed;
     t.key(b"z\x1b[201~c", 210);

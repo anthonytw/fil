@@ -46,7 +46,8 @@ use epochs::{Cells, Core, Cut, MAX_CUTS, Why};
 /// A cell the overlay wants to draw: the character and how.
 type Wanted = (char, CellStyle);
 pub use epochs::{
-    EXPIRY, IDLE, LATE_ECHO_GRACE, MAX_OUTSTANDING, Mispredicted, PredictStats, Withdrawn,
+    ANCHOR_GAP, EXPIRY, IDLE, LATE_ECHO_GRACE, MAX_OUTSTANDING, Mispredicted, PredictStats,
+    Withdrawn,
 };
 
 use crate::keys::{KeyClass, KeyDecoder, PasteMark, PasteScan, classify};
@@ -263,6 +264,17 @@ pub struct Guards {
     /// **Off by default** (a proposed hardening, rule 5): an epoch's first write also waits for
     /// the `EchoAck` that covers the key that confirmed it.
     pub ack_before_write: bool,
+    /// A tentative epoch whose keys waited for the `EchoAck` of the keys before it (rule 2,
+    /// "Anchoring after the keys in flight") is anchored at the shadow cursor only if none of its
+    /// own echoes can be on the screen already: only printable keys, and no run of cells just
+    /// left of the cursor that shows the epoch's first keys in order. Otherwise its guesses could
+    /// sit one key or more right of their echoes, and a repeated letter would confirm them.
+    pub anchor_echoed: bool,
+    /// The same epoch is anchored only if its first key was sent at least [`ANCHOR_GAP`] after
+    /// the input before it: one sent sooner can be taken before the `EchoAck` that lets the
+    /// epoch anchor was made, so its effect may be in the shadow already, a cursor move or a
+    /// bell as well as a glyph (vi's normal mode), which no look at the cells can rule out.
+    pub anchor_gap: bool,
 }
 
 impl Guards {
@@ -311,6 +323,8 @@ impl Guards {
             "untrusted" => &mut self.untrusted,
             "cursor_clause" => &mut self.cursor_clause,
             "ack_before_write" => &mut self.ack_before_write,
+            "anchor_echoed" => &mut self.anchor_echoed,
+            "anchor_gap" => &mut self.anchor_gap,
             _ => return None,
         })
     }
@@ -370,6 +384,8 @@ impl Guards {
         untrusted: true,
         cursor_clause: true,
         ack_before_write: false,
+        anchor_echoed: true,
+        anchor_gap: true,
     };
 
     /// M0's core: the painting guards only, every guess written as soon as it is declared. For
@@ -767,6 +783,7 @@ impl Overlay {
     /// The visible mispredictions other than `hidden`, as each was first counted (held guesses
     /// included): unlike `stats().mispredicted.ending()` it never goes down (the driver's run
     /// check).
+    #[cfg(feature = "testkit")]
     pub(crate) fn ending_seen(&self) -> u64 {
         self.o.core.ending_seen()
     }
@@ -989,6 +1006,7 @@ impl Overlay {
             // Not decoded: a pasted or released byte is never a key the core predicts.
             o.decoder.clear();
             o.core.end(Why::Unpredicted, Some(&st), now);
+            o.core.end_read(now);
             o.core.last_activity = Some(now);
             o.core.rebase(&st, now);
             o.report(&st, now);
@@ -997,6 +1015,7 @@ impl Overlay {
         let allowed = o.prediction_allowed(&st);
         let held = o.decoder.pending() as u64;
         let mut pos = at.saturating_sub(held);
+        o.core.begin_read(pos);
         // Whether the input is in a paste before the next key, and the next marker to apply.
         let (mut in_paste, mut mark) = (paste_before, 0);
         // The bytes from here on may be a marker that the next read completes: not keys. A bare
@@ -1025,7 +1044,7 @@ impl Overlay {
                 let pasted = in_paste || cut || o.marks.get(mark).is_some_and(overlaps);
                 if pasted {
                     // Not followed by `Core::touched_later`: a paste's echo may be anywhere.
-                    o.core.note_key(kat, KeyClass::Boundary);
+                    o.core.note_key(kat, KeyClass::Boundary, false);
                     if !skipping {
                         o.core.end(Why::Unpredicted, Some(&st), now);
                     }
@@ -1040,7 +1059,7 @@ impl Overlay {
                 continue;
             }
             o.core.before_key(&st, now);
-            o.core.note_key(kat, class);
+            o.core.note_key(kat, class, matches!(key, KeyEvent::Enter));
             o.core.last_activity = Some(now);
             if !allowed {
                 // The password rule or the alternate screen: the key is not predicted.
@@ -1067,6 +1086,7 @@ impl Overlay {
         }
         // The lazy check runs here too: a read may hold no key (a release event, half a UTF-8
         // character), and its baseline must not take output nobody checked (SEC-1).
+        o.core.end_read(now);
         o.core.last_activity = Some(now);
         o.core.rebase(&st, now);
         o.report(&st, now);
@@ -1084,6 +1104,14 @@ impl Overlay {
         o.core.on_echo_ack(input_upto, o.input_end, &st, now);
         if input_upto <= o.input_end {
             o.predictor.on_echo_ack(input_upto, &o.ctx(&st, now));
+        }
+        // Rule 2, anchoring after the keys in flight: the keys before the epoch are acknowledged
+        // now, their echoes in the shadow, so the epoch's waiting keys are offered to the
+        // predictor at the shadow cursor as it is here. A key it does not guess is a boundary
+        // at the next check, as at any key.
+        if let Some(keys) = o.core.anchor(&st, now) {
+            let edits = o.predictor.on_anchor(&keys, &o.ctx(&st, now));
+            o.core.apply_edits(edits, &st, now);
         }
         o.report(&st, now);
         o.flush_paint(&st, now)
@@ -1257,6 +1285,7 @@ impl Inner {
                 epoch: self.core.epoch,
                 confirmed: self.core.epoch_confirmed(),
                 prior_acked: self.core.prior_acked(),
+                deferring: self.core.deferring(),
                 origin: st.modes().origin || self.tracker.origin_maybe(),
                 cursor_disputed: self.tracker.cursor_disputed(),
             },

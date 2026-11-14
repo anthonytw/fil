@@ -852,6 +852,13 @@ pub struct SimConfig {
     /// through a place no guess leaves it (a Backspace's `\b \b`, an insert's shifted rest) can
     /// end the epoch.
     pub writes: Writes,
+    /// A steady typist instead of the scenario's (the latency lab's `keyprobe keys --screen`).
+    pub steady: Option<Steady>,
+    /// Upstream bursts (review of #91): each key, with this chance in percent, is held up as by
+    /// a lost packet and its retransmit (150 to 400 ms), and the stream is in order, so the keys
+    /// typed meanwhile reach the remote with it, at once. 0: off (the link keeps the keys'
+    /// spacing, with its jitter). A random sequence of its own, so the typist is the same.
+    pub upstream_bursts: u64,
     pub run: RunConfig,
 }
 
@@ -869,9 +876,22 @@ impl SimConfig {
             jitter: Duration::from_millis(20),
             max_chunk: 7,
             writes: Writes::Arbitrary,
+            steady: None,
+            upstream_bursts: 0,
             run,
         }
     }
+}
+
+/// A typist on a fixed schedule, as `keyprobe keys` types (`tests/realnet/predict.sh`): letters
+/// one every `gap`, starting once the prompt is in and the link quiet, and, with `line`, an
+/// Enter after every `line` letters and a `pause` before the next (the user waits for the
+/// command's output); with `line` 0, one unbroken line through the margin.
+#[derive(Clone, Copy, Debug)]
+pub struct Steady {
+    pub gap: Duration,
+    pub line: usize,
+    pub pause: Duration,
 }
 
 /// One thing the typist does: bytes, of a kind, after a gap (`None`: a typing gap at random).
@@ -889,6 +909,29 @@ impl Item {
             gap_us: None,
         }
     }
+}
+
+/// [`Steady`]'s keys: `keys` letters, and the Enters between its lines.
+fn steady(st: &Steady, keys: usize) -> Vec<Item> {
+    let mut items = Vec::new();
+    let mut gap = st.gap;
+    for i in 0..keys {
+        if st.line > 0 && i > 0 && i % st.line == 0 {
+            items.push(Item {
+                bytes: b"\r".to_vec(),
+                kind: InputKind::Typed,
+                gap_us: Some(micros(st.gap)),
+            });
+            gap = st.pause;
+        }
+        items.push(Item {
+            bytes: vec![b"abcdefghijklmnopqrstuvwxyz"[i % 26]],
+            kind: InputKind::Typed,
+            gap_us: Some(micros(gap)),
+        });
+        gap = st.gap;
+    }
+    items
 }
 
 fn typist(sc: Scenario, keys: usize, rng: &mut Rng) -> Vec<Item> {
@@ -1057,6 +1100,7 @@ pub struct SimOutcome {
 /// Runs one session to completion (or to its first violation).
 pub fn run(cfg: &SimConfig) -> SimOutcome {
     let mut rng = Rng::new(cfg.seed);
+    let mut bursts = Rng::new(cfg.seed ^ 0xB0B5_B0B5);
     let size = cfg.run.size;
     let mut remote = Remote::new(cfg.scenario, size.cols, cfg.seed);
     let mut d = Driver::new(&cfg.run);
@@ -1087,8 +1131,15 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
     link.deliver(&mut q, &mut rng, 0, first);
 
     // The user types.
-    let items = typist(cfg.scenario, cfg.keys, &mut rng);
-    let mut t = 30_000u64;
+    let items = match cfg.steady {
+        Some(st) => steady(&st, cfg.keys),
+        None => typist(cfg.scenario, cfg.keys, &mut rng),
+    };
+    // A steady typist starts once the prompt is in and the link quiet (keyprobe's settle).
+    let mut t = match cfg.steady {
+        Some(_) => micros(rtt) * 2 + 500_000,
+        None => 30_000u64,
+    };
     for it in items {
         t += it.gap_us.unwrap_or_else(|| {
             if rng.chance(15) {
@@ -1121,7 +1172,11 @@ pub fn run(cfg: &SimConfig) -> SimOutcome {
                     kind => Ev::Untyped(k.clone(), kind),
                 };
                 d.apply(at, ev);
-                let arrive = (now + link.delay(&mut rng)).max(link.last_c2s);
+                let mut arrive = now + link.delay(&mut rng);
+                if cfg.upstream_bursts > 0 && bursts.chance(cfg.upstream_bursts) {
+                    arrive += bursts.range(150_000, 400_000);
+                }
+                let arrive = arrive.max(link.last_c2s);
                 link.last_c2s = arrive;
                 q.put(arrive, Q::ToRemote(k));
             }

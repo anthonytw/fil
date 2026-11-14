@@ -294,9 +294,14 @@ predict-demo *args:
 
 # Scripted prediction scenarios at scale (no PTY): many seeds, release build. Also the shadow's row
 # stamps against a byte-by-byte reference (crates/fil-predict/tests/screen_view.rs).
-predict-soak seeds="200":
-    FIL_PREDICT_SEEDS={{seeds}} cargo test --release -p fil-predict --test sim
+predict-soak seeds="200" bursts="0":
+    FIL_PREDICT_SEEDS={{seeds}} FIL_PREDICT_BURSTS={{bursts}} cargo test --release -p fil-predict --test sim
     FIL_STAMP_SEEDS={{seeds}} cargo test --release -p fil-predict --test screen_view every_row
+
+# The soak's counts by program and delivery, not judged (docs/m3/plan.md §2.5's tables): 1,000 seeds
+# and both backends by default; `bursts` is the percentage of keys held up as by a lost packet.
+predict-soak-counts seeds="1000" bursts="0":
+    FIL_PREDICT_SEEDS={{seeds}} FIL_PREDICT_BURSTS={{bursts}} cargo test --release -p fil-predict --test sim soak_counts -- --ignored --nocapture
 
 # Guard-off sweep: proves every overlay guard is needed (slow; not in `ci`). Run after changing a guard.
 predict-mutants:

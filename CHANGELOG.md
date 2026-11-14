@@ -10,6 +10,8 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 ### Fixed
 
+- A guess erased by a later key's Backspace after a Right at the end of the line (readline's Right there does nothing) is no longer repainted over the erased cell until the next output arrives, and no longer ends the run of guesses.
+- A guess the host's output drew and then erased in the same burst of output (an echo and a later key's erase, arriving together) is taken off at once, instead of staying on the screen over the erased cell for a quarter of a second.
 - A Backspace typed over a space is no longer guessed: its erase shows nothing, so a later key's echo in the same output could count as a wrong guess.
 - An echo that arrives in output the client handles just after the 250 ms late-echo grace, before its timer runs, now counts as an echo: it no longer takes the guesses after it off the screen until their own echoes bring them back (seen once in three runs at a bash prompt on a loaded host).
 

@@ -27,6 +27,15 @@ fn seeds() -> u64 {
     fil_testkit::scale::pick("FIL_PREDICT_SEEDS", 2, 200)
 }
 
+/// Upstream bursts for the soak (`FIL_PREDICT_BURSTS`, a percentage of keys; 0 by default):
+/// `SimConfig::upstream_bursts`, keys held up as by a lost packet and its retransmit.
+fn bursts() -> u64 {
+    std::env::var("FIL_PREDICT_BURSTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Seeds for the prior-ack side-by-side run, which covers every scenario, backend and predictor
 /// in one test and replays two drivers per event: about 100 per-scenario tests' worth of work per
 /// seed (4.6 CPU-s), so 200 seeds took over 40 minutes on a CI runner. 2, or 16 at full scale;
@@ -101,6 +110,7 @@ fn scenario(sc: Scenario) {
             };
             for seed in base()..base() + n {
                 let mut cfg = SimConfig::new(sc, seed, b.name);
+                cfg.upstream_bursts = bursts();
                 // Mixed closes the painting gates often (character sets, insert mode, the
                 // alternate screen) and every disturbance ends an epoch: it needs more keys to
                 // be sure to paint at all.
@@ -163,6 +173,7 @@ fn scenario(sc: Scenario) {
             let mut cfg = SimConfig::new(sc, seed, b.name);
             cfg.keys = if sc == Scenario::Mixed { 150 } else { 50 };
             cfg.writes = Writes::Joined;
+            cfg.upstream_bursts = bursts();
             cfg.run.bar = (!fish).then_some(sc.category());
             let out = run(&cfg);
             let m = out.predict.mispredicted;
@@ -596,5 +607,50 @@ fn a_suggestion_seen_while_waiting_for_an_anchor_is_noted() {
         cfg.writes = Writes::Boundaries;
         let m = run(&cfg).predict.mispredicted;
         assert_eq!(m.total(), m.contradicted + m.hidden, "{}: {m:?}", b.name);
+    }
+}
+
+/// The soak's counts, not judged (`just predict-soak-counts`): every faithful and slow program
+/// with whole writes, writes cut at sequence boundaries and joined writes, both backends,
+/// `FIL_PREDICT_SEEDS` seeds (1,000 by default) of 50 keys, with `FIL_PREDICT_BURSTS` upstream
+/// bursts. One line per program and delivery: guesses written and visible mispredictions by
+/// kind. The judged soak (`scenario`) stops at its first failing run; this counts them all, for
+/// the tables in `docs/m3/plan.md` §2.5.
+#[test]
+#[ignore = "slow (minutes in release); run with `just predict-soak-counts`"]
+fn soak_counts() {
+    let n = std::env::var("FIL_PREDICT_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000u64);
+    for sc in Scenario::ALL {
+        if !matches!(sc.category(), Category::Faithful | Category::Slow) {
+            continue;
+        }
+        for w in [Writes::Whole, Writes::Boundaries, Writes::Joined] {
+            let (mut keys, mut written, mut miss, mut failures) =
+                (0u64, 0u64, Mispredicted::default(), 0u64);
+            for b in backends() {
+                for seed in base()..base() + n {
+                    let mut cfg = SimConfig::new(sc, seed, b.name);
+                    cfg.keys = 50;
+                    cfg.writes = w;
+                    cfg.upstream_bursts = bursts();
+                    let o = run(&cfg);
+                    failures += u64::from(o.failure.is_some());
+                    keys += 50;
+                    written += o.predict.written;
+                    add(&mut miss, &o.predict.mispredicted);
+                }
+            }
+            println!(
+                "counts {:<10} {:<10} bursts {} keys {keys} written {written} mispredicted {} ({}) failures {failures}",
+                sc.name(),
+                w.name(),
+                bursts(),
+                miss.total(),
+                kinds(&miss, keys)
+            );
+        }
     }
 }

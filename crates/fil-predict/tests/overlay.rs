@@ -665,6 +665,104 @@ fn a_right_past_the_typed_text_after_an_enter_moves_nothing() {
     assert_eq!(s.mispredicted.total(), 0, "{s:?}");
 }
 
+/// The joined-writes residual (echo seed 858): a guess made at the end of the line (nothing right
+/// of its cell) fixes the line's end for the overwrite walk, whatever came before, so a Right
+/// past what was typed after it is a no-op (readline's rule): the Backspace erases the guess's
+/// cell and the next key draws it. The guess's echo, then that erase, then the next key's echo:
+/// no contradiction.
+#[test]
+fn a_right_at_the_end_after_a_guess_at_the_end_moves_nothing() {
+    let mut t = T::trusted(); // `$ a`, the cursor at (0, 3), the row blank right of it
+    t.ack(130);
+    t.key(b"m", 200); // written at (0, 3)
+    assert!(t.painted());
+    t.key(b"\x1b[C", 210); // Right at the end: nothing
+    t.key(b"\x7f", 220); // erases `m`
+    t.key(b"7", 230); // drawn at (0, 3)
+    t.server(b"m\x08 \x08", 400);
+    t.server(b"7", 420);
+    let s = t.o.stats();
+    assert_eq!(s.mispredicted.total(), 0, "{s:?}");
+}
+
+/// The same with zsh's right prompt on the row: a right-aligned run two blanks or more away is
+/// not line text, so the line still ends at the guess.
+#[test]
+fn a_right_prompt_does_not_hide_the_end_of_the_line() {
+    let mut t = T::trusted(); // `$ a`, the cursor at (0, 3)
+    t.server(b"\x1b7\x1b[1;36H[ok]\x1b8", 100); // a right prompt ending one column before the margin
+    t.ack(130);
+    t.key(b"m", 200);
+    t.key(b"\x1b[C", 210);
+    t.key(b"\x7f", 220);
+    t.key(b"7", 230);
+    t.server(b"m\x08 \x08", 400);
+    t.server(b"7", 420);
+    let s = t.o.stats();
+    assert_eq!(s.mispredicted.total(), 0, "{s:?}");
+}
+
+/// A guess whose echo a chunk draws and then puts back to what the cell showed before (here its
+/// erase by a Backspace typed after Up, a boundary key the walk does not follow) is taken off at
+/// the end of that chunk, counted as a contradiction (the walk cannot vouch for the echo), not
+/// left drawn over the erased cell until its acknowledgement's grace.
+#[test]
+fn a_guess_drawn_and_erased_in_one_chunk_goes_with_it() {
+    let mut t = T::trusted(); // `$ a`
+    t.ack(130);
+    t.key(b"0", 200); // written at (0, 3)
+    t.key(b"\x1b[A", 210); // Up: a boundary
+    t.key(b"\x7f", 220);
+    t.server(b"0\x08 \x08", 400);
+    assert!(!t.painted(), "the guess stays drawn over the erased cell");
+    let s = t.o.stats();
+    assert_eq!(s.mispredicted.contradicted, 1, "{s:?}");
+}
+
+/// A guess's line end comes from the shadow only where the record of typed keys does not
+/// contradict it (review of #98, F2): here `p` and `q` were typed and not echoed yet, then two
+/// Lefts and `x` in front of them, so the shadow shows nothing right of `x`'s cell but the line
+/// goes on. A Right after `x` moves onto `q`'s place and the Backspace then erases `p`, not `x`:
+/// a masking overwrite of `x` in the same chunk is not taken for the Backspace's.
+#[test]
+fn typed_keys_right_of_a_guess_keep_its_line_open() {
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 4), (0, 3)]);
+    t.confirm(); // `$ a`, the cursor at (0, 3)
+    t.ack(130);
+    t.key(b"p", 200); // (0, 3)
+    t.key(b"q", 210); // (0, 4)
+    t.key(b"\x1b[D", 220);
+    t.key(b"\x1b[D", 230);
+    t.key(b"x", 240); // (0, 3), in front of `p`
+    t.key(b"\x1b[C", 250); // onto where `p` now is
+    t.key(b"\x7f", 260); // erases `x`'s right neighbour, not `x`
+    t.server(b"x\x08*", 400); // `x` drawn, then masked in place
+    let s = t.o.stats();
+    assert_eq!(
+        s.confirmed, 0,
+        "the masking overwrite was taken for an echo: {s:?}"
+    );
+}
+
+/// The drawn-then-erased rule skips a guess whose cell an earlier guess with the same glyph held
+/// (review of #98, F3): `b`, Backspace, `b`, each written (a predictor that writes the retyped
+/// key). The chunk with the first `b`'s echo and its erase is not the third guess's echo, which
+/// is still to come: it stays, and its echo confirms it.
+#[test]
+fn a_retyped_letter_is_not_taken_off_by_the_first_ones_erase() {
+    let mut t = fixed(vec![(0, 2), (0, 3), (0, 3), (0, 3)]);
+    t.confirm(); // `$ a`
+    t.ack(130);
+    t.key(b"b", 200);
+    t.key(b"\x7f", 210);
+    t.key(b"b", 220);
+    t.server(b"b\x08 \x08", 400);
+    assert!(t.painted(), "the retyped `b` was taken off");
+    t.server(b"b", 420);
+    let s = t.o.stats();
+    assert_eq!(s.mispredicted.total(), 0, "{s:?}");
+}
+
 #[test]
 fn an_echo_ack_beyond_the_input_sent_is_ignored() {
     let mut t = T::trusted();

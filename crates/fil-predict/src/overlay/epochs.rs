@@ -248,6 +248,9 @@ pub(crate) struct Guess {
     /// Written, then taken off the screen by a painting gate in a server-output chunk while
     /// pending, its cell blank: a gate retraction if its echo then confirms it (`hidden`).
     gated: bool,
+    /// When it was guessed, the shadow showed nothing right of its cell on its row: the line
+    /// ended there, so after it a Right past what was typed is a no-op ([`Core::touched_later`]).
+    open_right: bool,
 }
 
 /// A written guess retired while off the screen and unechoed, in a server-output chunk (or
@@ -290,7 +293,7 @@ enum Step {
     /// Enter: as `Stop`, and the line after it starts empty (a shell's next prompt), so its end
     /// is known: a Right past what was typed since is a no-op. That is readline's rule, not a
     /// fact about every line editor: fish and zsh-autosuggestions accept a suggestion there
-    /// (see [`Core::touched_later`] for why erring that way is safe).
+    /// (see [`Core::touched_later`] for what erring that way changes).
     Enter,
 }
 
@@ -311,6 +314,12 @@ struct Glimpse {
     /// anything could take it away unexplained; or `None`: it drew other text first, or a
     /// scroll, shift or erase came before any draw.
     seen: Option<Option<Attrs>>,
+    /// Undecided, but a cut saw the chunk draw the guess's own glyph in other text than the cell
+    /// had: if the cell ends the chunk showing any text other than the glyph, the guess is taken
+    /// off at the end of the chunk (`Core::settle_glimpsed`), not left drawn over the program's
+    /// erase until its acknowledgement's grace. It is held (its cell is blank): it ends
+    /// `contradicted`, or `hidden` if its own glyph comes back to the cell.
+    drawn: bool,
 }
 
 // No `Debug`: it holds guessed glyphs (docs/m3/plan.md §4.3).
@@ -882,6 +891,9 @@ impl Core {
             KeyClass::Backspace => (row, col),
             _ => (row, col + 1),
         };
+        // Nothing right of the cell on its row, or only a right-aligned run (zsh's `RPROMPT`):
+        // the line ends at this key (for the overwrite walk).
+        let open_right = Self::line_ends_after(v, row, col);
         // A kept guess's cell is not the new epoch's to take.
         let kept_there = self.keys.iter().any(|k| {
             matches!(&k.guess, Some(Guess {
@@ -939,6 +951,7 @@ impl Core {
             carried: false,
             kept: false,
             gated: false,
+            open_right,
         });
         self.stats.guessed += 1;
     }
@@ -964,6 +977,7 @@ impl Core {
             carried: false,
             kept: false,
             gated: false,
+            open_right: false,
         });
     }
 
@@ -1159,6 +1173,30 @@ impl Core {
             v.cell(r as u16, c as u16).map_or("", |c| c.text)
         };
         (1..=glyphs.len()).all(|j| here < j || (0..j).any(|i| text_at(here - j + i) != glyphs[i]))
+    }
+
+    /// Whether the row holds no line text right of `col`: blank to the margin, or blank up to a
+    /// right-aligned run (a right prompt, zsh's `RPROMPT`: one run ending at the last column or
+    /// the one before it, at least two blanks right of `col`), as the default predictor reads a
+    /// row's tail. For the overwrite walk's line end only (`Guess::open_right`). A wrong `true`
+    /// makes the walk more permissive, which changes more than a bucket: a glimpsed guess can be
+    /// settled at the chunk's end as confirmed (`Core::settle_glimpsed`), and a blank over a
+    /// blank can be settled as drawn over instead of contradicted (`Core::on_chunk`), which keeps
+    /// the epoch and its other written guesses where a contradiction would end it.
+    fn line_ends_after(v: &dyn ScreenView, row: u16, col: u16) -> bool {
+        let cols = v.size().cols;
+        let blank = |c: u16| v.cell(row, c).is_none_or(|c| c.text.trim().is_empty());
+        let Some(last) = (col + 1..cols).rev().find(|&c| !blank(c)) else {
+            return true;
+        };
+        if last + 2 < cols {
+            return false;
+        }
+        let Some(run_start) = (col + 1..=last).rev().find(|&c| blank(c)).map(|c| c + 1) else {
+            return false;
+        };
+        // At least two blanks between the cell and the run.
+        run_start >= col + 3 && (col + 1..run_start).all(blank)
     }
 
     fn is_kept(&self, i: usize) -> bool {
@@ -1523,9 +1561,10 @@ impl Core {
     /// cursor can only be at or right of where the line's known part starts, so stopping there
     /// keeps the walk's cursor no further left than readline's. A Right past what was typed is a
     /// no-op after an Enter, where the line started empty and its end is known (proposed,
-    /// 2026-11-12); after any other boundary it is not stopped, since the end is not known
-    /// (`docs/m3/plan.md` §2.5).
-    fn touched_later(&self, at: InputPos, class: KeyClass) -> bool {
+    /// 2026-11-12), and after the guess when the guess was made at the line's end
+    /// (`open_right`, `Guess::open_right`; proposed, 2026-11-14); otherwise it is not stopped,
+    /// since the end is not known (`docs/m3/plan.md` §2.5).
+    fn touched_later(&self, at: InputPos, class: KeyClass, open_right: bool) -> bool {
         let Some(p) = self.typed.iter().position(|&(a, _)| a == at) else {
             return false;
         };
@@ -1537,9 +1576,10 @@ impl Core {
         // After an Enter the line's end is known (it started empty): a Right past it is a no-op.
         // That is readline's rule. fish and zsh-autosuggestions differ: there a Right at the end
         // accepts the suggestion and moves the cursor far right. The walk then errs permissively
-        // (a later key is taken to draw a cell it does not), which can only change the bucket of
-        // a guess whose cell this chunk changed (a glimpsed echo, a blank drawn over), never what
-        // is drawn: every written guess's cell ends showing the shadow either way.
+        // (a later key is taken to draw a cell it does not). That is not only a bucket: a
+        // glimpsed guess is settled at the chunk's end as confirmed (`settle_glimpsed`), and a
+        // blank over a blank is settled as drawn over, which keeps the epoch and its other
+        // written guesses where a contradiction would end it (`on_chunk`).
         let known_end = stop.is_some_and(|i| self.typed[i].1 == Step::Enter);
         // The cursor, in characters right of where the line's known part starts, and how far
         // right the keys have put characters.
@@ -1571,6 +1611,19 @@ impl Core {
             end += 1;
             cur - 1
         };
+        // The shadow showed nothing right of the guess when it was made: the line ended at its
+        // key (a plain append, or a Backspace at the end), whatever came before the walk's start,
+        // so from here a Right past what was typed is a no-op too. Unless the record of typed keys
+        // says otherwise: keys since the line's start put characters right of the cell (typed
+        // ahead and not echoed yet, which the shadow does not show), so a Right there moves.
+        // As after an Enter, this is readline's rule, and now after any boundary: in fish and
+        // zsh-autosuggestions a Right at the end accepts the suggestion and moves far right, and
+        // the walk then errs permissively, with the effects `Core::line_ends_after` names.
+        let open_right = open_right && end <= cur;
+        let known_end = known_end || open_right;
+        if open_right {
+            end = cur;
+        }
         for &(_, step) in self.typed.range(p + 1..) {
             match step {
                 Step::Char if cur <= cell => return true,
@@ -1619,10 +1672,15 @@ impl Core {
             self.glimpses.push(Glimpse {
                 at: k.at,
                 i,
-                touched: self.touched_later(k.at, k.class),
+                touched: self.touched_later(
+                    k.at,
+                    k.class,
+                    k.guess.as_ref().is_some_and(|g| g.open_right),
+                ),
                 start: cell_hash(cell.map_or("", |c| c.text)),
                 start_attrs: cell.map(|c| c.attrs),
                 seen: None,
+                drawn: false,
             });
         }
         !self.glimpses.is_empty()
@@ -1667,6 +1725,7 @@ impl Core {
                 Some(c) if (other_text || Some(c.attrs) != x.start_attrs) && explained => {
                     x.seen = Some(Some(c.attrs));
                 }
+                Some(_) if other_text => x.drawn = true,
                 Some(_) => {}
                 None if other_text => x.seen = Some(None),
                 None => {}
@@ -1689,6 +1748,33 @@ impl Core {
     pub fn settle_glimpsed(&mut self, v: &dyn ScreenView, now: Time) {
         for j in 0..self.glimpses.len() {
             let x = self.glimpses[j];
+            // Drawn, unexplained, then put back: the program erased what it drew (its echo and a
+            // later key's erase, across a boundary key the walk does not follow, or a masking
+            // redraw back to blank). The cell is not the guess's any more, so it goes now, as a
+            // contradiction (the walk cannot vouch for the echo: `docs/m3/plan.md` §2.5).
+            // Not when an earlier guess for the cell had the same glyph (`seen` holds it): the
+            // drawing may be that key's echo, and this guess's own may still come.
+            if x.drawn
+                && x.seen.is_none()
+                && let Some(i) = self.keys.iter().position(|k| k.at == x.at)
+                && self.is_pending(i)
+                && let Some(Guess {
+                    kind:
+                        GKind::Glyph {
+                            row,
+                            col,
+                            glyph,
+                            seen,
+                        },
+                    ..
+                }) = &self.keys[i].guess
+                && !seen.iter().any(|t| *t == text_of(*glyph))
+                && v.cell(*row, *col)
+                    .is_some_and(|c| c.text != text_of(*glyph))
+            {
+                self.retire(i, Why::Contradiction, Some(v), now);
+                continue;
+            }
             if !matches!(x.seen, Some(Some(_))) {
                 continue;
             }
@@ -1935,7 +2021,14 @@ impl Core {
                     .recent
                     .iter()
                     .any(|&(a, c)| a > k.at && text_of(c) == now_text);
-                if blank_on_blank && later_glyph && self.touched_later(k.at, k.class) {
+                if blank_on_blank
+                    && later_glyph
+                    && self.touched_later(
+                        k.at,
+                        k.class,
+                        k.guess.as_ref().is_some_and(|g| g.open_right),
+                    )
+                {
                     drawn_over.push(i);
                 } else {
                     contradicted.push(i);

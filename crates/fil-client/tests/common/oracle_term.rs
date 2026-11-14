@@ -1738,6 +1738,7 @@ impl Rig {
             resume: None,
             echo_ack: false,
             agent: false,
+            take_over: fil_proto::msg::TakeOver::Any,
         };
         let session = self.session.clone();
         tokio::spawn(async move { session.serve(b, attach).await });

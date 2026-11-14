@@ -51,9 +51,19 @@ Pasted text is never read as an escape.
 
 ## One client at a time: takeover
 
-At most one client is attached to a session. If you attach to a session that is attached elsewhere, you **take it over**: the other client is told that the session was taken over by your machine's label at a time, and drops. You get the screen sized to your terminal.
+At most one client is attached to a session. If you attach to a session that is attached elsewhere, fil first asks whether to take it over:
 
-A laptop that wakes up later does not steal the session back. Its client is refused with the takeover message and asked, on its own terminal, whether to take the session back (`y` or `n`). The label shown is `host_label` from your [config](config.md), by default your machine's short host name. It is shown only to your own other clients.
+```
+fil: "build" is attached from laptop since 2026-11-13 14:02:00. Take it over?  y = yes, n = no
+```
+
+The time is in your local time. A client whose link is down (a laptop asleep in a bag) still holds the session, and the question then says `(disconnected)` after the time. Nothing has changed yet: the other client keeps the session while you decide. `n` leaves it alone, and fil exits with status 1. If the session changes hands while you decide, your `y` does not take it from the new holder: fil asks again, naming who has it now.
+
+`y` **takes it over**: the other client is told that the session was taken over by your machine's label at a time, and drops. You get the screen sized to your terminal.
+
+To take sessions over without the question, pass `--take-over` for one run, or set [`takeover = "always"`](config.md#takeover) for a host or for all of them. A session nobody is attached to (a new one, or one you detached from) never asks.
+
+A laptop that wakes up later does not steal the session back. Its client is refused with the takeover message and asked, on its own terminal, whether to take the session back (`y` or `n`); that `y` takes it without a second question. The label shown is `host_label` from your [config](config.md), by default your machine's short host name. It is shown only to your own other clients.
 
 ## Resuming and catching up
 
@@ -65,7 +75,7 @@ When a link drops and comes back, the client says where it stopped and the daemo
 
 - `0` when you detach or the session ends with nothing to report;
 - the shell's own status if it exited with one, or `128+N` if it was killed by signal N (or fil was stopped by signal N);
-- `1` on an error, or if the session was taken over, replaced or detached elsewhere;
+- `1` on an error, if the session was taken over, replaced or detached elsewhere, or if it is attached elsewhere and you did not take it over;
 - `2` on a usage error;
 - `255` if a forward failed and `forward_failure = "exit"`.
 

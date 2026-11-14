@@ -4,8 +4,16 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+This changes the wire (`wire 1.15` in `fil --version`), so it comes in 0.3.0: the client and the host need the same release.
+
+### Added
+
+- `--take-over` and the `takeover` setting (`"ask"`, the default, or `"always"`), in `[defaults]` and `[host.NAME]`, to take a session over without being asked. `fil config show` shows it with its source.
+
 ### Changed
 
+- **Attaching to a session that another client holds asks first.** fil says who has it and since when (`fil: "build" is attached from laptop since 2026-11-13 14:02:00. Take it over?  y = yes, n = no`, with `(disconnected)` for a client whose link is down) and takes it over only on `y`, and only from the client it named: if the session changes hands while you decide, it asks again. `n` leaves the other client alone and exits with status 1. Before, such an attach always took the session over. `--take-over` or `takeover = "always"` restores that. A session nobody is attached to, a reconnect and taking a session back after a takeover never ask.
+- The "taken over" message and the take-back question give the time in your local time instead of UTC.
 - **Predictive echo after an interruption.** In 0.2.0, once something interrupted the run of guesses (Enter, Tab, Ctrl-W, a Backspace while keys were still on their way, reaching the end of the line), prediction stayed off until your typing slowed below about one key per round trip. Now fil waits until the keys before the interruption have reached the host, about one round trip, then guesses the keys typed since and goes on, while you keep typing. Still not guessed: typing steadily faster than about 12 keys a second, until it slows, and fish or zsh's autosuggestions while more than one key is on its way. Nothing wrong is shown in either case; fil just does not guess.
 
 ### Fixed

@@ -158,6 +158,7 @@ fn attach<L: Link, D: Link>(h: &SessionHandle, client: L, daemon: D) -> fil_test
         echo_ack: false,
         agent: false,
         resume: None,
+        take_over: fil_proto::msg::TakeOver::Any,
     };
     let h = h.clone();
     tokio::spawn(async move { h.serve(daemon, attach).await });

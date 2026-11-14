@@ -757,6 +757,12 @@ f_takeover() {
   fc_wait a TAKEN-42
   fc_on client2
   fc_start b -- viajumps tk
+  # The second machine is asked first, and nothing has changed for the first one yet.
+  fc_wait b 'is attached' 30
+  fc_wait b 'from client since' 5
+  fc_line a 'echo STILL-$((2+2))'
+  fc_wait a STILL-4
+  fc_answer b y
   fc_wait b TAKEN-42 30
   fc_wait a 'was taken over' 20
   fc_wait a 'by client2' 5
@@ -780,7 +786,7 @@ f_takeover_back() {
   fc_line a 'echo FIRST-$((6*7))'
   fc_wait a FIRST-42
   fc_on client2
-  fc_start b -- viajumps tb
+  fc_start b -- --take-over viajumps tb
   fc_wait b FIRST-42 30
   # Output produced while the second client holds the session: the first client has not seen it,
   # so it can only appear on its screen if the take-back really restores the session.

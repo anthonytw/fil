@@ -1063,7 +1063,16 @@ pub fn predict_takeover(ctx: &Ctx, host: &str) -> Res {
     let t = Instant::now();
     cut.set(true);
     type_keys(&mut c1, "ghi");
-    let c2 = pattach(ctx, host, None, "dp-ptk", ADAPTIVE, 30, 100);
+    // `--take-over`: the question would hold the takeover until the cable is back.
+    let c2 = pattach(
+        ctx,
+        host,
+        None,
+        "dp-ptk",
+        &["--predict", "adaptive", "--take-over"],
+        30,
+        100,
+    );
     let attached = c2.want_screen("echo TO-", ATTACH_TIMEOUT);
     let held = t.elapsed();
     cut.set(false);

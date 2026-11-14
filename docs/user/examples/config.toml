@@ -6,6 +6,8 @@
 transport = "auto"        # auto | pipe | direct
 host_label = "laptop"     # shown to other clients on a takeover; default: this machine's short host name
 predict = "adaptive"      # off | adaptive | always: predictive echo (from 0.2.0); --predict overrides it
+takeover = "ask"          # ask | always: a session attached elsewhere is taken over only after you say yes;
+                          # --take-over is always, for one run
 
 [defaults.offline_input]  # keystrokes typed while disconnected
 buffer = "4KiB"           # 0 drops them

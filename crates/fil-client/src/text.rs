@@ -120,6 +120,17 @@ pub fn format_utc(unix_ms: u64) -> String {
     )
 }
 
+/// `unix_ms` as a time of day in a zone `offset_secs` east of UTC, without a zone name:
+/// `2023-11-14 17:13:20` for `1700000000000` at UTC-5. The `fil` binary passes this machine's
+/// offset at that instant (the takeover messages are in the user's local time); the offset is a
+/// parameter so the formatting has no zone of its own to depend on.
+pub fn format_at_offset(unix_ms: u64, offset_secs: i32) -> String {
+    let shifted = unix_ms.saturating_add_signed(i64::from(offset_secs) * 1000);
+    let mut t = format_utc(shifted);
+    t.truncate("2023-11-14 22:13:20".len());
+    t
+}
+
 /// `5` as `5s`, `75` as `1m15s`, `3700` as `1h01m`.
 pub fn format_elapsed(secs: u64) -> String {
     if secs < 60 {
@@ -179,6 +190,20 @@ mod tests {
         assert_eq!(format_utc(1_700_000_000_000), "2023-11-14 22:13:20 UTC");
         assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(format_utc(951_782_400_000), "2000-02-29 00:00:00 UTC");
+        // Local time: the offset moves the clock (and the date across midnight); no zone name.
+        assert_eq!(
+            format_at_offset(1_700_000_000_000, -5 * 3600),
+            "2023-11-14 17:13:20"
+        );
+        assert_eq!(
+            format_at_offset(1_700_000_000_000, 0),
+            "2023-11-14 22:13:20"
+        );
+        assert_eq!(
+            format_at_offset(1_700_000_000_000, 2 * 3600),
+            "2023-11-15 00:13:20"
+        );
+        assert_eq!(format_at_offset(0, -3600), "1970-01-01 00:00:00");
         assert_eq!(format_elapsed(5), "5s");
         assert_eq!(format_elapsed(75), "1m15s");
         assert_eq!(format_elapsed(3700), "1h01m");

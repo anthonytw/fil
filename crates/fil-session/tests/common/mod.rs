@@ -236,6 +236,7 @@ impl Client {
             echo_ack: c.echo_ack,
             agent: false,
             resume: c.resume,
+            take_over: fil_proto::msg::TakeOver::Any,
         };
         let h = h.clone();
         let serve = tokio::spawn(async move { h.serve(daemon_end, attach).await });
@@ -642,6 +643,7 @@ mod fwd {
                 echo_ack: false,
                 agent: self.side.agent.lock().unwrap().is_some(),
                 resume,
+                take_over: fil_proto::msg::TakeOver::Any,
             };
             {
                 let mut s = self.seen.lock().unwrap();

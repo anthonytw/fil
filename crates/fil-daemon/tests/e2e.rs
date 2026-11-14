@@ -123,6 +123,130 @@ async fn takeover_between_two_clients() {
     d.stop().await;
 }
 
+/// A fresh attach without `take_over` (the client's default) to a session someone holds is
+/// refused with who holds it, and changes nothing: no new epoch, the holder's key and link stay,
+/// the PTY keeps its size, and the refused attach's key is not left registered. A holder whose
+/// link is down still counts. With `take_over` the attach takes the session as before, and a
+/// session nobody holds (new, or detached) attaches without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_attach_asks_before_taking_a_session_over() {
+    let s = Scratch::new();
+    // `stty size` for every line typed: the PTY's rows and columns.
+    let d = start(&s, config("echo ready; while read l; do stty size; done")).await;
+    let (k1, k2, k3) = (key(1), key(2), key(3));
+
+    // A new session: nobody to ask about.
+    let mut a = Client::attach(
+        d.pipe().await,
+        Connect::new("main", k1.clone()).host("laptop").asking(),
+    )
+    .await;
+    assert_eq!(a.reply.as_ref().expect("a new session attaches").epoch, 1);
+    a.wait_screen("ready").await;
+
+    let mut wide = Connect::new("main", k2.clone()).host("desktop").asking();
+    wide.size = size(100, 30);
+    let b = Client::attach(d.pipe().await, wide).await;
+    let Some(AttachRefusal::Attached {
+        holder,
+        epoch,
+        connected,
+    }) = b.refused.clone()
+    else {
+        panic!("refused with the holder: {:?} {:?}", b.refused, b.reply);
+    };
+    assert_eq!(holder.host.as_str(), "laptop");
+    assert!(holder.since_unix_ms > 0);
+    assert!(connected);
+    assert_eq!(epoch, 1);
+    eventually("the refused attach's key to leave the registry", || async {
+        !d.registry.contains(&transport_key(&k2))
+    })
+    .await;
+    // The holder never heard of it: still attached, its key accepted, the PTY its size.
+    assert!(a.taken_over.is_none() && !a.down);
+    assert!(d.registry.contains(&transport_key(&k1)));
+    a.type_bytes(b"x\n").await;
+    a.wait_screen("24 80").await;
+    assert!(!a.out_str().contains("30 100"), "{:?}", a.out_str());
+
+    // The holder's link goes down without a detach: it still holds the session.
+    let stale = a.resume_request();
+    a.link.close();
+    drop(a);
+    let mut refused = None;
+    for _ in 0..100 {
+        let c = Client::attach(
+            d.pipe().await,
+            Connect::new("main", k3.clone()).host("desktop").asking(),
+        )
+        .await;
+        match c.refused.clone() {
+            Some(AttachRefusal::Attached {
+                connected: false, ..
+            }) => {
+                refused = c.refused.clone();
+                break;
+            }
+            Some(AttachRefusal::Attached {
+                connected: true, ..
+            }) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("refused while the holder is away: {other:?} {:?}", c.reply),
+        }
+    }
+    assert!(refused.is_some(), "the holder's link never counted as down");
+    // And it can still resume: nothing moved.
+    let mut a = Client::attach(
+        d.pipe().await,
+        Connect::new("main", k1.clone()).resume(stale),
+    )
+    .await;
+    assert_eq!(a.reply.as_ref().expect("the holder resumes").epoch, 1);
+
+    // A yes for an epoch that is over (the holder changed while the user decided) is refused
+    // again, with the holder now in force.
+    let stale_grant = Client::attach(
+        d.pipe().await,
+        Connect::new("main", k2.clone()).host("desktop").grant(7),
+    )
+    .await;
+    assert!(
+        matches!(
+            stale_grant.refused,
+            Some(AttachRefusal::Attached { epoch: 1, .. })
+        ),
+        "{:?}",
+        stale_grant.refused
+    );
+    // Told yes by its user, the other client takes the session from the holder it was told
+    // about.
+    let mut b = Client::attach(
+        d.pipe().await,
+        Connect::new("main", k2.clone()).host("desktop").grant(1),
+    )
+    .await;
+    assert_eq!(b.reply.as_ref().expect("a takeover").epoch, 2);
+    a.wait("the takeover notice", |c| c.taken_over.is_some())
+        .await;
+    b.wait_screen("ready").await;
+
+    // Detached: nobody to ask about again.
+    b.detach().await;
+    b.wait_down().await;
+    let c = Client::attach(
+        d.pipe().await,
+        Connect::new("main", k3.clone()).host("desktop").asking(),
+    )
+    .await;
+    assert_eq!(
+        c.reply.as_ref().expect("a detached session attaches").epoch,
+        4
+    );
+    d.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requests_ls_detach_kill() {
     let s = Scratch::new();

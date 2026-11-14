@@ -437,6 +437,25 @@ pub struct Attach {
     /// This client relays its agent (DESIGN.md section 10): the session's agent socket exists
     /// only while such a subscriber holds the session.
     pub agent: bool,
+    /// Whether a fresh attach (`resume` is `None`) may take the session from a subscriber that
+    /// holds it (DESIGN.md section 5.2). Ignored on a resume.
+    pub take_over: TakeOver,
+}
+
+/// What a fresh attach may do to a session that a subscriber holds (DESIGN.md section 5.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TakeOver {
+    /// Nothing: such an attach is refused with [`AttachRefusal::Attached`] and changes nothing.
+    /// The client asks its user, then attaches again with `Epoch`.
+    #[default]
+    No,
+    /// Take it from the subscriber of this epoch only (compare and swap): the one the user was
+    /// asked about (`AttachRefusal::Attached.epoch`), the one that took the session
+    /// (`TakenOver.epoch`, a take-back), or this client itself. If another subscriber holds it
+    /// by now, the attach is refused with a fresh `Attached`, and the client asks again.
+    Epoch(u64),
+    /// Take it from whoever holds it (`--take-over`, `takeover = "always"`).
+    Any,
 }
 
 /// How a session's shell ended, as in [`ControlMsg::SessionExited`]: exactly one field is set
@@ -569,6 +588,19 @@ pub enum AttachRefusal {
     SessionReplaced,
     /// The resume did not present the key of the subscriber it claims to be. Nothing changed.
     WrongKey,
+    /// A fresh attach without `take_over` found the session held by another subscriber
+    /// (DESIGN.md section 5.2). Nothing changed: no new epoch, no key revoked, no resize. The
+    /// client asks its user and attaches again with `TakeOver::Epoch(epoch)`.
+    Attached {
+        /// Who holds it, and since when (the time of its fresh attach).
+        holder: SubscriberSummary,
+        /// The holder's epoch: an attach with `TakeOver::Epoch` of it takes the session from
+        /// this holder and nobody else.
+        epoch: u64,
+        /// The holder's transport is up. `false` is a subscriber that still holds the session
+        /// but whose link is down (a laptop asleep): `fil ls` shows it as `-`.
+        connected: bool,
+    },
 }
 
 /// Who is attached to a session, as `fil ls` shows it.
@@ -1181,6 +1213,7 @@ mod tests {
             echo_ack: false,
             agent: false,
             resume: None,
+            take_over: TakeOver::Epoch(9),
         });
         let wire = good.encode().unwrap();
         assert_eq!(ControlMsg::decode(&wire).unwrap(), good);
@@ -1293,6 +1326,14 @@ mod tests {
             ControlMsg::AttachRefused(AttachRefusal::Detached),
             ControlMsg::AttachRefused(AttachRefusal::SessionReplaced),
             ControlMsg::AttachRefused(AttachRefusal::WrongKey),
+            ControlMsg::AttachRefused(AttachRefusal::Attached {
+                holder: SubscriberSummary {
+                    host: "laptop".parse().unwrap(),
+                    since_unix_ms: 1_700_000_000_000,
+                },
+                epoch: 4,
+                connected: false,
+            }),
             ControlMsg::TakenOver(t),
             ControlMsg::PtyMode {
                 canonical: true,

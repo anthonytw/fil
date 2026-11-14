@@ -13,7 +13,8 @@ use std::time::Duration;
 use common::*;
 use fil_proto::ChannelId;
 use fil_proto::msg::{
-    ControlMsg, ForwardOp, ForwardResult, PolicyLine, PortsRow, RefusedWhat, Request, Response,
+    AttachRefusal, ControlMsg, ForwardOp, ForwardResult, PolicyLine, PortsRow, RefusedWhat,
+    Request, Response,
 };
 use fil_proto::mux::{BindAddr, ForwardKind, ForwardRefusal, ForwardSpec, Target, TargetHost};
 use fil_session::policy::file::Trust;
@@ -221,6 +222,50 @@ async fn the_udp_port_follows_direct_in_the_policy_file() {
         e.reply.as_ref().unwrap().udp_port,
         d.handle.udp_port(),
         "offered again"
+    );
+    d.stop().await;
+}
+
+/// Under `direct = false` no key is registered, but the pipe attach still binds one: a refused
+/// fresh attach (one that did not take the session over) takes its binding away again, and a
+/// refused resume never touches the holder's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_fresh_attach_leaves_no_binding_under_direct_false() {
+    let host = Host::named("unbind", "", "direct = false\n");
+    let s = Scratch::new();
+    let mut cfg = config(CAT);
+    cfg.policy = host.sources();
+    let d = start(&s, cfg).await;
+    let (k1, k2) = (key(1), key(2));
+    let mut a = Client::attach(d.pipe().await, Connect::new("main", k1.clone()).asking()).await;
+    a.wait_screen("ready").await;
+    assert!(
+        !d.registry.contains(&transport_key(&k1)),
+        "no key registered"
+    );
+    assert!(d.handle.is_bound(&k1));
+
+    let b = Client::attach(d.pipe().await, Connect::new("main", k2.clone()).asking()).await;
+    assert!(
+        matches!(b.refused, Some(AttachRefusal::Attached { .. })),
+        "{:?}",
+        b.refused
+    );
+    until("the refused attach's binding to go", || {
+        !d.handle.is_bound(&k2)
+    })
+    .await;
+    assert!(d.handle.is_bound(&k1), "the holder keeps its binding");
+
+    // The holder's own resume, refused (an epoch from the future): its binding stays.
+    let mut bad = a.resume_request();
+    bad.epoch += 1;
+    let c = Client::attach(d.pipe().await, Connect::new("main", k1.clone()).resume(bad)).await;
+    assert_eq!(c.refused, Some(AttachRefusal::BadResume));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        d.handle.is_bound(&k1),
+        "a refused resume unbound the holder"
     );
     d.stop().await;
 }

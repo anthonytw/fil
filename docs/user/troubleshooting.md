@@ -77,7 +77,7 @@ The session works but `transport = "direct"` or `auto` never leaves ssh:
 
 ## Exit codes
 
-`0` normal, `1` error or the session was taken over elsewhere, `2` usage error, `255` a forward failed under `forward_failure = "exit"`, and `128+N` for a signal. See [sessions](sessions.md).
+`0` normal, `1` error, the session was taken over elsewhere or you did not take it over, `2` usage error, `255` a forward failed under `forward_failure = "exit"`, and `128+N` for a signal. See [sessions](sessions.md).
 
 ## Getting help
 

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! fil HOST [SESSION] [-L SPEC]... [-R SPEC]... [-D SPEC]... [-A|-a]
-//!          [--transport auto|pipe|direct] [--predict off|adaptive|always]
+//!          [--transport auto|pipe|direct] [--predict off|adaptive|always] [--take-over]
 //!                                                attach (default session: main)
 //! fil ls HOST                                    list sessions
 //! fil kill HOST SESSION                          end a session
@@ -83,7 +83,8 @@ Logs: ~/.local/state/fil/client.log (set FIL_LOG=debug for more).
 Exit status: 0 on a normal end (detached, or the session ended with nothing to report);
 the shell's own status if it exited with one; 128+N if the shell was killed by signal N or
 fil was stopped by signal N;
-1 on an error or if the session was taken over, replaced or detached elsewhere;
+1 on an error, if the session was taken over, replaced or detached elsewhere, or if it is
+attached elsewhere and you did not take it over;
 2 on a usage error;
 255 if a forward failed and forward_failure = \"exit\".
 
@@ -156,6 +157,11 @@ pub struct AttachArgs {
     /// guesses shown only on a slow link) or always
     #[arg(long, value_enum, value_name = "MODE")]
     pub predict: Option<PredictArg>,
+
+    /// Take the session over without asking when another client is attached to it (the
+    /// config's takeover = "always" for this run). By default fil asks first
+    #[arg(long)]
+    pub take_over: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -511,6 +517,8 @@ pub enum Action {
         transport: Option<TransportSetting>,
         /// `--predict`: over the config's `predict` for this run.
         predict: Option<Predict>,
+        /// `--take-over`: over the config's `takeover` for this run.
+        take_over: bool,
         /// `-L`, `-R`, `-D`, `-A` and `-a`, parsed and checked, for the run's plan.
         forwards: CliForwards,
     },
@@ -610,6 +618,9 @@ impl Cli {
         }
         if a.predict.is_some() {
             stray.push("--predict".to_string());
+        }
+        if a.take_over {
+            stray.push("--take-over".to_string());
         }
         if stray.is_empty() {
             return Ok(());
@@ -712,6 +723,7 @@ impl Cli {
                     session: a.session.unwrap_or_else(default_session),
                     transport: a.transport.map(Into::into),
                     predict: a.predict.map(Into::into),
+                    take_over: a.take_over,
                     forwards,
                 })
             }
@@ -751,6 +763,7 @@ mod tests {
                 session: name("main"),
                 transport: None,
                 predict: None,
+                take_over: false,
                 forwards: Default::default()
             }
         );
@@ -761,6 +774,7 @@ mod tests {
                 session: name("build"),
                 transport: None,
                 predict: None,
+                take_over: false,
                 forwards: Default::default()
             }
         );
@@ -780,6 +794,7 @@ mod tests {
                     session: name("main"),
                     transport: Some(want),
                     predict: None,
+                    take_over: false,
                     forwards: Default::default()
                 }
             );
@@ -790,6 +805,37 @@ mod tests {
                 .kind(),
             ErrorKind::InvalidValue
         );
+    }
+
+    #[test]
+    fn take_over_flag() {
+        assert!(matches!(
+            action(&["devbox"]),
+            Action::Attach {
+                take_over: false,
+                ..
+            }
+        ));
+        for args in [
+            &["--take-over", "devbox"][..],
+            &["devbox", "build", "--take-over"],
+        ] {
+            assert!(matches!(
+                action(args),
+                Action::Attach {
+                    take_over: true,
+                    ..
+                }
+            ));
+        }
+        // Long only: fil's short flags are ssh's.
+        assert!(parse(&["-T", "devbox"]).is_err());
+        // Before a subcommand it would be ignored: a usage error.
+        let e = parse(&["--take-over", "ls", "devbox"])
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(e.to_string().contains("--take-over"), "{e}");
     }
 
     #[test]
@@ -806,6 +852,7 @@ mod tests {
                     session: name("main"),
                     transport: None,
                     predict: Some(want),
+                    take_over: false,
                     forwards: Default::default()
                 }
             );
@@ -1133,6 +1180,7 @@ mod tests {
                 session: s.clone(),
                 transport: None,
                 predict: None,
+                take_over: false,
                 forwards: forwards(&["devbox", "-L", "80"]),
             }
         );
@@ -1366,6 +1414,7 @@ mod tests {
                 session: name("ls"),
                 transport: None,
                 predict: None,
+                take_over: false,
                 forwards: Default::default()
             }
         );
@@ -1380,6 +1429,7 @@ mod tests {
                 session: name("main"),
                 transport: None,
                 predict: None,
+                take_over: false,
                 forwards: Default::default()
             }
         );

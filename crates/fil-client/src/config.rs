@@ -63,8 +63,14 @@ pub struct ClientConfig {
     /// On the first attach, scroll the screen's current contents into the terminal's scrollback
     /// before the snapshot clears the screen, so the user's earlier work is not wiped.
     pub preserve_screen: bool,
-    /// Formats a daemon timestamp (ms since the Unix epoch) for the "taken over" message. The
-    /// default is UTC; the `fil` binary can supply local time.
+    /// A fresh attach takes the session over from a client that holds it, without asking
+    /// (`--take-over`, `takeover = "always"`; DESIGN.md section 5.2). Off by default: the daemon
+    /// refuses such an attach and the user is asked first. A take-back after a takeover always
+    /// takes over (the user has just said yes), and a reconnect never asks (it resumes).
+    pub take_over: bool,
+    /// Formats a daemon timestamp (ms since the Unix epoch) for the "taken over" message and the
+    /// take-over question. The default is UTC; the `fil` binary supplies local time
+    /// (`fil::localtime::format_local`).
     pub time_format: fn(u64) -> String,
     /// Bound on keystrokes sent but not yet acknowledged (the input channel's send buffer).
     pub input_window: usize,
@@ -169,6 +175,7 @@ impl ClientConfig {
             status_placement: Placement::Auto,
             notice_for: Duration::from_secs(10),
             preserve_screen: true,
+            take_over: false,
             time_format: format_utc,
             input_window: 256 * 1024,
             max_held_output: 4 * 1024 * 1024,
@@ -202,6 +209,8 @@ pub enum Outcome {
     },
     /// Someone else took the session over and the user chose not to take it back.
     TakenOver { by: String, at_unix_ms: u64 },
+    /// The session is attached from another client and the user chose not to take it over.
+    Attached { by: String, since_unix_ms: u64 },
     /// The session was killed and recreated (or the daemon restarted) and the user chose not to
     /// start a fresh attach.
     SessionReplaced,
@@ -238,6 +247,10 @@ impl Outcome {
             Outcome::TakenOver { by, at_unix_ms } => format!(
                 "fil: session \"{session}\" was taken over by {by} at {} (left alone)",
                 time_format(*at_unix_ms)
+            ),
+            Outcome::Attached { by, since_unix_ms } => format!(
+                "fil: session \"{session}\" is attached from {by} since {}; left alone (--take-over takes it without asking)",
+                time_format(*since_unix_ms)
             ),
             Outcome::SessionReplaced => format!(
                 "fil: \"{session}\" is a different session now (killed and recreated, or the daemon restarted)"

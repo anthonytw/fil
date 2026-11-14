@@ -541,6 +541,8 @@ impl FakeDaemon {
             host: a.host.clone(),
             size: a.size,
             resume: a.resume,
+            take_over: a.take_over,
+            holder_connected: st.current.is_some(),
             now_unix_ms: now,
         });
         let (epoch, subscriber, mode, effects) = match outcome {
@@ -1242,6 +1244,8 @@ impl FakeDaemon {
             host: host.parse().unwrap(),
             size: fil_proto::msg::TermSize::new(100, 30).unwrap(),
             resume: None,
+            take_over: fil_proto::msg::TakeOver::Any,
+            holder_connected: true,
             now_unix_ms: now,
         });
         let AttachOutcome::Accepted { effects, .. } = outcome else {

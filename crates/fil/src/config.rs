@@ -19,6 +19,8 @@
 //!                             # the plain command
 //! install = "ask"             # ask | never | always: offering to install fil on a host that has
 //!                             # none, on an interactive first attach only
+//! takeover = "ask"            # ask | always: attaching to a session another client holds asks
+//!                             # first, or takes it over at once; --take-over is always, for one run
 //!
 //! [defaults.forward]          # instead of the list above, when tunables are set:
 //! # specs = ["-L 5173"]       #   the same list
@@ -195,6 +197,17 @@ pub enum ForwardFailure {
     Exit,
 }
 
+/// Attaching to a session that another client holds (DESIGN.md section 5.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TakeoverMode {
+    /// The daemon refuses the attach and the user is asked whether to take the session over.
+    #[default]
+    Ask,
+    /// Take it over without asking, as `--take-over` does for one run.
+    Always,
+}
+
 /// The `[defaults.forward]` tunables (DESIGN.md section 14), checked: the same keys and
 /// bounds as the daemon's `[forward]` (`fil_forward::tunables`).
 pub use fil_forward::tunables::ForwardTunables;
@@ -330,6 +343,7 @@ struct RawSection {
     direct: Option<RawDirect>,
     remote: Option<RemoteMode>,
     install: Option<InstallMode>,
+    takeover: Option<TakeoverMode>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -385,6 +399,7 @@ impl RawSection {
             forward_failure: self.forward_failure.or(base.forward_failure),
             remote: self.remote.or(base.remote),
             install: self.install.or(base.install),
+            takeover: self.takeover.or(base.takeover),
             offline_input: nested(
                 &self.offline_input,
                 &base.offline_input,
@@ -434,6 +449,9 @@ pub struct HostSettings {
     pub remote: RemoteMode,
     /// Whether an attach that finds no fil offers to install it (`crate::install::attach`).
     pub install: InstallMode,
+    /// Whether attaching to a session another client holds asks first; `--take-over` makes it
+    /// `Always` for one run (`app::attach_settings`).
+    pub takeover: TakeoverMode,
 }
 
 impl Default for HostSettings {
@@ -453,6 +471,7 @@ impl Default for HostSettings {
             direct_address: None,
             remote: RemoteMode::Auto,
             install: InstallMode::Ask,
+            takeover: TakeoverMode::Ask,
         }
     }
 }
@@ -618,6 +637,7 @@ pub mod keys {
         "direct",
         "remote",
         "install",
+        "takeover",
     ];
     /// `forward` written as a table.
     pub const FORWARD: &[&str] = &["specs", "window", "buffer", "open_wait", "linger"];
@@ -649,6 +669,7 @@ const EXPLAINED_KEYS: &[&str] = &[
     "predict",
     "remote",
     "install",
+    "takeover",
     "forward",
     "forward.window",
     "forward.buffer",
@@ -678,6 +699,7 @@ fn is_set(key: &str, s: &RawSection) -> bool {
         "predict" => s.predict.is_some(),
         "remote" => s.remote.is_some(),
         "install" => s.install.is_some(),
+        "takeover" => s.takeover.is_some(),
         "forward" => fwd(|t| t.specs.is_some()),
         "forward.window" => fwd(|t| t.window.is_some()),
         "forward.buffer" => fwd(|t| t.buffer.is_some()),
@@ -767,6 +789,7 @@ fn show_value(key: &str, host: &str, s: &HostSettings) -> Result<(String, Option
         "predict" => word(&s.predict),
         "remote" => word(&s.remote),
         "install" => word(&s.install),
+        "takeover" => word(&s.takeover),
         "forward" => list(s.forward.iter().map(forward_spec::format_flag)),
         "forward.window" => bytes(s.forward_tunables.window.get() as usize),
         "forward.buffer" => bytes(s.forward_tunables.buffer),
@@ -949,6 +972,9 @@ fn resolve(s: &RawSection) -> Result<HostSettings, String> {
     }
     if let Some(i) = s.install {
         out.install = i;
+    }
+    if let Some(t) = s.takeover {
+        out.takeover = t;
     }
     if let Some(d) = &s.direct {
         if let Some(a) = &d.address {
@@ -1156,6 +1182,23 @@ install = "always"
             (RemoteMode::Auto, InstallMode::Always)
         );
         assert_eq!(cfg.for_host("other").install, InstallMode::Never);
+    }
+
+    #[test]
+    fn takeover_defaults_to_ask_and_layers_by_host() {
+        assert_eq!(Config::default().for_host("x").takeover, TakeoverMode::Ask);
+        let cfg = parse("[defaults]\ntakeover = \"always\"\n[host.shared]\ntakeover = \"ask\"\n")
+            .unwrap();
+        assert_eq!(cfg.for_host("devbox").takeover, TakeoverMode::Always);
+        assert_eq!(cfg.for_host("shared").takeover, TakeoverMode::Ask);
+        // Only the two words; `never` is not one (the question already says no).
+        for bad in ["never", "yes", "true"] {
+            assert!(
+                parse(&format!("[defaults]\ntakeover = \"{bad}\"\n")).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse("[defaults]\ntakeover = true\n").is_err());
     }
 
     #[test]

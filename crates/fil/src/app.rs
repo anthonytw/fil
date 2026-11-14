@@ -117,9 +117,14 @@ async fn run(action: Action, config: &Config) -> u8 {
             session,
             transport,
             predict,
+            take_over,
             forwards,
         } => {
-            let settings = attach_settings(config, &host, predict);
+            let mut settings = attach_settings(config, &host, predict);
+            // `--take-over` over the config's `takeover`, for this run.
+            if take_over {
+                settings.takeover = config::TakeoverMode::Always;
+            }
             let run = Run::new(settings.remote, settings.pipe.is_some());
             attach(&host, session, transport, forwards, settings, run).await
         }
@@ -266,6 +271,9 @@ pub fn client_config(session: SessionName, settings: &HostSettings) -> ClientCon
     let mut cfg = ClientConfig::new(session, host_label(settings.host_label.as_deref()));
     cfg.offline = settings.offline.clone();
     cfg.predict = settings.predict;
+    cfg.take_over = settings.takeover == config::TakeoverMode::Always;
+    // The takeover messages and the take-over question are in the user's local time.
+    cfg.time_format = crate::localtime::format_local;
     // Only the path manager backs off; a second layer would double the waits.
     cfg.reconnect.backoff = Backoff::None;
     cfg

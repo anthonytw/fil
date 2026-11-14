@@ -20,7 +20,7 @@
 #   detach_reattach      ~. and come back: the same shell, the output kept
 #   daemon_survives_login  every ssh login ended: the daemon and the session are still there (macOS
 #                        has no logind)
-#   takeover             a second client takes the session; the first is told, the second sees it all
+#   takeover             a second client is asked, takes the session; the first is told, the second sees it all
 #   forwards_reconnect   -L, -R and -D, and a transfer through each that outlives a killed ssh
 #   agent                -A with a throwaway ssh-agent: a real ssh hop from the session; refused without -A
 #   quic_upgrade         pipe to QUIC on loopback, the session continues with the ssh gone
@@ -234,6 +234,9 @@ scenario_takeover() {
   fc_line a 'for i in $(seq 1 60); do echo TICK-$i; sleep 0.25; done; echo TICKDONE-$((6*7))'
   fc_wait a 'TICK-8' 20
   fc_start b -- --config "$CFG" macremote mac-take
+  # The second client asks first (the first one keeps the session meanwhile); yes takes it.
+  fc_wait b 'is attached from' 30
+  fc_answer b y
   fc_wait a 'was taken over' 30
   # The client asks whether to take it back; no: it leaves the session alone and exits 1.
   fc_wait a 'Take it back?' 10

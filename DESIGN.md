@@ -179,7 +179,15 @@ A command typed right after a window resize must see the new size, as it does ov
 
 ### 5.2 One subscriber, with takeover
 
-At most one client is attached to a session **(decided)**. Attaching to a session that is already attached takes it over:
+At most one client is attached to a session **(decided)**. Attaching to a session that another client holds asks first **(decided, owner 2026-11-13; it replaced the old rule, under which such an attach always took the session over)**:
+
+- The client's fresh attach says whether it may take the session over (`Attach.take_over`): `No` (the default), `Epoch(e)` (from the holder of epoch `e` only) or `Any`. Unless it may take it from the holder now in force, the daemon refuses it with who holds the session, since when and at which epoch (`AttachRefusal::Attached`; a holder whose link is down still holds it, and the refusal says so). Nothing changes on that refusal: no new epoch, no key revoked, no resize, and the refused attach's own key and binding are removed again (also under server policy `direct = false`, where the key was never registered; a refused resume never touches the key it presented, which may be the holder's).
+- The client asks its user on the terminal, the way it asks to take a session back: on one line before the first attach has entered the screen (`fil: "build" is attached from laptop since 2026-11-13 14:02:00. Take it over?  y = yes, n = no`, the time in the client's local time as in the takeover messages, with `(disconnected)` after the time for a holder whose link is down), on the status overlay after that. `y` attaches again with `Epoch` of the holder named; `n` (or `q`, Esc, ^C) ends the run with status 1 and a line that names `--take-over`. `fil` attaches only with a terminal on stdin and stdout, so there is always someone to ask.
+- `--take-over` (one run) or `takeover = "always"` (config, per host; the flag wins) sends `Any` and skips the question. The take-back after a takeover (below) is already a yes and sends `Epoch` of the taker (`TakenOver.epoch`). The fresh attach after a `BadResume`, which only the holder itself is sent (§7.2), and the one that starts over when the first screen's snapshot was cut short (the daemon gave this client the session a moment before) send `Epoch` of this client's own epoch, once: an attach that gets no answer is followed by one that asks. A reconnect is a resume and never asks.
+- **A yes is for the holder it named (compare and swap).** The question has no time limit, and the session can change hands while the user decides (the holder detaches and a third client attaches, or another client takes it): an `Epoch` that is no longer current is refused with a fresh `Attached`, and the client asks again about the holder now in force. So no client takes a session from someone its user was not asked about, and a laptop that was away while a self-granted retry waited never takes the session from the client that took it meanwhile. One case can still ask about the client's own attach: a link that dies after the daemon accepted a fresh attach that did not take over, but before its reply arrived, and a client that then attaches again. The client cannot tell that from a refusal that was lost, so it asks rather than take the session silently.
+- A session nobody holds (new, or detached) attaches without asking.
+
+A fresh attach with `take_over` takes the session over:
 
 1. The daemon increments the epoch. It tells the old subscriber "taken over by `<host label>` at `<time>`", revokes that client's key and drops its transport.
 2. The new subscriber receives a snapshot sized to its terminal, and the PTY is resized (SIGWINCH).
@@ -557,7 +565,7 @@ Frames still queued on the old transport are discarded. The send buffers rebuild
 
 **Catch-up rule.** Snapshot when more than 1 MiB of output is waiting to be sent, or when output has waited unacknowledged for more than 2 s, or (with the terminal pacer, §8.5) the output ahead of new output would take more than 2 s to drain at the measured rate, and at least 16 KiB is waiting to be sent. Output already sent is not counted: a jump does not skip it, the client applies it before the snapshot (§6.2). The size floor on the time rule stops a quiet shell on a slow link from triggering a snapshot. These are the §16 item 7 defaults, still to be tuned.
 
-**Epoch rules.** A fresh attach (no resume state) increments the epoch, tells the old subscriber it was taken over, revokes its key and drops its transport. Detach increments the epoch and revokes; when it came from `fil detach`, the attached client is sent `Detach` before its transport is dropped. The attach request also carries a host label (§5.2), which the old subscriber sees in the takeover message.
+**Epoch rules.** A fresh attach (no resume state) to a session that a subscriber holds (connected or not) and without `take_over` is refused with `Attached` (the holder's host label and attach time, and whether its link is up), and nothing changes (§5.2). Otherwise a fresh attach increments the epoch, tells the old subscriber, if any, it was taken over, revokes its key and drops its transport. Detach increments the epoch and revokes; when it came from `fil detach`, the attached client is sent `Detach` before its transport is dropped. The attach request also carries a host label (§5.2), which the old subscriber sees in the takeover message.
 
 **Resume rules.** Epochs are small per-session counters that restart at 1 whenever a session is created, so a resume is checked in this order:
 
@@ -596,6 +604,7 @@ The binding and the key end with the subscriber's hold on the session: on takeov
 - `ResumeRequest.want_snapshot`: resume the session but repaint from a snapshot, for when the client's screen no longer matches its byte position. The snapshot's reason is `Requested`, and `skipped` is what the client had not yet seen (`ready - seq`), so the gap marker appears when it missed output and not when it was current.
 - **Wire revision 13** (M3 W1) added `InputRecord::Repaint`, `SnapshotReason::Repaint` and `SnapshotInfo.size_gen`: the in-band repaint (§4.2, §6.2). The golden's `input/` section has the record, and its decode probes a repaint with a trailing byte and the first kind past it.
 - **Wire revision 14** (0.1.0 sweep) added `Response::Killed { unchecked }`, the answer to `KillSession` in place of `Done`: whether the kill could check for jobs that left the session (§5.1).
+- **Wire revision 15** added `Attach.take_over` and `AttachRefusal::Attached { holder, connected }`: a fresh attach takes a held session over only when it asks to (§5.2).
 - `ErrorCode::SessionStartFailed`: the daemon could not start the session; the reason is in its log.
 
 Before v1 these changes are made in place, with no compatibility kept.
@@ -889,7 +898,7 @@ Everything below that is not marked **(decided)** is proposed: the implementatio
 ## 14. CLI and configuration (sketch)
 
 ```
-fil HOST [SESSION] [-L SPEC]… [-R SPEC]… [-D SPEC]… [-A|-a] [--transport MODE] [--predict MODE]
+fil HOST [SESSION] [-L SPEC]… [-R SPEC]… [-D SPEC]… [-A|-a] [--transport MODE] [--predict MODE] [--take-over]
                                            attach, creating the session if needed (default: main)
 fil ls HOST                                sessions: name, term, forwards, attached, last output, created
 fil kill HOST SESSION
@@ -940,6 +949,7 @@ It can only narrow what `/etc/fil/policy.toml` and the sshd mirror allow, never 
 transport = "auto"        # auto | pipe | direct
 host_label = "laptop"     # shown to other clients on a takeover; default: this machine's short host name
 predict = "adaptive"      # off | adaptive | always: predictive echo (§9), from 0.2.0; --predict overrides it
+takeover = "ask"          # ask | always: attaching to a session another client holds (§5.2); --take-over is always
 
 [defaults.offline_input]  # keystrokes typed while disconnected (§4.3)
 buffer = "4KiB"           # 0 drops them

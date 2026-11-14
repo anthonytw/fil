@@ -253,6 +253,9 @@ pub struct Connect {
     pub host: &'static str,
     pub size: TermSize,
     pub resume: Option<ResumeRequest>,
+    /// `Attach::take_over`: `Any` by default here, as most tests are about what a takeover
+    /// does; [`Connect::asking`] is the client's default.
+    pub take_over: fil_proto::msg::TakeOver,
 }
 
 impl Connect {
@@ -263,7 +266,18 @@ impl Connect {
             host: "laptop",
             size: size(80, 24),
             resume: None,
+            take_over: fil_proto::msg::TakeOver::Any,
         }
+    }
+    /// A fresh attach that does not take the session from a holder (`take_over` unset).
+    pub fn asking(mut self) -> Self {
+        self.take_over = fil_proto::msg::TakeOver::No;
+        self
+    }
+    /// A fresh attach that takes the session from the holder of `epoch` only.
+    pub fn grant(mut self, epoch: u64) -> Self {
+        self.take_over = fil_proto::msg::TakeOver::Epoch(epoch);
+        self
     }
     pub fn host(mut self, host: &'static str) -> Self {
         self.host = host;
@@ -284,6 +298,7 @@ impl Connect {
             agent: false,
             size_gen: 0,
             resume: self.resume,
+            take_over: self.take_over,
         }
     }
 }

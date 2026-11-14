@@ -46,6 +46,13 @@ pub fn utc_offset_secs(unix_secs: i64) -> i32 {
     off.clamp(-MAX_OFFSET_SECS, MAX_OFFSET_SECS) as i32
 }
 
+/// `unix_ms` in this machine's local time, `YYYY-MM-DD HH:MM:SS`: the time in the takeover
+/// messages and the take-over question (`fil_client::ClientConfig::time_format`).
+pub fn format_local(unix_ms: u64) -> String {
+    let secs = i64::try_from(unix_ms / 1000).unwrap_or(i64::MAX);
+    fil_client::text::format_at_offset(unix_ms, utc_offset_secs(secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +64,15 @@ mod tests {
         assert!((-12 * 3600..=14 * 3600).contains(&off), "{off}");
         // And a time the platform cannot represent is UTC, not a panic.
         assert_eq!(utc_offset_secs(i64::MAX), 0);
+    }
+
+    #[test]
+    fn local_times_are_utc_moved_by_this_machine_s_offset() {
+        let at = 1_700_000_000_000;
+        assert_eq!(
+            format_local(at),
+            fil_client::text::format_at_offset(at, utc_offset_secs(1_700_000_000))
+        );
+        assert_eq!(format_local(at).len(), "2023-11-14 22:13:20".len());
     }
 }

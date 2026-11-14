@@ -308,13 +308,17 @@ fn last_fil_line(t: &str) -> String {
         .to_string()
 }
 
-/// A second client takes the session over; the first is told.
+/// A second client is asked, then takes the session over; the first is told.
 fn takeover(ctx: &Ctx, host: &str) -> Res {
     let mut c1 = Client::spawn(ctx, host, Variant::Auto, "e2e-to");
     spawn_to_prompt(&c1)?;
     c1.send("ZV=held5\r");
     c1.roundtrip("TO1", ATTACH_TIMEOUT)?;
     let mut c2 = Client::spawn(ctx, host, Variant::Auto, "e2e-to");
+    // It asks before it takes the session from the first client.
+    c2.expect_screen("is attached from", ATTACH_TIMEOUT)
+        .ok_or_else(|| format!("the second client did not ask\n{}", c2.tail()))?;
+    c2.answer("y");
     let t0 = Instant::now();
     c2.expect("TO1-42", ATTACH_TIMEOUT)
         .ok_or_else(|| format!("takeover client does not show the session\n{}", c2.tail()))?;

@@ -1244,6 +1244,9 @@ impl Core {
             host: a.host.clone(),
             size: a.size,
             resume: a.resume,
+            take_over: a.take_over,
+            // Only said in a refusal: a holder whose link is down still holds the session.
+            holder_connected: self.live.as_ref().is_some_and(|l| !l.events.is_closed()),
             now_unix_ms: now_unix_ms(),
         });
         let (epoch, sub, mode, effects) = match outcome {
@@ -1893,6 +1896,7 @@ mod tests {
             echo_ack: true,
             agent: false,
             size_gen: 0,
+            take_over: fil_proto::msg::TakeOver::Any,
         };
         let mut a = match handle.attach(attach).await.ok().unwrap() {
             AttachAnswer::Accepted(a) => a,
@@ -2218,6 +2222,7 @@ mod tests {
             echo_ack: false,
             agent: false,
             size_gen: 0,
+            take_over: fil_proto::msg::TakeOver::Any,
         };
         let accepted = |answer: AttachAnswer| match answer {
             AttachAnswer::Accepted(a) => a,
@@ -2293,6 +2298,7 @@ mod tests {
             echo_ack: false,
             agent: false,
             size_gen: 0,
+            take_over: fil_proto::msg::TakeOver::Any,
         };
         let accepted = |answer: AttachAnswer| match answer {
             AttachAnswer::Accepted(a) => a,

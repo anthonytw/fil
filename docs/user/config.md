@@ -18,7 +18,7 @@ transport = "pipe"
 
 - `[host.NAME]` overrides `[defaults]` key by key. The nested tables (`forward`, `offline_input`, `direct`) are merged key by key too. A list replaces the list under it.
 - `fil user@devbox` uses `[host."user@devbox"]` if there is one, and otherwise `[host.devbox]`.
-- The command line is applied over both: `-L`, `-R` and `-D` add to `forward`, `-A` and `-a` set `agent`, `--transport` sets `transport`, `--predict` sets `predict`.
+- The command line is applied over both: `-L`, `-R` and `-D` add to `forward`, `-A` and `-a` set `agent`, `--transport` sets `transport`, `--predict` sets `predict`, `--take-over` sets `takeover` to `always`.
 
 ## Seeing what applies: `fil config show HOST`
 
@@ -69,6 +69,16 @@ fil devbox --predict off
 ### `install`
 
 `"ask"` (default), `"never"` or `"always"`: whether an attach that finds no fil on the host offers to install it. It asks only on an interactive first attach.
+
+### `takeover`
+
+`"ask"` (default) or `"always"`: what happens when you attach to a session that another client is attached to. `ask` shows who has it and since when, and asks whether to take it over; `n` leaves it alone and fil exits with status 1. A client whose link is down (a laptop asleep) still counts, and the question says it is disconnected. `always` takes the session over without asking, as fil 0.2 and earlier always did (the key is new in 0.3.0; earlier versions refuse it as unknown). A session nobody is attached to never asks.
+
+`--take-over` does the same as `always` for one run:
+
+```
+fil devbox build --take-over
+```
 
 ### `forward`
 

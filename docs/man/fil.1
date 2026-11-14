@@ -56,6 +56,9 @@ adaptive
 always
 .RE
 .TP
+\fB\-\-take\-over\fR
+Take the session over without asking when another client is attached to it (the config\*(Aqs takeover = "always" for this run). By default fil asks first
+.TP
 \fB\-\-config\fR \fI<FILE>\fR
 Read this config file instead of ~/.config/fil/config.toml ($FIL_CONFIG also works)
 .TP
@@ -167,7 +170,8 @@ Logs: ~/.local/state/fil/client.log (set FIL_LOG=debug for more).
 Exit status: 0 on a normal end (detached, or the session ended with nothing to report);
 the shell\*(Aqs own status if it exited with one; 128+N if the shell was killed by signal N or
 fil was stopped by signal N;
-1 on an error or if the session was taken over, replaced or detached elsewhere;
+1 on an error, if the session was taken over, replaced or detached elsewhere, or if it is
+attached elsewhere and you did not take it over;
 2 on a usage error;
 255 if a forward failed and forward_failure = "exit".
 .PP

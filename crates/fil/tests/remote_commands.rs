@@ -859,9 +859,9 @@ fn a_live_session_runs_only_the_approved_remote_commands() {
     });
     a.live(2);
 
-    // Another client takes the session over; the first takes it back (a fresh attach, in the
-    // background); the second is asked in turn.
-    let mut b = w.start();
+    // Another client takes the session over (`--take-over`: no question); the first takes it
+    // back (a fresh attach, in the background); the second is asked in turn.
+    let mut b = w.start_with(&["--take-over", HOST]);
     b.live(3);
     a.wait_for("Take it back", 0);
     let from_b = b.text().len();

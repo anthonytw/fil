@@ -4,15 +4,24 @@
 //! the daemon must now do ([`Effect`]); the machine never does it itself.
 //!
 //! Rules:
-//! - A fresh attach (no resume state) bumps the epoch and becomes the subscriber. Any previous
-//!   subscriber is told it was taken over, its key is revoked and its transport dropped.
+//! - A fresh attach (no resume state) to a session nobody holds bumps the epoch and becomes the
+//!   subscriber.
+//! - A fresh attach to a session that a subscriber holds (connected or not) takes it over only
+//!   if it asks to: [`TakeOver::Any`], or [`TakeOver::Epoch`] of the epoch now in force (compare
+//!   and swap: the holder the user was asked about, and nobody who came after). It bumps the
+//!   epoch, the previous subscriber is told it was taken over, its key is revoked and its
+//!   transport dropped. Otherwise it is refused with who holds the session and its epoch
+//!   ([`AttachRefusal::Attached`]), and nothing changes.
 //! - A resume must match the session's incarnation (else the session was replaced) and present
 //!   the current subscriber's key; with the current epoch it is accepted and keeps the epoch.
 //! - A resume with a stale epoch is refused with the takeover details. It never steals the
 //!   session; to take it back the client attaches afresh.
 //! - Detach bumps the epoch and revokes, so a late resume from the detached client is refused.
 
-use crate::msg::{AttachRefusal, HostLabel, PublicKey, ResumeRequest, TakenOver, TermSize};
+use crate::msg::{
+    AttachRefusal, HostLabel, PublicKey, ResumeRequest, SubscriberSummary, TakeOver, TakenOver,
+    TermSize,
+};
 
 /// Identifies one subscriber across transports within an epoch. The daemon maps it to the live
 /// connection.
@@ -84,6 +93,11 @@ pub struct AttachInput {
     pub host: HostLabel,
     pub size: TermSize,
     pub resume: Option<ResumeRequest>,
+    /// Whether a fresh attach may take the session from its subscriber (`Attach::take_over`).
+    pub take_over: TakeOver,
+    /// The current subscriber's transport is up, for the refusal of a fresh attach without
+    /// `take_over` (the machine does not know about transports; the caller does).
+    pub holder_connected: bool,
     pub now_unix_ms: u64,
 }
 
@@ -138,6 +152,23 @@ impl SessionEpoch {
     }
 
     fn attach_fresh(&mut self, req: AttachInput) -> AttachOutcome {
+        // Someone holds the session, and this attach did not ask to take it from this holder:
+        // refused before anything changes (no epoch, no revoke, no resize).
+        let allowed = match req.take_over {
+            TakeOver::Any => true,
+            TakeOver::Epoch(e) => e == self.epoch,
+            TakeOver::No => false,
+        };
+        if !allowed && let Some(cur) = &self.current {
+            return AttachOutcome::Refused(AttachRefusal::Attached {
+                holder: SubscriberSummary {
+                    host: cur.host.clone(),
+                    since_unix_ms: cur.since_unix_ms,
+                },
+                epoch: self.epoch,
+                connected: req.holder_connected,
+            });
+        }
         self.epoch += 1;
         let sub = self.install(&req);
         let mut effects = Vec::new();
@@ -237,13 +268,25 @@ mod tests {
     fn key(b: u8) -> PublicKey {
         PublicKey::new(vec![b; 32]).unwrap()
     }
+    /// An attach that takes the session over if it must (the rule before `take_over` existed;
+    /// most tests here are about what happens after that).
     fn input(k: u8, host: &str, resume: Option<ResumeRequest>, now: u64) -> AttachInput {
         AttachInput {
             key: key(k),
             host: host.parse().unwrap(),
             size: TermSize::new(80, 24).unwrap(),
             resume,
+            take_over: TakeOver::Any,
+            holder_connected: true,
             now_unix_ms: now,
+        }
+    }
+    /// A fresh attach that does not take the session over (the client's default).
+    fn asking(k: u8, host: &str, now: u64, holder_connected: bool) -> AttachInput {
+        AttachInput {
+            take_over: TakeOver::No,
+            holder_connected,
+            ..input(k, host, None, now)
         }
     }
     fn accepted(o: AttachOutcome) -> (u64, SubscriberId, AttachMode, Vec<Effect>) {
@@ -305,6 +348,125 @@ mod tests {
         assert!(!s.key_authorized(&key(1)));
         assert!(s.key_authorized(&key(2)));
         assert!(!s.is_current(1));
+    }
+
+    #[test]
+    fn a_fresh_attach_without_take_over_is_refused_and_changes_nothing() {
+        let mut s = SessionEpoch::new(INC);
+        let (_, id, _, _) = accepted(s.attach(input(1, "laptop", None, 10)));
+        for connected in [true, false] {
+            let out = s.attach(asking(2, "desktop", 99, connected));
+            assert_eq!(
+                out,
+                AttachOutcome::Refused(AttachRefusal::Attached {
+                    holder: SubscriberSummary {
+                        host: "laptop".parse().unwrap(),
+                        since_unix_ms: 10,
+                    },
+                    epoch: 1,
+                    connected,
+                })
+            );
+            // No new epoch, the subscriber and its key as they were, the asker's key nowhere.
+            assert_eq!(s.epoch(), 1);
+            assert!(s.is_current(1));
+            let sub = s.subscriber().unwrap();
+            assert_eq!(
+                (
+                    sub.id,
+                    sub.key.clone(),
+                    sub.host.as_str(),
+                    sub.since_unix_ms
+                ),
+                (id, key(1), "laptop", 10)
+            );
+            assert!(s.key_authorized(&key(1)) && !s.key_authorized(&key(2)));
+        }
+        // The holder resumes as if nothing happened.
+        let (e, id2, _, _) = accepted(s.attach(input(1, "laptop", resume(1), 120)));
+        assert_eq!((e, id2), (1, id));
+        // And the asker, told yes by its user, takes it over as before.
+        let (e, _, mode, fx) = accepted(s.attach(input(2, "desktop", None, 130)));
+        assert_eq!((e, mode), (2, AttachMode::Fresh));
+        assert!(fx.contains(&Effect::RevokeKey(key(1))));
+    }
+
+    /// `TakeOver::Epoch` is a compare and swap: it takes the session from the holder of that
+    /// epoch only. One who came after (a third client while the user was deciding, or a client
+    /// that took it while this one was away) is asked about afresh.
+    #[test]
+    fn an_epoch_grant_takes_the_session_from_that_holder_only() {
+        let mut s = SessionEpoch::new(INC);
+        accepted(s.attach(input(1, "laptop", None, 10)));
+        // Asked about laptop at epoch 1; meanwhile desktop took it (epoch 2).
+        accepted(s.attach(input(2, "desktop", None, 20)));
+        let stale = AttachInput {
+            take_over: TakeOver::Epoch(1),
+            ..input(3, "phone", None, 30)
+        };
+        assert_eq!(
+            s.attach(stale),
+            AttachOutcome::Refused(AttachRefusal::Attached {
+                holder: SubscriberSummary {
+                    host: "desktop".parse().unwrap(),
+                    since_unix_ms: 20,
+                },
+                epoch: 2,
+                connected: true,
+            })
+        );
+        assert_eq!(s.epoch(), 2);
+        assert!(s.key_authorized(&key(2)) && !s.key_authorized(&key(3)));
+        // The grant for the holder now in force takes it.
+        let fresh = AttachInput {
+            take_over: TakeOver::Epoch(2),
+            ..input(3, "phone", None, 40)
+        };
+        let (e, _, _, fx) = accepted(s.attach(fresh));
+        assert_eq!(e, 3);
+        assert!(fx.contains(&Effect::RevokeKey(key(2))));
+        // A grant for a session nobody holds has nobody to check against: it attaches.
+        assert!(matches!(s.detach(3), DetachOutcome::Detached { .. }));
+        let late = AttachInput {
+            take_over: TakeOver::Epoch(1),
+            ..input(4, "laptop", None, 50)
+        };
+        assert_eq!(accepted(s.attach(late)).0, 5);
+    }
+
+    #[test]
+    fn a_session_nobody_holds_attaches_without_asking() {
+        // New: nobody has attached yet.
+        let mut s = SessionEpoch::new(INC);
+        let (e, _, _, fx) = accepted(s.attach(asking(1, "laptop", 10, false)));
+        assert_eq!(e, 1);
+        assert_eq!(fx, vec![Effect::ResizePty(TermSize::new(80, 24).unwrap())]);
+        // Detached: the subscriber left.
+        assert!(matches!(s.detach(1), DetachOutcome::Detached { .. }));
+        let (e, _, _, fx) = accepted(s.attach(asking(2, "desktop", 20, false)));
+        assert_eq!(e, 3);
+        assert_eq!(fx, vec![Effect::ResizePty(TermSize::new(80, 24).unwrap())]);
+    }
+
+    #[test]
+    fn take_over_does_not_change_a_resume() {
+        let mut s = SessionEpoch::new(INC);
+        accepted(s.attach(input(1, "laptop", None, 10)));
+        // A resume with `take_over` unset is the subscriber coming back: accepted.
+        let r = AttachInput {
+            take_over: TakeOver::No,
+            ..input(1, "laptop", resume(1), 20)
+        };
+        let (e, _, mode, _) = accepted(s.attach(r));
+        assert_eq!((e, mode), (1, AttachMode::Resumed(resume(1).unwrap())));
+        // And a stale one with it set still never steals the session.
+        accepted(s.attach(input(2, "desktop", None, 30)));
+        let stale = s.attach(input(1, "laptop", resume(1), 40));
+        assert!(matches!(
+            stale,
+            AttachOutcome::Refused(AttachRefusal::TakenOver(_))
+        ));
+        assert!(s.key_authorized(&key(2)));
     }
 
     #[test]

@@ -48,7 +48,8 @@ use fil_proto::input::InputRecord;
 use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
 use fil_proto::msg::{
     Agent, Attach, AttachRefusal, AttachReply, ControlMsg, Hello, PublicKey, ResumeRequest,
-    SnapshotInfo, SnapshotReason, StartPoint, TakenOver, TermName, TermSize,
+    SnapshotInfo, SnapshotReason, StartPoint, SubscriberSummary, TakeOver, TakenOver, TermName,
+    TermSize,
 };
 use fil_term::Size;
 use fil_transport::{Link, LinkError, LinkKind, LinkState, LinkStatus};
@@ -319,8 +320,26 @@ struct Snap {
 #[derive(Debug)]
 enum Prompt {
     TakeBack(TakenOver),
+    /// A fresh attach without a grant for the holder found the session held by another client.
+    TakeOver {
+        holder: SubscriberSummary,
+        epoch: u64,
+        connected: bool,
+    },
     Replaced,
     DetachedElsewhere,
+}
+
+/// What the next fresh attach may take the session from (DESIGN.md section 5.2): always one
+/// holder, by its epoch, so a session that changed hands meanwhile is asked about again.
+#[derive(Clone, Copy, Debug)]
+enum Grant {
+    None,
+    /// The user said yes to a question naming the holder of this epoch.
+    User(u64),
+    /// This client held the session at this epoch (after `BadResume`, or a first snapshot cut
+    /// short). One attach only.
+    Own(u64),
 }
 
 /// What a link's service ended with.
@@ -694,6 +713,10 @@ pub(crate) struct Core<I, O> {
     agent_refused_shown: Option<fil_proto::mux::PolicyRefusal>,
     ack_due: Option<Instant>,
     first_attached: bool,
+    /// What the next fresh attach may take the session from, besides what the config says
+    /// (`--take-over` is `TakeOver::Any` on every fresh attach). Cleared once an attach is
+    /// accepted.
+    grant: Grant,
     /// The screen has been given back (overlay gone, cooked mode, the ending shown). A detach does
     /// it before it waits for the daemon.
     screen_left: bool,
@@ -777,6 +800,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             agent_refused_shown: None,
             ack_due: None,
             first_attached: false,
+            grant: Grant::None,
             screen_left: false,
             term_warned: false,
             term_mismatch: None,
@@ -881,6 +905,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 }
                 Served::Refused(prompt) => {
                     let replaced = matches!(prompt, Prompt::Replaced);
+                    // A yes to these is a yes to taking the session from the holder named in the
+                    // question, and from nobody who comes after it (compare and swap).
+                    let takes = match &prompt {
+                        Prompt::TakeBack(t) => Some(t.epoch),
+                        Prompt::TakeOver { epoch, .. } => Some(*epoch),
+                        Prompt::Replaced | Prompt::DetachedElsewhere => None,
+                    };
                     // The session is elsewhere now: this run's forwarded connections cannot
                     // resume, so they end before the question, which has no time limit.
                     if let Some(h) = &self.fwd {
@@ -897,12 +928,19 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                                 self.write(&bytes)?;
                             }
                             purpose = DialPurpose::Attach;
+                            if let Some(epoch) = takes {
+                                self.grant = Grant::User(epoch);
+                            }
                         }
                         Err(outcome) => return Ok(outcome),
                     }
                 }
                 Served::Fresh => {
                     self.mark_disconnected();
+                    // `BadResume` goes only to the subscriber that holds the session: the fresh
+                    // attach takes it from this client's own epoch, so it does not ask. If
+                    // someone else holds it by the time the attach arrives, the user is asked.
+                    self.grant = Grant::Own(self.sess.epoch);
                     // As after a take-back: new session state, and the dialer installs a new key.
                     self.sess.forget(self.cfg.input_window);
                     self.pending.clear();
@@ -1330,6 +1368,10 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             // was and a resume is exact: a catch-up's daemon resends or jumps again, and a
             // repaint is asked for again by `want_snapshot`.
             self.sess.established = false;
+            // The daemon gave this client the session a moment ago: the attach that starts over
+            // takes it from this client's own epoch, which is nothing to ask the user about. If
+            // someone attached in between, the epoch has moved on and the user is asked.
+            self.grant = Grant::Own(self.sess.epoch);
         }
         if promoted.is_some() {
             dialer.swapped(Err(SwapError::Lost));
@@ -1505,10 +1547,31 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 echo_ack: self.predicting,
                 // The session's agent socket exists while this subscriber relays (section 10).
                 agent: self.fwd.as_ref().is_some_and(ForwardHandle::agent_on),
+                take_over: self.take_over_for(resume.is_none()),
                 resume,
             }),
         );
         self.size_gen
+    }
+
+    /// `Attach::take_over` for the attach being sent: nothing on a resume (the daemon reads it on
+    /// a fresh attach only), `Any` with `--take-over`, else the grant. A grant this client gave
+    /// itself (`Grant::Own`) is used once: if that attach gets no answer, the next one asks.
+    fn take_over_for(&mut self, fresh: bool) -> TakeOver {
+        if !fresh {
+            return TakeOver::No;
+        }
+        if self.cfg.take_over {
+            return TakeOver::Any;
+        }
+        match self.grant {
+            Grant::None => TakeOver::No,
+            Grant::User(e) => TakeOver::Epoch(e),
+            Grant::Own(e) => {
+                self.grant = Grant::None;
+                TakeOver::Epoch(e)
+            }
+        }
     }
 
     fn local_term_name(&self) -> TermName {
@@ -1684,6 +1747,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 tracing::debug!("the daemon refused the resume; attaching afresh");
                 Ok(Flow::End(Served::Fresh))
             }
+            AttachRefusal::Attached {
+                holder,
+                epoch,
+                connected,
+            } => Ok(Flow::End(Served::Refused(Prompt::TakeOver {
+                holder,
+                epoch,
+                connected,
+            }))),
         }
     }
 
@@ -1695,6 +1767,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         // Control is ordered on every link, so this link's own restatement comes after.
         self.sess.modes.clear();
         self.sess.established = true;
+        // A question answered yes counted for this attach only.
+        self.grant = Grant::None;
         self.sess.incarnation = r.incarnation;
         self.sess.epoch = r.epoch;
         if conn.resumed
@@ -2766,6 +2840,19 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     },
                 )
             }
+            Prompt::TakeOver {
+                holder, connected, ..
+            } => {
+                let by = sanitize_inline(holder.host.as_str());
+                let since = (self.cfg.time_format)(holder.since_unix_ms);
+                (
+                    status::confirm_take_over(&by, &since, *connected, &session),
+                    Outcome::Attached {
+                        by,
+                        since_unix_ms: holder.since_unix_ms,
+                    },
+                )
+            }
             Prompt::Replaced => (
                 status::confirm_replaced(&session, !self.buf.is_empty()),
                 Outcome::SessionReplaced,
@@ -2784,7 +2871,16 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
         self.prompt = Some(lines.clone());
         self.prompt_plain = false;
-        if !self.show_or_open(lines.clone(), true)? && self.display.is_some() {
+        if self.display.is_none() {
+            // Before the first attach (a take-over question): nothing of ours is on the screen
+            // and the terminal is still cooked. The question goes on one line, and the keys are
+            // read raw, as for every question; the screen is entered or given back after it.
+            self.out.set_raw(true)?;
+            self.raw = true;
+            let text = format!("{}\r\n", lines.join(" "));
+            self.write(text.as_bytes())?;
+            self.prompt_plain = true;
+        } else if !self.show_or_open(lines.clone(), true)? {
             // Nothing safe to draw on (wide characters on every candidate row, say): print the
             // question below the cursor instead. The answer ends the session or starts a fresh
             // snapshot, so the screen is not coming back to this state anyway.

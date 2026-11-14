@@ -126,6 +126,21 @@ pub fn confirm_take_back(by: &str, when: &str, session: &str) -> Vec<String> {
     ]
 }
 
+/// The question before a fresh attach takes a session from the client that holds it
+/// (`AttachRefusal::Attached`). `connected` is false for a holder whose link is down.
+pub fn confirm_take_over(by: &str, since: &str, connected: bool, session: &str) -> Vec<String> {
+    vec![
+        format!("fil: \"{session}\" is attached"),
+        format!("from {by}"),
+        if connected {
+            format!("since {since}.")
+        } else {
+            format!("since {since} (disconnected).")
+        },
+        "Take it over?  y = yes, n = no".into(),
+    ]
+}
+
 pub fn confirm_replaced(session: &str, discarding: bool) -> Vec<String> {
     let mut v = vec![
         format!("fil: \"{session}\" is a different session now"),

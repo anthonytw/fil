@@ -1,14 +1,17 @@
 //! A yes/no question is answered by a person who has read it, not by typing that was already under
 //! way (sweep security #4), and a refused swap candidate leaves the session on the old link
-//! (bugs #8).
+//! (bugs #8). A fresh attach to a session another client holds asks first (DESIGN.md section
+//! 5.2).
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
+use fil_client::DialError;
 use fil_client::Outcome;
-use fil_proto::msg::AttachRefusal;
+use fil_proto::msg::{AttachRefusal, TakeOver};
 use fil_transport::LinkKind;
 
 async fn taken_over() -> Rig {
@@ -254,4 +257,208 @@ async fn the_take_back_question_is_visible_after_a_full_width_line() {
         text.contains("Take it back?"),
         "the client waits for y/n on an invisible question:\n{text}"
     );
+}
+
+// ---- taking over a session another client holds (DESIGN.md section 5.2) ----------------------
+
+/// A session held by another client, whose link is down (`take_over` there leaves no
+/// connection behind in the fake daemon): the shape a laptop asleep in a bag leaves.
+async fn held_elsewhere() -> Arc<FakeDaemon> {
+    let daemon = FakeDaemon::new(1 << 20);
+    daemon.output(b"$ make\r\nbuilding...\r\n").await;
+    daemon.take_over("desktop").await;
+    daemon
+}
+
+async fn asked(rig: &Rig) {
+    until("the take-over question", 5, || {
+        rig.term.text().contains("Take it over?")
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn attaching_to_a_held_session_asks_and_yes_takes_it_over() {
+    let rig = start_with(held_elsewhere().await, config(), 80, 24, "xterm-256color");
+    asked(&rig).await;
+    let text = rig.term.text();
+    assert!(
+        text.contains("fil: \"main\" is attached from desktop since"),
+        "{text}"
+    );
+    assert!(text.contains("(disconnected)"), "{text}");
+    // Asked, not taken: the attach did not ask to take over, and nothing else was sent.
+    let a = rig.daemon.attaches().await;
+    assert_eq!(a.len(), 1);
+    assert!(a[0].resume.is_none());
+    assert_eq!(a[0].take_over, TakeOver::No);
+    rig.answer("y").await;
+    until_async("the second attach", 30, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    let a = rig.daemon.attaches().await;
+    assert!(a[1].resume.is_none());
+    // The holder the question named, and nobody else.
+    assert_eq!(a[1].take_over, TakeOver::Epoch(1));
+    until("the session's screen", 5, || {
+        rig.term.text().contains("building...")
+    })
+    .await;
+    // A reconnect afterwards is a resume, and the next fresh attach would ask again.
+    rig.daemon.kill_link(fil_transport::DownReason::Dead).await;
+    until_async("the resume", 30, || async {
+        rig.daemon.attaches().await.len() == 3
+    })
+    .await;
+    let a = rig.daemon.attaches().await;
+    assert!(a[2].resume.is_some());
+    assert_eq!(a[2].take_over, TakeOver::No);
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_leaves_the_session_alone_and_says_how_to_take_it() {
+    let rig = start_with(held_elsewhere().await, config(), 80, 24, "xterm-256color");
+    asked(&rig).await;
+    rig.answer("n").await;
+    let term = rig.term.clone();
+    let daemon = rig.daemon.clone();
+    let out = rig.finish().await.unwrap();
+    let Outcome::Attached { by, .. } = &out else {
+        panic!("{out:?}");
+    };
+    assert_eq!(by, "desktop");
+    assert_eq!(daemon.attaches().await.len(), 1);
+    // The terminal is given back, and the last line names the flag.
+    assert!(!term.is_raw());
+    let msg = out.message("main", fil_client::text::format_utc);
+    assert!(
+        msg.contains("--take-over") && msg.contains("left alone"),
+        "{msg}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn take_over_set_never_asks() {
+    let mut cfg = config();
+    cfg.take_over = true;
+    let rig = start_with(held_elsewhere().await, cfg, 80, 24, "xterm-256color");
+    rig.attached().await;
+    assert!(!rig.term.text().contains("Take it over?"));
+    let a = rig.daemon.attaches().await;
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].take_over, TakeOver::Any);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_nobody_holds_is_attached_without_a_question() {
+    let rig = start(config());
+    rig.attached().await;
+    assert!(!rig.term.text().contains("Take it over?"));
+    let a = rig.daemon.attaches().await;
+    assert_eq!(a.len(), 1);
+    assert_eq!(
+        a[0].take_over,
+        TakeOver::No,
+        "the default asks the daemon not to take a session over"
+    );
+}
+
+/// Two clients of one daemon: the second is asked (the first is connected, so no
+/// "disconnected"), takes the session on `y`, and the first's take-back is a yes already.
+#[tokio::test(start_paused = true)]
+async fn a_second_client_asks_and_the_take_back_does_not_ask_again() {
+    let first = start(config());
+    first.attached().await;
+    first.daemon.output(b"$ make\r\n").await;
+    settle().await;
+    let second = start_with(first.daemon.clone(), config(), 80, 24, "xterm-256color");
+    asked(&second).await;
+    let text = second.term.text();
+    assert!(text.contains("from testhost"), "{text}");
+    assert!(!text.contains("disconnected"), "{text}");
+    // The first client has heard nothing.
+    assert!(!first.term.text().contains("taken over"));
+    second.answer("y").await;
+    until("the takeover notice", 5, || {
+        first.term.text().contains("Take it back?")
+    })
+    .await;
+    first.answer("y").await;
+    until_async("the take-back", 30, || async {
+        first.daemon.attaches().await.len() == 4
+    })
+    .await;
+    let a = first.daemon.attaches().await;
+    // From the second client, which took it at epoch 2, and nobody else.
+    assert!(a[3].resume.is_none(), "{:?}", a[3]);
+    assert_eq!(a[3].take_over, TakeOver::Epoch(2));
+    until("the second client's take-back question", 5, || {
+        second.term.text().contains("Take it back?")
+    })
+    .await;
+}
+
+/// The holder changes while the user decides: the `y` was for the one named, so the daemon
+/// refuses it, and the client asks again about the new holder.
+#[tokio::test(start_paused = true)]
+async fn a_holder_that_changed_during_the_question_is_asked_about_again() {
+    let rig = start_with(held_elsewhere().await, config(), 80, 24, "xterm-256color");
+    asked(&rig).await;
+    rig.daemon.take_over("phone").await;
+    rig.answer("y").await;
+    until("the second question", 5, || {
+        rig.term.text().contains("is attached from phone")
+    })
+    .await;
+    let a = rig.daemon.attaches().await;
+    assert_eq!(a.len(), 2);
+    assert_eq!(a[1].take_over, TakeOver::Epoch(1));
+    // Yes again: now for phone's epoch.
+    rig.answer("y").await;
+    until_async("the third attach", 30, || async {
+        rig.daemon.attaches().await.len() == 3
+    })
+    .await;
+    assert_eq!(rig.daemon.attaches().await[2].take_over, TakeOver::Epoch(2));
+    until("the session's screen", 5, || {
+        rig.term.text().contains("building...")
+    })
+    .await;
+}
+
+/// After `BadResume` the client attaches fresh without asking, but only to take the session from
+/// itself: if another client took it while this one could not get through, it asks.
+#[tokio::test(start_paused = true)]
+async fn a_fresh_attach_after_bad_resume_asks_if_someone_took_the_session_meanwhile() {
+    let rig = start(config());
+    rig.attached().await;
+    rig.daemon.output(b"$ make\r\n").await;
+    settle().await;
+    // The resume gets through and is refused with `BadResume`; the fresh attach after it cannot
+    // get through for a while.
+    rig.dial.push(Step::Banner(Vec::new()));
+    for _ in 0..5 {
+        rig.dial
+            .push(Step::Fail(DialError::retry("no route to host")));
+    }
+    rig.daemon.refuse_next(AttachRefusal::BadResume).await;
+    rig.daemon.kill_link(fil_transport::DownReason::Dead).await;
+    until_async("the refused resume", 30, || async {
+        rig.daemon.attaches().await.len() == 2
+    })
+    .await;
+    // Meanwhile another client takes the session.
+    rig.daemon.take_over("desktop").await;
+    until_async("the fresh attach", 120, || async {
+        rig.daemon.attaches().await.len() == 3
+    })
+    .await;
+    asked(&rig).await;
+    assert!(rig.term.text().contains("from desktop"));
+    let a = rig.daemon.attaches().await;
+    assert_eq!(a.len(), 3);
+    assert!(a[2].resume.is_none());
+    // Its own epoch, which is over: refused, nothing taken.
+    assert_eq!(a[2].take_over, TakeOver::Epoch(1));
 }

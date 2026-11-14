@@ -141,6 +141,14 @@ fn refusals() -> Vec<AttachRefusal> {
         AttachRefusal::BadResume,
         AttachRefusal::SessionReplaced,
         AttachRefusal::WrongKey,
+        AttachRefusal::Attached {
+            holder: SubscriberSummary {
+                host: host("laptop"),
+                since_unix_ms: 1_700_000_000_000,
+            },
+            epoch: 3,
+            connected: true,
+        },
     ];
     for c in &all {
         match c {
@@ -149,7 +157,8 @@ fn refusals() -> Vec<AttachRefusal> {
             | AttachRefusal::SessionGone { .. }
             | AttachRefusal::BadResume
             | AttachRefusal::SessionReplaced
-            | AttachRefusal::WrongKey => {}
+            | AttachRefusal::WrongKey
+            | AttachRefusal::Attached { .. } => {}
         }
     }
     all
@@ -1241,6 +1250,11 @@ fn attach(resume: Option<ResumeRequest>, echo_ack: bool) -> Attach {
         echo_ack,
         size_gen: 7,
         agent: echo_ack,
+        take_over: match (resume.is_none(), echo_ack) {
+            (true, true) => TakeOver::Any,
+            (true, false) => TakeOver::No,
+            (false, _) => TakeOver::Epoch(5),
+        },
     }
 }
 
@@ -1259,6 +1273,11 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
         }),
     );
     add("attach", ControlMsg::Attach(attach(None, false)));
+    // Every `TakeOver`: `No` above, `Epoch` on the resume below, `Any` here.
+    add(
+        "attach-take-over-any",
+        ControlMsg::Attach(attach(None, true)),
+    );
     add(
         "attach-resume-echo",
         ControlMsg::Attach(attach(
@@ -1424,6 +1443,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
             echo_ack: true,
             size_gen: u64::MAX,
             agent: true,
+            take_over: TakeOver::Epoch(u64::MAX),
         }),
     );
     add(
@@ -1447,6 +1467,17 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
     add(
         "max/attach-refused",
         ControlMsg::AttachRefused(AttachRefusal::TakenOver(widest_taken_over.clone())),
+    );
+    add(
+        "max/attach-refused-attached",
+        ControlMsg::AttachRefused(AttachRefusal::Attached {
+            holder: SubscriberSummary {
+                host: host(&longest('h', MAX_HOST_LABEL)),
+                since_unix_ms: u64::MAX,
+            },
+            epoch: u64::MAX,
+            connected: true,
+        }),
     );
     add("max/taken-over", ControlMsg::TakenOver(widest_taken_over));
     add(
@@ -2225,10 +2256,18 @@ fn revisioned() -> Entries {
         "decode/attach-refusal-5".into(),
         outcome::<AttachRefusal>(&past(5)),
     ));
+    // Tag 6 (`Attached`) carries a payload: the tag alone is a truncated message, and 7 is the
+    // first unknown tag.
     e.push((
-        "decode/attach-refusal-6".into(),
+        "decode/attach-refusal-6-tag-only".into(),
         outcome::<AttachRefusal>(&past(6)),
     ));
+    e.push((
+        "decode/attach-refusal-7".into(),
+        outcome::<AttachRefusal>(&past(7)),
+    ));
+    e.push(("decode/take-over-2".into(), outcome::<TakeOver>(&past(2))));
+    e.push(("decode/take-over-3".into(), outcome::<TakeOver>(&past(3))));
     e.push(("decode/request-0".into(), outcome::<Request>(&past(0))));
     // `Ports { session: None, probe_other: false }`.
     e.push(("decode/request-4".into(), outcome::<Request>(&[4, 0, 0])));

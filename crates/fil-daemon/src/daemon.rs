@@ -693,6 +693,14 @@ impl DaemonHandle {
     pub fn check_files_now(&self) {
         self.check_now.notify_one();
     }
+
+    /// Whether `key` (an attach's) is bound to a session. For tests.
+    #[cfg(feature = "test-hooks")]
+    pub fn is_bound(&self, key: &msg::PublicKey) -> bool {
+        self.host
+            .binding(&TransportKey::from_spki_der(key.as_bytes()))
+            .is_some()
+    }
 }
 
 /// A running daemon. See the [module docs](self).
@@ -2262,6 +2270,7 @@ mod tests {
             agent: false,
             size_gen: 0,
             resume: None,
+            take_over: fil_proto::msg::TakeOver::Any,
         }
     }
 

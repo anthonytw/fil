@@ -123,6 +123,10 @@ fn describe_end(end: &ServeEnd) -> String {
 fn describe_refusal(r: &AttachRefusal) -> String {
     match r {
         AttachRefusal::TakenOver(_) => "TakenOver".to_string(),
+        // Who holds the session stays out of the log, as for a takeover.
+        AttachRefusal::Attached { connected, .. } => {
+            format!("Attached {{ connected: {connected} }}")
+        }
         other => format!("{other:?}"),
     }
 }
@@ -192,6 +196,7 @@ impl Inner {
         let key_bytes = attach.key.clone();
         let key = TransportKey::from_spki_der(attach.key.as_bytes());
         let session = attach.name.clone();
+        let fresh = attach.resume.is_none();
         let direct = matches!(origin, Origin::Direct { .. });
         tracing::info!(resuming = attach.resume.is_some(), direct, "attach");
         // Which of the user's machines attached is for someone debugging fil, not for the record.
@@ -216,6 +221,9 @@ impl Inner {
         // On the pipe (the bootstrap) the key is registered for QUIC. A key is for one attach,
         // so for one session: one already bound to another session is not registered again.
         let mut newly_registered = false;
+        // This attach made the key's binding (it had none): a refused fresh attach takes it
+        // away again, whatever server policy said about registering it.
+        let mut newly_bound = false;
         if required.is_none() {
             if self
                 .host
@@ -275,6 +283,7 @@ impl Inner {
             }
             // The pipe attach was accepted for this session: bind the key to it.
             None => {
+                newly_bound = self.host.binding(&key).is_none();
                 let bound = self.host.bind(
                     &key,
                     Binding {
@@ -297,7 +306,9 @@ impl Inner {
 
         let end = handle.serve(link, attach).await;
         tracing::info!(direct, end = %describe_end(&end), "attach ended");
-        if newly_registered && matches!(end, ServeEnd::Refused(_)) {
+        // A refused attach leaves no key behind. On a refused resume only a key it newly
+        // registered goes: one that was there already may be the holder's own.
+        if matches!(end, ServeEnd::Refused(_)) && (newly_registered || (fresh && newly_bound)) {
             self.revoke_key(&key_bytes);
         }
     }
@@ -569,5 +580,21 @@ mod tests {
             assert!(text.contains("TakenOver"), "{text}");
         }
         assert_eq!(describe_end(&ServeEnd::Detached), "Detached");
+        // Nor who holds a session that an attach was refused for.
+        let attached = AttachRefusal::Attached {
+            holder: fil_proto::msg::SubscriberSummary {
+                host: "laptop-b".parse().unwrap(),
+                since_unix_ms: 0,
+            },
+            epoch: 2,
+            connected: false,
+        };
+        for text in [
+            describe_end(&ServeEnd::Refused(attached.clone())),
+            describe_refusal(&attached),
+        ] {
+            assert!(!text.contains("laptop"), "{text}");
+            assert!(text.contains("Attached"), "{text}");
+        }
     }
 }

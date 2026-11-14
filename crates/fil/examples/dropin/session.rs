@@ -57,14 +57,24 @@ pub fn detach_reattach(ctx: &Ctx, host: &str) -> Res {
     ])
 }
 
-/// A second client takes the session over while a command runs; the first is told, and the
-/// second's account of the running command is complete.
+/// A second client is asked, then takes the session over while a command runs; the first is
+/// told, and the second's account of the running command is complete.
 pub fn takeover_running(ctx: &Ctx, host: &str) -> Res {
     let mut c1 = ctx.client(host, Variant::Auto, "dp-tk", 30, 100);
     c1.roundtrip("TK0", ATTACH_TIMEOUT)?;
     start_ticks(&mut c1, 60);
     c1.want_screen("TICK-8", CMD_TIMEOUT)?;
     let mut c2 = ctx.client(host, Variant::Auto, "dp-tk", 30, 100);
+    // It asks first, and the first client keeps the session meanwhile. (The question's start: the
+    // whole line can wrap anywhere, with a long host label.)
+    c2.want_screen("is attached from", ATTACH_TIMEOUT)?;
+    ensure(!c1.screen().contains("taken over"), || {
+        format!(
+            "the first client lost the session before the answer\n{}",
+            c1.dump()
+        )
+    })?;
+    answer(&mut c2, "y");
     let t0 = Instant::now();
     c2.want_screen("TICK-", ATTACH_TIMEOUT)?;
     let seen = t0.elapsed();
@@ -194,7 +204,7 @@ pub fn vim_session_life(ctx: &Ctx, host: &str) -> Res {
     c2.send("i");
     type_rows(&mut c2, 4, 5);
     c2.want_row("ROW-5", CMD_TIMEOUT)?;
-    let mut c3 = ctx.client(host, Variant::Auto, "dp-vsl", 30, 100);
+    let mut c3 = ctx.taker(host, Variant::Auto, "dp-vsl", 30, 100);
     c3.want_alt(true, ATTACH_TIMEOUT)?;
     c3.want_row("ROW-5", ATTACH_TIMEOUT)?;
     c2.want_screen("taken over", Duration::from_secs(10))?;
@@ -295,7 +305,7 @@ pub fn terminal_modes(ctx: &Ctx, host: &str) -> Res {
     want_modes(&c2, &held_modes(), "after a reattach")?;
     notes.push("a reattach restores alternate screen, mouse (press/release, SGR), application cursor keys and the hidden cursor (asserted)".to_string());
     // A takeover too.
-    let mut c3 = ctx.client(host, Variant::Auto, "dp-modes", 30, 100);
+    let mut c3 = ctx.taker(host, Variant::Auto, "dp-modes", 30, 100);
     want_modes(&c3, &held_modes(), "after a takeover")?;
     c2.want_screen("taken over", Duration::from_secs(10))?;
     answer(&mut c2, "n");
@@ -481,7 +491,21 @@ pub fn client_kill9(ctx: &Ctx, host: &str) -> Res {
             thread::sleep(Duration::from_millis(500));
         }
         let detected = t.elapsed();
+        // The dead client still holds the session, so the new one asks first; once the daemon
+        // has seen its link go, the question says so.
         let mut c2 = ctx.client(host, variant, &session, 30, 100);
+        // The question's start (the whole line can wrap anywhere, with a long host label), then
+        // the line read with its rows joined.
+        c2.want_screen("is attached from", ATTACH_TIMEOUT)?;
+        thread::sleep(Duration::from_millis(200));
+        let marked = c2.rows().concat().contains("(disconnected)");
+        ensure(marked || seen.as_deref() != Some("-"), || {
+            format!(
+                "the question does not say the holder is disconnected\n{}",
+                c2.dump()
+            )
+        })?;
+        answer(&mut c2, "y");
         let out = c2.run("echo V-$ZV", ATTACH_TIMEOUT)?;
         ensure(has_line(&out, "V-survived4"), || {
             format!("the new client does not find the same shell\n{out}")
@@ -497,7 +521,7 @@ pub fn client_kill9(ctx: &Ctx, host: &str) -> Res {
             format!("`fil ls` does not show the new client as attached: {row:?}")
         })?;
         notes.push(format!(
-            "{}: after kill -9 of the client, `fil ls` showed it {} (waited {}, measured); a fresh client attached with no question, the same shell (a variable), ticks 1..60: {res}; `fil ls` shows it attached (asserted)",
+            "{}: after kill -9 of the client, `fil ls` showed it {} (waited {}, measured); a fresh client was asked (the holder shown disconnected: {marked}), took it over, the same shell (a variable), ticks 1..60: {res}; `fil ls` shows it attached (asserted)",
             variant.tag(),
             match seen.as_deref() {
                 Some("-") => "detached".to_string(),

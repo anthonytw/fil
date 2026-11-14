@@ -136,6 +136,30 @@ pub struct Extra<'a> {
 }
 
 impl Ctx {
+    /// A client that takes the session over without asking (`--take-over`), for the scenarios
+    /// about what a takeover does rather than about its question.
+    pub fn taker(
+        &self,
+        host: &str,
+        variant: Variant,
+        session: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Client {
+        let args = ["--take-over".to_string()];
+        self.client_with(
+            host,
+            variant,
+            session,
+            rows,
+            cols,
+            &Extra {
+                args: &args,
+                ..Default::default()
+            },
+        )
+    }
+
     pub fn is_local(host: &str) -> bool {
         host == LOCAL
     }

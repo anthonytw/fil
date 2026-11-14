@@ -1908,7 +1908,8 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 # ssh-keygen keys and real commit signing; every other tool is a stub driven by FAKE_* variables.
 # The scripts find GitHub by its URL, so `github`'s is git@github.com:o/r.git, which git's
 # url.<base>.insteadOf points at the bare repo (and GIT_SSH_COMMAND=false in pfx: a URL that is not
-# rewritten fails, it never reaches github.com). Gitea's `origin` is the remote the release no longer
+# rewritten fails, it never reaches github.com). A rewritten URL must itself be GitHub's, so pfx
+# names that bare repo as the one stand-in the self-test may rewrite to (FIL_RELEASE_GITHUB_STANDIN). Gitea's `origin` is the remote the release no longer
 # reads: some cases make it unreachable. Nothing here reaches GitHub, Gitea, crates.io or Docker.
 # Each failure class must fail with its message.
 echo "== release-preflight.sh"
@@ -2059,6 +2060,7 @@ chmod +x "$pf/bin"/* "$pf/path"/*
 # pfx [ENV=VALUE ...] CMD...: CMD with the fixture's stubs; pfr [ENV=VALUE ...]: the preflight itself
 pfx() {
   env FAKE_GH_LOG="$pf/gh.log" PATH="$pf/path:$PATH" GIT_SSH_COMMAND=false FIL_RELEASE_SELFTEST=1 FIL_RELEASE_ROOT="$pf/clone" FIL_RELEASE_KEY="$pf/key" \
+    FIL_RELEASE_GITHUB_STANDIN="$pf/github.git" \
     FIL_GH="$pf/bin/gh" FIL_SSH="$pf/bin/ssh" FIL_DOCKER="$pf/bin/docker" FIL_LIMACTL="$pf/bin/limactl" FIL_DF="$pf/bin/df" \
     FIL_CARGO="$pf/bin/cargo" FIL_CRATES_CURL="$pf/bin/curl" FIL_GPG="$pf/bin/gpg" FIL_SECURITY="$pf/bin/security" \
     FIL_NOTARYTOOL="$pf/bin/notarytool" FIL_CODESIGN="$pf/bin/codesign" FIL_CODESIGN_IDENTITY="Developer ID Application: Test (TEAM)" \
@@ -2116,8 +2118,9 @@ pg reset -q --hard github/main
 pg remote set-url origin "$pf/nosuch.git"
 expect_pass "preflight: Gitea unreachable: everything still passes (Gitea is not read)" pfr
 pg remote set-url origin "$pf/origin.git"
+# GitHub unreachable: the rewrite and the stand-in name a repo that is not there
 pg config --rename-section "url.$pf/github.git" "url.$pf/nosuch.git"
-expect_fail "preflight: GitHub unreachable fails" pfr
+expect_fail "preflight: GitHub unreachable fails" pfr FIL_RELEASE_GITHUB_STANDIN="$pf/nosuch.git"
 last_pf=$(cat "$tmp/out.log")
 expect_pass "preflight: ...in the tree check, saying it cannot read GitHub's main" sh -c 'printf "%s\n" "$1" | grep -q "FAIL  tree: cannot read main on remote .github. (GitHub)"' sh "$last_pf"
 pg config --rename-section "url.$pf/nosuch.git" "url.$pf/github.git"
@@ -2132,9 +2135,9 @@ pg remote rename github neutral
 pfgh_is "...found by its URL whatever its name" neutral
 pg remote rename neutral github
 pfx env FIL_RELEASE_ROOT="$pf/clone" bash -c 'source "$1"; bad=""
-for u in git@github.com:o/r.git git@github.com:o/r ssh://git@github.com/o/r.git ssh://git@github.com:22/o/r git+ssh://git@github.com/o/r https://github.com/o/r.git https://github.com:443/o/r https://github.com/O/R/ https://user@github.com/o/r git@GitHub.com:o/r.git github.com:o/r; do pf_url_is_repo "$u" o/r || bad="$bad +$u"; done
-for u in git@github.com:o/rr.git git@github.com:x/o/r.git git@github.com:o/r.git.evil git@gitlab.com:o/r.git git@git-ssh.example:o/r.git https://github.com.evil/o/r https://evil.com/@github.com/o/r https://github.com@evil.com/o/r https://github.com:22/o/r ssh://git@github.com:443/o/r ftp://github.com/o/r github.com/o/r ./github.com:o/r a/b:github.com:o/r git@github.com:/o/r https://github.com "$2/github.git" ""; do ! pf_url_is_repo "$u" o/r || bad="$bad -$u"; done
-[ -z "$bad" ] || { echo "wrong:$bad" >&2; exit 1; }' sh "$PF" "$pf" > "$tmp/out.log" 2>&1 && pass "preflight: pf_url_is_repo knows github.com's URL forms, and nothing else (the host parsed: no evil.com/@github.com, no bare github.com/O/R)" || { flunk "preflight: pf_url_is_repo knows github.com's URL forms, and nothing else"; sed 's/^/       | /' "$tmp/out.log"; }
+for u in git@github.com:o/r.git git@github.com:o/r ssh://git@github.com/o/r.git ssh://git@github.com:22/o/r git+ssh://git@github.com/o/r https://github.com/o/r.git https://github.com:443/o/r https://github.com/O/R/ https://user@github.com/o/r https://user:x@github.com/o/r git@GitHub.com:o/r.git github.com:o/r; do pf_url_is_repo "$u" o/r || bad="$bad +$u"; done
+for u in git@github.com:o/rr.git git@github.com:x/o/r.git git@github.com:o/r.git.evil git@gitlab.com:o/r.git git@git-ssh.example:o/r.git https://github.com.evil/o/r https://evil.com/@github.com/o/r https://github.com@evil.com/o/r https://github.com:22/o/r ssh://git@github.com:443/o/r https://evil.com:github.com/o/r ssh://evil.com:github.com/o/r https://x:github.com:443/o/r ssh://evil@github.com@x/o/r ssh://x@evil@github.com/o/r https://a@b@github.com/o/r a@evil@github.com:o/r ftp://github.com/o/r github.com/o/r ./github.com:o/r a/b:github.com:o/r git@github.com:/o/r https://github.com "$2/github.git" ""; do ! pf_url_is_repo "$u" o/r || bad="$bad -$u"; done
+[ -z "$bad" ] || { echo "wrong:$bad" >&2; exit 1; }' sh "$PF" "$pf" > "$tmp/out.log" 2>&1 && pass "preflight: pf_url_is_repo knows github.com's URL forms, and nothing else (the host parsed and compared whole: no evil.com/@github.com, no evil.com:github.com, no second @, no bare github.com/O/R)" || { flunk "preflight: pf_url_is_repo knows github.com's URL forms, and nothing else"; sed 's/^/       | /' "$tmp/out.log"; }
 # a remote counts only when every url and pushurl is GitHub's and git fetches from exactly where it
 # pushes: a second url (git fetches from the first, pushes to all), a pushurl, a pushInsteadOf
 pg remote set-url --add github "$pf/origin.git"
@@ -2156,11 +2159,25 @@ pg config "url.$pf/origin.git.pushInsteadOf" git@github.com:o/r.git
 pfgh_is "a pushInsteadOf that sends the pushes elsewhere: not GitHub's" ""
 pg config --unset "url.$pf/origin.git.pushInsteadOf"
 pfgh_is "...without it: found again" github
-# an explicit --github is held to the same rule outside the self-test (the self-test alone may name
-# a local path)
+# an insteadOf rewrites fetch and push alike (get-url --all equals --push --all), so the equality
+# alone would pass it: the rewritten URL must be GitHub's (or, here, the self-test's stand-in)
+pg config --rename-section "url.$pf/github.git" "url.$pf/origin.git"
+pfgh_is "an insteadOf that sends fetch and push to Gitea: not GitHub's" ""
+expect_fail "preflight: ...and the preflight fails on it" pfr
+pg config --rename-section "url.$pf/origin.git" "url.$pf/github.git"
+pg config --rename-section "url.$pf/github.git" "url.git@git-ssh.example:o/r.git"
+pfgh_is "...nor one that sends them to another git host's URL" ""
+pg config --rename-section "url.git@git-ssh.example:o/r.git" "url.$pf/github.git"
+pfx env FIL_RELEASE_GITHUB_STANDIN= bash -c 'source "$1" && PF_REPO=o/r && pf_init 0.9.0 && printf "%s\n" "$PF_GITHUB"' sh "$PF" > "$tmp/out.log" 2> /dev/null || true
+if [ -z "$(cat "$tmp/out.log")" ]; then pass "preflight: ...the self-test's own rewrite counts only for the stand-in it names"; else flunk "preflight: ...the self-test's own rewrite counts only for the stand-in it names (picked '$(cat "$tmp/out.log")')"; fi
+pfx env FIL_RELEASE_SELFTEST= bash -c 'source "$1" && PF_REPO=o/r && pf_init 0.9.0 && printf "%s\n" "$PF_GITHUB"' sh "$PF" > "$tmp/out.log" 2> /dev/null || true
+if [ -z "$(cat "$tmp/out.log")" ]; then pass "preflight: ...and never outside the self-test"; else flunk "preflight: ...and never outside the self-test (picked '$(cat "$tmp/out.log")')"; fi
+pfgh_is "...back to the stand-in's rewrite: found again" github
+# an explicit --github is held to the same rule, in the self-test too (only the stand-in's rewrite is
+# the self-test's own)
 pfx env FIL_RELEASE_SELFTEST= bash -c 'source "$1" && PF_REPO=o/r && PF_GITHUB=origin && pf_init 0.9.0 && PF_CUR=tree && pf_need_github' sh "$PF" > "$tmp/out.log" 2>&1 && st=0 || st=$?
 if [ "$st" = 1 ] && grep -q "the remote 'origin' is not github.com's o/r alone" "$tmp/out.log"; then pass "preflight: --github naming Gitea's remote is refused"; else flunk "preflight: --github naming Gitea's remote is refused (exit $st)"; sed 's/^/       | /' "$tmp/out.log"; fi
-pfx env FIL_RELEASE_SELFTEST= bash -c 'source "$1" && PF_REPO=o/r && PF_GITHUB=github && pf_init 0.9.0 && PF_CUR=tree && pf_need_github' sh "$PF" > "$tmp/out.log" 2>&1 && st=0 || st=$?
+pfx bash -c 'source "$1" && PF_REPO=o/r && PF_GITHUB=github && pf_init 0.9.0 && PF_CUR=tree && pf_need_github' sh "$PF" > "$tmp/out.log" 2>&1 && st=0 || st=$?
 if [ "$st" = 0 ]; then pass "preflight: ...--github naming GitHub's remote is accepted"; else flunk "preflight: ...--github naming GitHub's remote is accepted (exit $st)"; sed 's/^/       | /' "$tmp/out.log"; fi
 # after the switch: origin is GitHub, gitea is Gitea (and unreachable): the same checks pass, on origin
 pg remote rename origin gitea
@@ -2184,7 +2201,7 @@ cp "$tmp/out.log" "$pf/noremote.log"
 expect_pass "preflight: ...saying so, with the fix" sh -c 'grep -q "FAIL  tree: no remote of the clone is github.com.s o/r" "$1" && grep -q "git remote add origin git@github.com:o/r.git (or fix the remote" "$1"' sh "$pf/noremote.log"
 pg remote set-url github "$pf/github.git"
 expect_fail "preflight: ...a remote that is a local path is not GitHub either" pfr
-expect_pass "preflight: ...and --github names it (in the self-test only)" pfx "$PF" 0.9.0 --repo o/r --github github --only tree
+expect_fail "preflight: ...nor when --github names it (no bypass, in the self-test either)" pfx "$PF" 0.9.0 --repo o/r --github github --only tree
 pg remote set-url github git@github.com:o/r.git
 pf_class "--commit binds the run to another commit" "the release commit this run is bound to" sh -c 'exec "$1" 0.9.0 --repo o/r --commit 0123456789012345678901234567890123456789' sh "$PF"
 pf_class "the wrong version" "Cargo.toml's version is '0.9.0', not 0.9.1" sh -c 'exec "$1" 0.9.1 --repo o/r --only version' sh "$PF"
@@ -2801,7 +2818,24 @@ expect_fail "release: no remote is github.com's OWNER/REPO: refused" rls
 last
 expect_pass "release: ...saying so, with the fix" grep -q "no remote of .* is github.com's o/r: git remote add origin git@github.com:o/r.git" "$rs/last.log"
 pg remote set-url github git@github.com:o/r.git
-expect_fail "release: --github names a remote the clone does not have: refused" rls --github nosuch
+# rlg REMOTE: the status of the command with --github REMOTE (rls's arguments are env's)
+rlg() { rlx "$RL" 0.9.0 --repo o/r --tap "$rs/tap" --status --github "$1"; }
+expect_fail "release: --github names a remote the clone does not have: refused" rlg nosuch
+last
+expect_pass "release: ...saying so" grep -q "^release: --github nosuch: the clone has no such remote" "$rs/last.log"
+# --github naming a remote that is not GitHub's (Gitea's origin here) is refused, with no bypass in
+# the self-test; the same for a github.com URL an insteadOf sends elsewhere, and a lookalike URL
+expect_fail "release: --github names Gitea's remote: refused" rlg origin
+last
+expect_pass "release: ...saying it is not github.com's repo" grep -q "^release: --github origin: that remote is not github.com's o/r alone" "$rs/last.log"
+expect_pass "release: ...before any step (no state written)" test ! -e "$RSTATE"
+pg config --rename-section "url.$pf/github.git" "url.$pf/origin.git"
+expect_fail "release: --github names a GitHub URL an insteadOf sends to Gitea: refused" rlg github
+pg config --rename-section "url.$pf/origin.git" "url.$pf/github.git"
+pg remote set-url github https://evil.com:github.com/o/r
+expect_fail "release: --github names a remote whose URL's host only looks like github.com: refused" rlg github
+pg remote set-url github git@github.com:o/r.git
+expect_pass "release: ...--github naming GitHub's remote is accepted" rlg github
 
 # 0: nothing done but the candidate (GitHub's main is the release commit: on-main is done)
 rl_refs > "$rs/refs.before"

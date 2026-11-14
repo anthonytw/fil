@@ -184,14 +184,15 @@ pf_init() {
 
 pf_git() { git -C "$ROOT" "$@"; }
 
-# pf_url_is_repo URL OWNER/REPO: URL (as configured, before any insteadOf) names OWNER/REPO on
-# github.com: ssh://[user@]github.com[:22]/O/R, https://[user@]github.com[:443]/O/R or the scp form
-# [user@]github.com:O/R, with or without .git or a trailing slash, in any case (GitHub's names are
-# not case-sensitive). The host is parsed: userinfo is stripped only inside the authority (so
-# https://evil.com/@github.com/O/R is evil.com), and a bare github.com/O/R (a local path to git) is
-# no URL.
+# pf_url_is_repo URL OWNER/REPO: URL names OWNER/REPO on github.com: ssh://[user@]github.com[:22]/O/R,
+# https://[user@]github.com[:443]/O/R or the scp form [user@]github.com:O/R, with or without .git or
+# a trailing slash, in any case (GitHub's names are not case-sensitive). The host is parsed and
+# compared whole: userinfo is stripped only inside the authority (so https://evil.com/@github.com/O/R
+# is evil.com), the rest of the authority must be exactly github.com (or github.com:PORT with the
+# scheme's port: https://evil.com:github.com/O/R is no match), an authority with more than one '@' is
+# refused (ssh://a@evil@github.com/O/R), and a bare github.com/O/R (a local path to git) is no URL.
 pf_url_is_repo() {
-  local u want rest auth path
+  local u want rest auth host path
   u=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   want=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
   case $u in
@@ -199,32 +200,43 @@ pf_url_is_repo() {
       rest=${u#*://}
       case $rest in */*) ;; *) return 1 ;; esac
       auth=${rest%%/*} path=${rest#*/}
-      case $auth in *@*) auth=${auth##*@} ;; esac
-      case $u:$auth in
-        https://*:github.com | https://*:github.com:443) ;;
-        *ssh://*:github.com | *ssh://*:github.com:22) ;;
-        *) return 1 ;;
-      esac
       ;;
     *://*) return 1 ;;
     *:*)
       # scp form: [user@]host:path, the host before any '/' (a ':' after a '/' is a local path)
       auth=${u%%:*} path=${u#*:}
       case $auth in */*) return 1 ;; esac
-      case $auth in *@*) auth=${auth#*@} ;; esac
-      [ "$auth" = github.com ] || return 1
       ;;
     *) return 1 ;;
+  esac
+  case $auth in
+    *@*@*) return 1 ;;
+    *@*) host=${auth#*@} ;;
+    *) host=$auth ;;
+  esac
+  case $u in
+    https://*) [ "$host" = github.com ] || [ "$host" = github.com:443 ] || return 1 ;;
+    *://*) [ "$host" = github.com ] || [ "$host" = github.com:22 ] || return 1 ;;
+    *) [ "$host" = github.com ] || return 1 ;;
   esac
   path=${path%/}
   path=${path%.git}
   [ -n "$want" ] && [ "$path" = "$want" ]
 }
+# pf_real_url_ok URL: URL, as git really uses it (after url.*.insteadOf and pushInsteadOf), is
+# github.com's PF_REPO. The self-test's clone has no network: its GitHub URL is rewritten to a local
+# bare repo, which only the self-test may name (FIL_RELEASE_GITHUB_STANDIN, a test-only override,
+# with FIL_RELEASE_SELFTEST=1); any other rewrite target is refused there too.
+pf_real_url_ok() {
+  pf_url_is_repo "$1" "$PF_REPO" && return 0
+  [ "${FIL_RELEASE_SELFTEST:-}" = 1 ] && [ -n "${FIL_RELEASE_GITHUB_STANDIN:-}" ] && [ "$1" = "$FIL_RELEASE_GITHUB_STANDIN" ]
+}
 # pf_remote_is_repo NAME: the clone's remote NAME reads from and pushes to github.com's PF_REPO and
 # nowhere else: every remote.NAME.url and remote.NAME.pushurl names it (git fetches from the first
-# url and pushes to all of them, or to the pushurls), and the URLs git fetches from are exactly the
-# ones it pushes to after any rewriting (git remote get-url --all and --push --all: catches a
-# url.*.pushInsteadOf; an insteadOf rewrites both alike).
+# url and pushes to all of them, or to the pushurls), the URLs git fetches from are exactly the ones
+# it pushes to after any rewriting (git remote get-url --all and --push --all: catches a
+# url.*.pushInsteadOf), and every one of those rewritten URLs is GitHub's too (pf_real_url_ok:
+# catches a url.*.insteadOf, which rewrites fetch and push alike, pointing anywhere else).
 pf_remote_is_repo() {
   local n=$1 u any=0 fetch push
   while IFS= read -r u; do
@@ -237,7 +249,11 @@ pf_remote_is_repo() {
   done < <(pf_git config --get-all "remote.$n.pushurl" 2> /dev/null || true)
   fetch=$(pf_git remote get-url --all "$n" 2> /dev/null) || return 1
   push=$(pf_git remote get-url --push --all "$n" 2> /dev/null) || return 1
-  [ -n "$fetch" ] && [ "$fetch" = "$push" ]
+  [ -n "$fetch" ] && [ "$fetch" = "$push" ] || return 1
+  while IFS= read -r u; do
+    pf_real_url_ok "$u" || return 1
+  done <<< "$fetch
+$push"
 }
 # pf_github_remote: the name of the clone's remote for GitHub's PF_REPO, found by its URLs
 # (pf_remote_is_repo), not its name (`github` while Gitea was the home, `origin` since GitHub is):
@@ -258,8 +274,8 @@ pf_need_github() {
     pf_fail "no remote of the clone is github.com's $PF_REPO (its fetch and push URLs all github.com's, and nothing else)" - "git remote add origin git@github.com:$PF_REPO.git (or fix the remote: git remote -v; git config --get-regexp '^remote\\.|insteadof')"
     return 1
   fi
-  # a remote named by --github is held to the same rule (only the self-test may name a local path)
-  if ! pf_remote_is_repo "$PF_GITHUB" && [ "${FIL_RELEASE_SELFTEST:-}" != 1 ]; then
+  # a remote named by --github is held to the same rule, in the self-test too
+  if ! pf_remote_is_repo "$PF_GITHUB"; then
     pf_fail "the remote '$PF_GITHUB' is not github.com's $PF_REPO alone (every url and pushurl, and where git really fetches and pushes, must be)" - "git remote -v; name the remote whose fetch and push URLs are all git@github.com:$PF_REPO.git (or leave --github out: it is found by its URL)"
     return 1
   fi

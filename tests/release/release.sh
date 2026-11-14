@@ -273,9 +273,10 @@ if [ -z "$github" ]; then
   github=$(pf_github_remote) || die "no remote of $ROOT is github.com's $repo: git remote add origin git@github.com:$repo.git (or pass --github REMOTE; git remote -v lists them)"
 fi
 git -C "$ROOT" config --get "remote.$github.url" > /dev/null 2>&1 || die "--github $github: the clone has no such remote (git remote -v)"
-# an explicit --github is held to the URL rule too (only the self-test may name a local path)
+# an explicit --github is held to the URL rule too, in the self-test as well (its GitHub is a
+# github.com URL rewritten to a local stand-in, which pf_remote_is_repo accepts there alone)
 PF_REPO=$repo
-if ! pf_remote_is_repo "$github" && [ "${FIL_RELEASE_SELFTEST:-}" != 1 ]; then
+if ! pf_remote_is_repo "$github"; then
   die "--github $github: that remote is not github.com's $repo alone (every url and pushurl, and where git really fetches and pushes, must be; git remote -v). Leave --github out: GitHub is found by its URL"
 fi
 
@@ -1586,7 +1587,7 @@ tag_ours() {
   rg -c gpg.format=ssh -c "gpg.ssh.allowedSignersFile=$s" verify-tag "$1" > /dev/null 2>&1
 }
 act_tag() {
-  local name='' n t now
+  local name='' n t now was
   step_log tag
   [ "$TAG_STATE" = none ] || step_fail "$TAG on GitHub is in a state the tag step does not act on: $TAG_MSG" "run it again; if it says the same, send the log to the coordinator"
   t=$(tree_of "$G")
@@ -1610,7 +1611,12 @@ act_tag() {
   [ -n "$now" ] || step_fail "cannot read main on '$github' before the tag" "run it again"
   if [ "$now" != "$GMAIN" ] || ! has_commit "$now"; then
     has_commit "$now" || rg fetch -q --no-tags "$github" 2>> "$STEP_LOG" || step_fail "git fetch $github failed" "run it again"
-    echo "$github's main moved to $now (was ${GMAIN:-not read})" >> "$STEP_LOG"
+    was=${GMAIN:-}
+    if [ "$now" != "$was" ]; then
+      echo "$github's main moved to $now (was ${was:-not read})" >> "$STEP_LOG"
+    else
+      echo "$github's main is still $now (fetched: the clone did not have it)" >> "$STEP_LOG"
+    fi
     GMAIN=$now
     has_commit "$now" && rg merge-base --is-ancestor "$G" "$now" \
       || step_fail "$github's main moved to $(short "$now"), which does not have the release commit $(short "$G"): the tag is not made" \

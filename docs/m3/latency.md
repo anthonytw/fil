@@ -9,7 +9,7 @@ The real-network half of M3's verification (`docs/m3/plan.md` §5.5): key-to-gly
 The coordinator's route (one run after V1 merges, one at the M3 sweep close; `docs/m3/plan.md` §5.7):
 
 ```bash
-gh workflow run linux-check.yml --ref ci/BRANCH -f ref=SHA -f suite=latency
+gh workflow run linux-check.yml --ref BRANCH -f ref=SHA -f suite=latency
 ```
 
 `suite=latency` runs two realnet jobs, `latency` (M2's lab) and `predict` (these cells), and nothing else. The `predict` job uploads the artifact `realnet-predict`; its summary has the scenario table and a table of the cells. On a Linux box with root: `just realnet predict` (all five) or `just realnet predict p_keys` (one).

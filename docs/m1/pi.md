@@ -67,7 +67,7 @@ Do not run two copies at once. `reset` kills everything the account runs.
 `linux-check` with `suite=arm64-remote` (and `suite=all`) runs the job `arm64-remote` on `ubuntu-24.04-arm` in two shards, after the `aarch64` job of the same run; `suite=extended` (once per merge batch) runs a smoke shard of it:
 
 ```sh
-gh workflow run linux-check.yml --ref ci/BRANCH -f ref=SHA -f suite=arm64-remote
+gh workflow run linux-check.yml --ref BRANCH -f ref=SHA -f suite=arm64-remote
 ```
 
 1. **The remote binaries** are the `aarch64` job's artifact `fil-aarch64-musl`: the static `fil` and `fwdprobe` that would go on a Pi, checked against their `.sha256` files and as static aarch64 ELFs.

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/anthonytw/fil"
@@ -19,15 +19,15 @@ rust-version = "1.99.1"
 # Only normal dependencies use them: a dev-dependency stays a bare path, which `cargo publish` drops,
 # so the test-only crates (fil-testkit, fil-testbins, fil-netsim) are never needed on crates.io.
 [workspace.dependencies]
-fil-client = { path = "crates/fil-client", version = "=0.2.0" }
-fil-daemon = { path = "crates/fil-daemon", version = "=0.2.0" }
-fil-forward = { path = "crates/fil-forward", version = "=0.2.0" }
-fil-predict = { path = "crates/fil-predict", version = "=0.2.0" }
-fil-proto = { path = "crates/fil-proto", version = "=0.2.0" }
-fil-session = { path = "crates/fil-session", version = "=0.2.0" }
+fil-client = { path = "crates/fil-client", version = "=0.3.0" }
+fil-daemon = { path = "crates/fil-daemon", version = "=0.3.0" }
+fil-forward = { path = "crates/fil-forward", version = "=0.3.0" }
+fil-predict = { path = "crates/fil-predict", version = "=0.3.0" }
+fil-proto = { path = "crates/fil-proto", version = "=0.3.0" }
+fil-session = { path = "crates/fil-session", version = "=0.3.0" }
 # No default features: the shipped crates take only the alacritty backend (DESIGN.md section 6.5).
-fil-term = { path = "crates/fil-term", version = "=0.2.0", default-features = false }
-fil-transport = { path = "crates/fil-transport", version = "=0.2.0" }
+fil-term = { path = "crates/fil-term", version = "=0.3.0", default-features = false }
+fil-transport = { path = "crates/fil-transport", version = "=0.3.0" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

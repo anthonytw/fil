@@ -148,7 +148,7 @@ The sequential forward smoke stays above 1,024 (QUIC's stream credit, which a mi
 `Link::finish` runs out of); 300 concurrent connections already overflow macOS's listen queue of
 128, the failure that size exists to catch.
 
-Since the CI rework for 0.2.1 the GitHub checks have three suites, by what a run is for: the PR
+Since the CI rework for 0.3.0 the GitHub checks have three suites, by what a run is for: the PR
 gate (`suite=check`, every PR head, about 10 min; about 21 on the release paths, macOS's release-test), the extended set (`suite=extended`, once per
 merge batch on `main`, about 15 min; it is also the run that saves the rust-cache) and the release
 candidate (`suite=all`, which `tests/release/just.sh release` dispatches, about 20 min on GitHub),

@@ -8,7 +8,7 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 Ask before taking over a session, and predictive echo that recovers after an interruption.
 
-0.3.0 changes the wire (`wire 1.15` in `fil --version`; 0.1.0 and 0.2.0 are `wire 1.14`), so install it on your machine and on each host: a 0.3.0 client does not talk to a 0.2.0 daemon. Daemons of different wires run side by side, so nothing breaks: your 0.2.0 sessions stay on the old daemon until they end, and a 0.3.0 client starts its own. The guide's "Upgrading" section has the details.
+0.3.0 changes the wire (`wire 1.15` in `fil --version`; 0.1.0 and 0.2.0 are `wire 1.14`), so install it on your machine and on each host: a 0.3.0 client does not talk to a 0.2.0 daemon. Daemons of different wires run side by side, so nothing breaks: your 0.2.0 sessions stay on the old daemon until they end (the 0.3.0 `fil` does not list or reach them; the 0.2.0 `fil` still does), and a 0.3.0 client starts its own. The guide's "Upgrading" section has the details.
 
 ### Added
 

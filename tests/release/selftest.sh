@@ -1893,7 +1893,11 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 # ============================================================== 9. release-preflight.sh (stubs only)
 # A clone with a Gitea-like `origin` and a GitHub-like `github` (local bare repos), real git, real
 # ssh-keygen keys and real commit signing; every other tool is a stub driven by FAKE_* variables.
-# Nothing here reaches GitHub, Gitea, crates.io or Docker. Each failure class must fail with its message.
+# The scripts find GitHub by its URL, so `github`'s is git@github.com:o/r.git, which git's
+# url.<base>.insteadOf points at the bare repo (and GIT_SSH_COMMAND=false in pfx: a URL that is not
+# rewritten fails, it never reaches github.com). Gitea's `origin` is the remote the release no longer
+# reads: some cases make it unreachable. Nothing here reaches GitHub, Gitea, crates.io or Docker.
+# Each failure class must fail with its message.
 echo "== release-preflight.sh"
 pf=$tmp/preflight
 PF=$RELEASE_DIR/release-preflight.sh
@@ -1904,8 +1908,7 @@ git init -q --bare "$pf/origin.git"
 git init -q --bare "$pf/github.git"
 git init -q -b main "$pf/clone"
 pg() { git -C "$pf/clone" "$@"; }
-# GitHub's main starts one commit behind the release commit (as after the agents' last fast-forward
-# of it): the history is `base`, then the release commit `r`
+# The history is `base`, then the release commit `r`, which is GitHub's main
 echo base > "$pf/clone/README"
 pg add README
 pg commit -q --no-gpg-sign -m base
@@ -1923,9 +1926,12 @@ cp -R "$REPO_ROOT/tests/release" "$pf/clone/tests/"
 pg add -A
 pg commit -q -m r
 pg remote add origin "$pf/origin.git"
-pg remote add github "$pf/github.git"
+pg remote add github git@github.com:o/r.git
+pg config "url.$pf/github.git.insteadOf" git@github.com:o/r.git
+# and no ssh from this clone, whatever the environment (a URL that is not rewritten fails here)
+pg config core.sshCommand false
 pg push -q origin main
-pg push -q github "$PF_BASE:refs/heads/main"
+pg push -q github main
 pg fetch -q github
 pg config gpg.format ssh
 pg config user.signingkey "$pf/key.pub"
@@ -2039,7 +2045,7 @@ printf '#!/bin/sh\ncase " $* " in *" --dump "*) exec %s "$@" ;; esac\necho just 
 chmod +x "$pf/bin"/* "$pf/path"/*
 # pfx [ENV=VALUE ...] CMD...: CMD with the fixture's stubs; pfr [ENV=VALUE ...]: the preflight itself
 pfx() {
-  env FAKE_GH_LOG="$pf/gh.log" PATH="$pf/path:$PATH" FIL_RELEASE_SELFTEST=1 FIL_RELEASE_ROOT="$pf/clone" FIL_RELEASE_KEY="$pf/key" \
+  env FAKE_GH_LOG="$pf/gh.log" PATH="$pf/path:$PATH" GIT_SSH_COMMAND=false FIL_RELEASE_SELFTEST=1 FIL_RELEASE_ROOT="$pf/clone" FIL_RELEASE_KEY="$pf/key" \
     FIL_GH="$pf/bin/gh" FIL_SSH="$pf/bin/ssh" FIL_DOCKER="$pf/bin/docker" FIL_LIMACTL="$pf/bin/limactl" FIL_DF="$pf/bin/df" \
     FIL_CARGO="$pf/bin/cargo" FIL_CRATES_CURL="$pf/bin/curl" FIL_GPG="$pf/bin/gpg" FIL_SECURITY="$pf/bin/security" \
     FIL_NOTARYTOOL="$pf/bin/notarytool" FIL_CODESIGN="$pf/bin/codesign" FIL_CODESIGN_IDENTITY="Developer ID Application: Test (TEAM)" \
@@ -2091,11 +2097,82 @@ pf_class "low disk in the VM" "GiB free in VM fil" FAKE_VM_KIB=1048576
 echo dirty >> "$pf/clone/CHANGELOG.md"
 pf_class "a dirty tree" "uncommitted changes"
 pg checkout -q -- CHANGELOG.md
-pf_class "HEAD is not Gitea's main" "is not origin's main" sh -c 'git -C "$1" commit -q --allow-empty --no-gpg-sign -m x && exec "$2" 0.9.0 --repo o/r' sh "$pf/clone" "$PF"
-pg reset -q --hard origin/main
+pf_class "HEAD is not GitHub's main (the tree check fails it, github-main only notes it)" "is not github's main" sh -c 'git -C "$1" commit -q --allow-empty --no-gpg-sign -m x && exec "$2" 0.9.0 --repo o/r' sh "$pf/clone" "$PF"
+pg reset -q --hard github/main
+# GitHub is the release's only remote: Gitea (origin here) unreachable changes nothing
 pg remote set-url origin "$pf/nosuch.git"
-pf_class "Gitea unreachable" "cannot read main on remote 'origin'"
+expect_pass "preflight: Gitea unreachable: everything still passes (Gitea is not read)" pfr
 pg remote set-url origin "$pf/origin.git"
+pg config --rename-section "url.$pf/github.git" "url.$pf/nosuch.git"
+expect_fail "preflight: GitHub unreachable fails" pfr
+last_pf=$(cat "$tmp/out.log")
+expect_pass "preflight: ...in the tree check, saying it cannot read GitHub's main" sh -c 'printf "%s\n" "$1" | grep -q "FAIL  tree: cannot read main on remote .github. (GitHub)"' sh "$last_pf"
+pg config --rename-section "url.$pf/nosuch.git" "url.$pf/github.git"
+# GitHub is found by its URL, whatever the remote's name; without one, every check that reads it
+# says so
+# pfgh: the remote pf_init picks in the fixture (PF_REPO=o/r), printed ("" for none)
+pfgh() { pfx bash -c 'source "$1" && PF_REPO=o/r && pf_init 0.9.0 && printf "%s\n" "$PF_GITHUB"' sh "$PF" 2> /dev/null; }
+# pfgh_is NAME WANT: pfgh prints WANT
+pfgh_is() { local got; got=$(pfgh); if [ "$got" = "$2" ]; then pass "preflight: $1"; else flunk "preflight: $1 (picked '${got}', wanted '$2')"; fi; }
+pfgh_is "the GitHub remote is the one whose URL is github.com's OWNER/REPO (github, beside Gitea's origin)" github
+pg remote rename github neutral
+pfgh_is "...found by its URL whatever its name" neutral
+pg remote rename neutral github
+pfx env FIL_RELEASE_ROOT="$pf/clone" bash -c 'source "$1"; bad=""
+for u in git@github.com:o/r.git git@github.com:o/r ssh://git@github.com/o/r.git ssh://git@github.com:22/o/r git+ssh://git@github.com/o/r https://github.com/o/r.git https://github.com:443/o/r https://github.com/O/R/ https://user@github.com/o/r git@GitHub.com:o/r.git github.com:o/r; do pf_url_is_repo "$u" o/r || bad="$bad +$u"; done
+for u in git@github.com:o/rr.git git@github.com:x/o/r.git git@github.com:o/r.git.evil git@gitlab.com:o/r.git git@git-ssh.example:o/r.git https://github.com.evil/o/r https://evil.com/@github.com/o/r https://github.com@evil.com/o/r https://github.com:22/o/r ssh://git@github.com:443/o/r ftp://github.com/o/r github.com/o/r ./github.com:o/r a/b:github.com:o/r git@github.com:/o/r https://github.com "$2/github.git" ""; do ! pf_url_is_repo "$u" o/r || bad="$bad -$u"; done
+[ -z "$bad" ] || { echo "wrong:$bad" >&2; exit 1; }' sh "$PF" "$pf" > "$tmp/out.log" 2>&1 && pass "preflight: pf_url_is_repo knows github.com's URL forms, and nothing else (the host parsed: no evil.com/@github.com, no bare github.com/O/R)" || { flunk "preflight: pf_url_is_repo knows github.com's URL forms, and nothing else"; sed 's/^/       | /' "$tmp/out.log"; }
+# a remote counts only when every url and pushurl is GitHub's and git fetches from exactly where it
+# pushes: a second url (git fetches from the first, pushes to all), a pushurl, a pushInsteadOf
+pg remote set-url --add github "$pf/origin.git"
+pfgh_is "a GitHub remote with a second url (Gitea's) is not GitHub's" ""
+pg remote set-url --delete github "$pf/origin.git"
+pg config --unset-all remote.github.url
+pg config --add remote.github.url "$pf/origin.git"
+pg config --add remote.github.url git@github.com:o/r.git
+pfgh_is "...nor with Gitea's url first and GitHub's second" ""
+pg config --unset-all remote.github.url
+pg config remote.github.url git@github.com:o/r.git
+pfgh_is "...back to one url: found again" github
+pg config remote.github.pushurl "$pf/origin.git"
+pfgh_is "a pushurl elsewhere: not GitHub's" ""
+pg config remote.github.pushurl git@github.com:o/r.git
+pfgh_is "...a pushurl that is the same GitHub URL: found" github
+pg config --unset remote.github.pushurl
+pg config "url.$pf/origin.git.pushInsteadOf" git@github.com:o/r.git
+pfgh_is "a pushInsteadOf that sends the pushes elsewhere: not GitHub's" ""
+pg config --unset "url.$pf/origin.git.pushInsteadOf"
+pfgh_is "...without it: found again" github
+# an explicit --github is held to the same rule outside the self-test (the self-test alone may name
+# a local path)
+pfx env FIL_RELEASE_SELFTEST= bash -c 'source "$1" && PF_REPO=o/r && PF_GITHUB=origin && pf_init 0.9.0 && PF_CUR=tree && pf_need_github' sh "$PF" > "$tmp/out.log" 2>&1 && st=0 || st=$?
+if [ "$st" = 1 ] && grep -q "the remote 'origin' is not github.com's o/r alone" "$tmp/out.log"; then pass "preflight: --github naming Gitea's remote is refused"; else flunk "preflight: --github naming Gitea's remote is refused (exit $st)"; sed 's/^/       | /' "$tmp/out.log"; fi
+pfx env FIL_RELEASE_SELFTEST= bash -c 'source "$1" && PF_REPO=o/r && PF_GITHUB=github && pf_init 0.9.0 && PF_CUR=tree && pf_need_github' sh "$PF" > "$tmp/out.log" 2>&1 && st=0 || st=$?
+if [ "$st" = 0 ]; then pass "preflight: ...--github naming GitHub's remote is accepted"; else flunk "preflight: ...--github naming GitHub's remote is accepted (exit $st)"; sed 's/^/       | /' "$tmp/out.log"; fi
+# after the switch: origin is GitHub, gitea is Gitea (and unreachable): the same checks pass, on origin
+pg remote rename origin gitea
+pg remote rename github origin
+pg remote set-url gitea "$pf/nosuch.git"
+pfgh_is "after the remotes' rename: origin is GitHub's, and picked" origin
+expect_pass "preflight: after the remotes' rename (origin = GitHub, gitea = Gitea, unreachable): everything passes" pfr
+cp "$tmp/out.log" "$pf/renamed.log"
+expect_pass "preflight: ...reading origin, by its URL" grep -q "ok    tree: clean, HEAD is origin's main" "$pf/renamed.log"
+pg remote add mirror git@github.com:o/r.git
+pfgh_is "...origin preferred when another remote is GitHub's too" origin
+pg remote remove mirror
+pg remote set-url gitea "$pf/origin.git"
+pg remote rename origin github
+pg remote rename gitea origin
+pg fetch -q github
+pg fetch -q origin
+pg remote set-url github git@github.com:o/other.git
+expect_fail "preflight: no remote is github.com's o/r: it fails" pfr
+cp "$tmp/out.log" "$pf/noremote.log"
+expect_pass "preflight: ...saying so, with the fix" sh -c 'grep -q "FAIL  tree: no remote of the clone is github.com.s o/r" "$1" && grep -q "git remote add origin git@github.com:o/r.git (or fix the remote" "$1"' sh "$pf/noremote.log"
+pg remote set-url github "$pf/github.git"
+expect_fail "preflight: ...a remote that is a local path is not GitHub either" pfr
+expect_pass "preflight: ...and --github names it (in the self-test only)" pfx "$PF" 0.9.0 --repo o/r --github github --only tree
+pg remote set-url github git@github.com:o/r.git
 pf_class "--commit binds the run to another commit" "the release commit this run is bound to" sh -c 'exec "$1" 0.9.0 --repo o/r --commit 0123456789012345678901234567890123456789' sh "$PF"
 pf_class "the wrong version" "Cargo.toml's version is '0.9.0', not 0.9.1" sh -c 'exec "$1" 0.9.1 --repo o/r --only version' sh "$PF"
 pf_class "...and no changelog section for it" "CHANGELOG.md has no section for 0.9.1" sh -c 'exec "$1" 0.9.1 --repo o/r --only version' sh "$PF"
@@ -2145,11 +2222,13 @@ pf_class "no Developer ID" "no valid codesigning identity" FAKE_NO_IDENTITY=1
 pf_class "no notary profile" "store-credentials fil-notary" FAKE_NOTARY_FAIL=1
 pf_class "a codesign that fails (locked keychain)" "security unlock-keychain" FAKE_CODESIGN_FAIL=1
 pf_class "git cannot sign" "git cannot sign a commit" sh -c 'git -C "$1" config user.signingkey "$1/nosuch.pub"; "$2" 0.9.0 --repo o/r; s=$?; git -C "$1" config user.signingkey "$3"; exit $s' sh "$pf/clone" "$PF" "$pf/key.pub"
-pf_class "GitHub's main not fetched" "git fetch github" sh -c 'echo extra > "$1/extra" && git -C "$1" add extra && git -C "$1" commit -q --no-gpg-sign -m m && git -C "$1" push -q github HEAD:main && git -C "$1" reset -q --hard origin/main && git -C "$1" update-ref -d refs/remotes/github/main && git -C "$1" reflog expire --expire=now --all && git -C "$1" gc -q --prune=now && exec "$2" 0.9.0 --repo o/r' sh "$pf/clone" "$PF"
+PF_R0=$(pg rev-parse HEAD)
+st=0; pfx sh -c 'echo extra > "$1/extra" && git -C "$1" add extra && git -C "$1" commit -q --no-gpg-sign -m m && git -C "$1" push -q github HEAD:main && git -C "$1" reset -q --hard "$3" && git -C "$1" update-ref -d refs/remotes/github/main && git -C "$1" reflog expire --expire=now --all && git -C "$1" gc -q --prune=now && exec "$2" 0.9.0 --repo o/r --commit "$3"' sh "$pf/clone" "$PF" "$PF_R0" > "$tmp/out.log" 2>&1 || st=$?
+if [ "$st" = 1 ] && grep -q "FAIL  github-main: github's main (.*) is not in the clone" "$tmp/out.log" && grep -q "do:      git fetch github" "$tmp/out.log"; then pass "preflight: GitHub's main not fetched"; else flunk "preflight: GitHub's main not fetched (exit $st)"; sed 's/^/       | /' "$tmp/out.log" | tail -12; fi
 pg fetch -q github
-# the mirror is a fast-forward of GitHub's main to the release commit itself; pf_gh_main WHAT
-# [ARGS]: the preflight (with ARGS), GitHub's main at WHAT; pf_gh_line STATUS NAME RE [WANT]: it
-# exited STATUS (WANT, default 0) and printed RE
+# the release commit must be on GitHub's main (nothing pushes it there); pf_gh_main WHAT [ARGS]: the
+# preflight (with ARGS), GitHub's main at WHAT; pf_gh_line STATUS NAME RE [WANT]: it exited STATUS
+# (WANT, default 0) and printed RE
 pf_gh_main() {
   pg push -q -f github "$1:refs/heads/main" && pg fetch -q github
   shift
@@ -2158,53 +2237,45 @@ pf_gh_main() {
 pf_gh_line() {
   if [ "$1" = "${4:-0}" ] && grep -q -- "$3" "$tmp/out.log"; then pass "preflight: $2"; else flunk "preflight: $2 (exit $1)"; sed 's/^/       | /' "$tmp/out.log" | tail -12; fi
 }
-# GitHub's main past the release commit. With a commit only GitHub has (the commit with a file the
-# release commit lacks, above): a failure, in github-main and in release-key (the signers the tag is
-# checked against would come from it)
+# GitHub's main past the release commit (the commit with a file the release commit lacks, above), in
+# a run bound by --commit R (as after the tag): a warning (the dry run needs main at R), no failure
 PF_E=$(pg rev-parse github/main)
-st=0; pf_gh_main "$PF_E" || st=$?
-pf_gh_line "$st" "github/main past the release commit with a commit only GitHub has fails" 'FAIL  github-main: .* is past the release commit with commits origin/main lacks' 1
-pf_gh_line "$st" "...in the release-key check too" 'FAIL  release-key: .* is past the release commit with commits origin/main lacks' 1
-# ... with that commit on Gitea's main too (a run bound by --commit R, as after the tag): a warning
-# (the dry run needs main at R), no failure
-pg push -q origin "$PF_E:refs/heads/main"
 st=0; pf_gh_main "$PF_E" --commit "$(pg rev-parse HEAD)" || st=$?
-pf_gh_line "$st" "github/main past the release commit, on Gitea's main: a warning, not a failure" 'WARN  github-main: .* has moved on past the release commit'
-# ... and a commit on both that changes .github/release-signers (the key still listed): a failure
+pf_gh_line "$st" "github/main past the release commit: a warning, not a failure" 'WARN  github-main: .* has moved on past the release commit'
+pf_gh_line "$st" "...the release key checked on both, main's signers being R's" 'ok    release-key: .* at github/main '
+# ... and a commit past R that changes .github/release-signers (the key still listed): a failure
 PF_SIG=$({ pg show "HEAD:.github/release-signers"; echo '# changed'; } | pg hash-object -w --stdin)
 PF_S=$({ pg ls-tree "$PF_E:.github" | awk -F '\t' '$2 != "release-signers"'; printf '100644 blob %s\trelease-signers\n' "$PF_SIG"; } | pg mktree)
 PF_S=$({ pg ls-tree "$PF_E" | awk -F '\t' '$2 != ".github"'; printf '040000 tree %s\t.github\n' "$PF_S"; } | pg mktree)
 PF_S=$(pg commit-tree "$PF_S" -p "$PF_E" -m signers)
-pg push -q origin "$PF_S:refs/heads/main"
 st=0; pf_gh_main "$PF_S" --commit "$(pg rev-parse HEAD)" || st=$?
 pf_gh_line "$st" "github/main past the release commit with another release-signers fails" 'FAIL  github-main: .* has a .github/release-signers that differs from the release commit' 1
 pf_gh_line "$st" "...in the release-key check too" 'FAIL  release-key: .* has a .github/release-signers that differs from the release commit' 1
-pg push -q -f origin "$(pg rev-parse HEAD):refs/heads/main"
-pg fetch -q origin
+# GitHub's main behind the release commit, or diverged from it: R is not on it (and HEAD is not
+# main): a failure, nothing to fast-forward
 st=0; pf_gh_main "$PF_BASE" || st=$?
-pf_gh_line "$st" "github/main behind the release commit: the mirror fast-forwards it (a note)" 'note  github-main: .* is behind the release commit (new commits: 1): step mirror fast-forwards it'
+pf_gh_line "$st" "github/main behind the release commit fails: HEAD is not main" "FAIL  tree: HEAD .* is not github's main" 1
+pf_gh_line "$st" "...github-main notes R is not on it" 'note  github-main: the release commit .* is not on github/main' 1
+st=0; pf_gh_main "$(pg commit-tree "$(pg rev-parse 'HEAD^{tree}')" -p "$PF_BASE" -m 'another commit')" || st=$?
+pf_gh_line "$st" "github/main diverged from the release commit fails" "FAIL  tree: HEAD .* is not github's main" 1
 st=0; pf_gh_main "$(pg rev-parse HEAD)" || st=$?
-pf_gh_line "$st" "github/main at the release commit: the mirror is done" 'ok    github-main: github/main is the release commit'
-pg push -q -f github "$(pg commit-tree "$(pg rev-parse 'HEAD^{tree}')" -p "$PF_BASE" -m 'pushed to GitHub only'):refs/heads/main"
-pg fetch -q github
-pf_class "github/main diverged from the release commit" "step mirror only fast-forwards (it never forces)"
-pg push -q -f github "$PF_BASE:refs/heads/main"
-pg fetch -q github
-pf_class "the tag on GitHub already exists" "already exists on GitHub" sh -c 'git -C "$1" push -q github origin/main:refs/tags/v0.9.0 && "$2" 0.9.0 --repo o/r; s=$?; git -C "$1" push -q github :refs/tags/v0.9.0; exit $s' sh "$pf/clone" "$PF"
+pf_gh_line "$st" "github/main at the release commit: on-main is done" 'ok    github-main: github/main is the release commit'
+pf_class "the tag on GitHub already exists" "already exists on GitHub" sh -c 'git -C "$1" push -q github github/main:refs/tags/v0.9.0 && "$2" 0.9.0 --repo o/r; s=$?; git -C "$1" push -q github :refs/tags/v0.9.0; exit $s' sh "$pf/clone" "$PF"
 # after the tag: main moves on, and a run bound to the release commit still passes
 R=$(pg rev-parse HEAD)
 echo later > "$pf/clone/later"
 pg add later
 pg commit -q --no-gpg-sign -m later
-pg push -q origin HEAD:main
+pg push -q github HEAD:main
 pg reset -q --hard "$R"
-expect_pass "preflight: --commit R --from crates passes with Gitea's main ahead of R" pfx "$PF" 0.9.0 --repo o/r --commit "$R" --from crates
+expect_pass "preflight: --commit R --from crates passes with GitHub's main ahead of R" pfx "$PF" 0.9.0 --repo o/r --commit "$R" --from crates
 expect_pass "preflight: --from crates without --commit binds to HEAD, on main" pfx "$PF" 0.9.0 --repo o/r --from crates
-pf_class "...but an unbound run before the tag still needs HEAD == main" "is not origin's main"
-pg fetch -q origin
-pf_class "a bound commit that is not on main" "is not on origin's main" sh -c 'git -C "$1" commit -q --allow-empty --no-gpg-sign -m side && exec "$2" 0.9.0 --repo o/r --commit "$(git -C "$1" rev-parse HEAD)" --from crates' sh "$pf/clone" "$PF"
+pf_class "...but an unbound run before the tag still needs HEAD == main" "is not github's main"
+pg fetch -q github
+pf_class "a bound commit that is not on main" "is not on github's main" sh -c 'git -C "$1" commit -q --allow-empty --no-gpg-sign -m side && exec "$2" 0.9.0 --repo o/r --commit "$(git -C "$1" rev-parse HEAD)" --from crates' sh "$pf/clone" "$PF"
 pg reset -q --hard "$R"
-pg push -q -f origin "$R:main"
+pg push -q -f github "$R:main"
+pg fetch -q github
 # a resume at `crates` needs neither the VM nor Docker nor the keys
 expect_pass "preflight: --from crates does not look at the VM, Docker or the keys" pfx FAKE_VM_STATUS=Stopped FAKE_DOCKER_DOWN=1 FAKE_NO_SECRET=1 FAKE_NO_IDENTITY=1 "$PF" 0.9.0 --repo o/r --from crates
 expect_pass "preflight: every gh call was a read (no -X, -f, -F, --input; no release create/edit/delete/upload)" sh -c 'test -s "$1" && ! grep -Eq -- "(^| )(-X|--method|-f|-F|--field|--raw-field|--input)( |=|$)|^release (create|edit|delete|upload)" "$1"' sh "$pf/gh.log"
@@ -2217,6 +2288,8 @@ expect_pass "preflight: every gh call was a read (no -X, -f, -F, --input; no rel
 # see it, and nothing more.
 echo "== release.sh"
 rs=$tmp/rel
+# Gitea (origin here) unreachable throughout: the release never reads or writes it
+pg remote set-url origin "$pf/nosuch.git"
 RL=$RELEASE_DIR/release.sh
 mkdir -p "$rs/world/runs" "$rs/world/releases" "$rs/gnupg"
 chmod 700 "$rs/gnupg"
@@ -2343,14 +2416,6 @@ elif a[:2] == ["workflow", "run"]:
     open(nf, "w").write(str(nid + 1))
     json.dump(dict(id=nid, workflow=wf, name=wf[:-4], event="workflow_dispatch", branch="main", head=head, status="queued", conclusion="",
                    jobs=[], suite=fields.get("suite", ""), attempt=1), open(os.path.join(w, "runs", "%d.json" % nid), "w"))
-    if os.environ.get("FAKE_ORIGIN_MOVE") and not os.path.exists(os.path.join(w, "origin-moved")):
-        # two merges to Gitea's main while the run waits (once; the same tree, so at the version)
-        o = ["git", "--git-dir", os.environ["FAKE_ORIGIN_GIT"]]
-        c = subprocess.check_output(o + ["rev-parse", "refs/heads/main"]).decode().strip()
-        for m in ("merged meanwhile", "merged meanwhile, again"):
-            c = subprocess.check_output(o + ["commit-tree", c + "^{tree}", "-p", c, "-m", m]).decode().strip()
-        subprocess.check_call(o + ["update-ref", "refs/heads/main", c])
-        open(os.path.join(w, "origin-moved"), "w").write(c)
     if os.environ.get("FAKE_DISPATCH_MOVE"):
         # GitHub's main moves on past the commit just dispatched (another writer, in that moment)
         g = ["git", "--git-dir", os.environ["FAKE_GITHUB_GIT"]]
@@ -2376,6 +2441,18 @@ elif a[:2] in (["run", "watch"], ["run", "rerun"]):
     else:
         if os.environ.get("FAKE_WATCH_FAIL"):
             print("HTTP 502: Bad Gateway", file=sys.stderr); sys.exit(1)
+        if os.environ.get("FAKE_MAIN_MOVE") and not os.path.exists(os.path.join(w, "main-moved")):
+            # GitHub's main moves while the runs are waited for (once): FAKE_MAIN_MOVE=1, two merges
+            # (the same tree, so at the version); else to the commit it names
+            o = ["git", "--git-dir", os.environ["FAKE_GITHUB_GIT"]]
+            c = subprocess.check_output(o + ["rev-parse", "refs/heads/main"]).decode().strip()
+            if os.environ["FAKE_MAIN_MOVE"] == "1":
+                for m in ("merged meanwhile", "merged meanwhile, again"):
+                    c = subprocess.check_output(o + ["commit-tree", c + "^{tree}", "-p", c, "-m", m]).decode().strip()
+            else:
+                c = os.environ["FAKE_MAIN_MOVE"]
+            subprocess.check_call(o + ["update-ref", "refs/heads/main", c])
+            open(os.path.join(w, "main-moved"), "w").write(c)
         if r["status"] != "completed":
             # the run finishes; FAKE_RUN_FAIL names the workflows whose first attempt fails
             bad = r["workflow"] in os.environ.get("FAKE_RUN_FAIL", "").split() and r.get("attempt", 1) == 1
@@ -2648,7 +2725,7 @@ chmod +x "$rs/verify" "$rs/sign-macos" "$rs/sign-packages" "$rs/keys"
 RL_SOCK=$rs/none.sock
 rlx() {
   pfx env FIL_GH="$rs/gh" FIL_GPG="$rs/gpg" FIL_CARGO="$rs/cargo" FIL_CRATES_CURL="$rs/curl" FAKE_WORLD="$rs/world" FAKE_PF_GH="$pf/bin/gh" \
-    FIL_RELEASE_VERIFY="$rs/verify" FAKE_CALLS="$rs/calls.log" FAKE_GITHUB_GIT="$pf/github.git" FAKE_ORIGIN_GIT="$pf/origin.git" \
+    FIL_RELEASE_VERIFY="$rs/verify" FAKE_CALLS="$rs/calls.log" FAKE_GITHUB_GIT="$pf/github.git" \
     FIL_SIGN_MACOS="$rs/sign-macos" FIL_SIGN_PACKAGES="$rs/sign-packages" FIL_RELEASE_KEYS="$rs/keys" FIL_RELEASE_POLL=0 \
     FAKE_RW="$RW" FAKE_RELEASE_FILES="$rs/files0" FAKE_RELEASE_DIR="$RELEASE_DIR" FAKE_KEYS_LOCKED="$rs/keys-locked" \
     FIL_BREW="$rs/brew-stub" FAKE_BREW_PREFIX="$rs/brewprefix" FIL_RELEASE_SHARED="$rs/shared/fil-0.9.0" \
@@ -2700,32 +2777,41 @@ if [ -z "$ov_bad" ]; then pass "release: every test-only override, set alone, is
 expect_fail "release: --redo tag is refused" rlx "$RL" 0.9.0 --redo tag
 last
 expect_pass "release: ...it cannot be redone" grep -q 'it cannot be redone' "$rs/last.log"
-for x in mirror tag-run publish crates finish candidate nosuch; do expect_fail "release: --redo $x is refused" rlx "$RL" 0.9.0 --redo "$x"; done
+for x in on-main tag-run publish crates finish candidate nosuch; do expect_fail "release: --redo $x is refused" rlx "$RL" 0.9.0 --redo "$x"; done
 expect_fail "release: --redo does not go with --from" rlx "$RL" 0.9.0 --redo upload --from tag
 expect_fail "release: --redo does not go with --status" rlx "$RL" 0.9.0 --redo upload --status
 expect_fail "release: --from names a step" rlx "$RL" 0.9.0 --from nosuch
-expect_fail "release: --status does not go with --from" rlx "$RL" 0.9.0 --status --from mirror
+expect_fail "release: --status does not go with --from" rlx "$RL" 0.9.0 --status --from on-main
+# GitHub is found by its URL; a clone without such a remote is refused, saying so
+pg remote set-url github git@github.com:o/other.git
+expect_fail "release: no remote is github.com's OWNER/REPO: refused" rls
+last
+expect_pass "release: ...saying so, with the fix" grep -q "no remote of .* is github.com's o/r: git remote add origin git@github.com:o/r.git" "$rs/last.log"
+pg remote set-url github git@github.com:o/r.git
+expect_fail "release: --github names a remote the clone does not have: refused" rls --github nosuch
 
-# 0: nothing done but the candidate
+# 0: nothing done but the candidate (GitHub's main is the release commit: on-main is done)
 rl_refs > "$rs/refs.before"
 rl_kind 1 candidate "done (checked)"
-rl_kind 2 mirror next
-rl_kind 3 dry-run pending
+rl_kind 2 on-main "done (checked)"
+rl_kind 3 dry-run next
+rl_kind 4 dry-verify pending
 expect_pass "release status: wrote no state" test ! -e "$RSTATE"
 expect_pass "release status: ...and changed no ref or file of the clone" sh -c 'rl_refs() { git -C "$1" for-each-ref --format="%(refname) %(objectname)" | grep -v "^refs/remotes/" | LC_ALL=C sort; git -C "$1" status --porcelain; }; rl_refs "$1" | cmp -s - "$2"' sh "$pf/clone" "$rs/refs.before"
-rl_paused 2 mirror
-expect_pass "release run: ...at the confirmation, with no terminal, in the failure format" sh -c 'grep -q "input is not a terminal: nothing was done" "$1" && grep -q "^  do:    run it in a terminal (there is no --yes)" "$1" && grep -q "^  then:  tests/release/just.sh release 0.9.0 .*(steps 1-1 are done" "$1"' sh "$rs/run.out"
-expect_pass "release run: ...the preflight ran for mirror and after" grep -q '^preflight: all .* checks passed for 0.9.0' "$rs/run.out"
+rl_paused 5 tag
+expect_pass "release run: ...at the confirmation, with no terminal, in the failure format" sh -c 'grep -q "input is not a terminal: nothing was done" "$1" && grep -q "^  do:    run it in a terminal (there is no --yes)" "$1" && grep -q "^  then:  tests/release/just.sh release 0.9.0 .*(steps 1-4 are done" "$1"' sh "$rs/run.out"
+expect_pass "release run: ...the preflight ran for dry-run and after" grep -q '^preflight: all .* checks passed for 0.9.0' "$rs/run.out"
+expect_pass "release run: ...and nothing was pushed to GitHub's main" test "$(git --git-dir="$pf/github.git" rev-parse refs/heads/main)" = "$RR"
 expect_pass "release run: ...the state is bound to the version and HEAD" sh -c 'grep -qx "version=0.9.0" "$1" && grep -qx "release_commit=$2" "$1"' sh "$RSTATE" "$RR"
 expect_pass "release run: ...and the lock is gone" test ! -e "$RW/.lock"
 
 # binding
 cp "$RSTATE" "$rs/state.saved"
 sed "s/^release_commit=.*/release_commit=0123456789012345678901234567890123456789/" "$rs/state.saved" > "$RSTATE"
-rl_paused 2 mirror
+rl_paused 5 tag
 expect_pass "release run: ...a state bound to another commit, with no tag yet, is rebound by itself, saying so" sh -c 'grep -q "there is no v0.9.0 yet (in the clone or on github): the state is rebound to" "$1" && grep -qx "release_commit=$2" "$3"' sh "$rs/run.out" "$RR" "$RSTATE"
 sed "s/^release_commit=.*/release_commit=0123456789012345678901234567890123456789/" "$rs/state.saved" > "$RSTATE"
-rl_paused 2 mirror -- --reset-state
+rl_paused 5 tag -- --reset-state
 expect_pass "release run: ...--reset-state before the tag rebinds" grep -qx "release_commit=$RR" "$RSTATE"
 # the lock
 mkdir -p "$RW/.lock"
@@ -2737,11 +2823,11 @@ last
 expect_pass "release run: ...naming its pid" grep -q "another release run (pid $rl_sleeper)" "$rs/last.log"
 kill "$rl_sleeper" 2> /dev/null || true
 wait "$rl_sleeper" 2> /dev/null || true
-rl_paused 2 mirror
+rl_paused 5 tag
 expect_pass "release run: ...a stale lock is removed with a note" grep -q 'removed a stale lock' "$rs/run.out"
 # three runs against a stale lock, all waiting on the held reap mutex, then released together: the
 # mutex lets exactly one reap and take the lock, which it holds (FIL_RELEASE_LOCK_HOLD) until the
-# other two have found it held; then it goes on and pauses at mirror; none leaves a lock behind
+# other two have found it held; then it goes on and pauses at the tag; none leaves a lock behind
 mkdir -p "$RW/.lock" "$RW/.lock.reap"
 echo "$rl_sleeper" > "$RW/.lock/pid"
 touch "$rs/lock-hold"
@@ -2752,7 +2838,7 @@ n=0
 until [ "$(cat "$rs"/race.?.st 2> /dev/null | grep -c .)" -ge 2 ] || [ $n -ge 250 ]; do n=$((n + 1)); sleep 0.1; done
 rm -f "$rs/lock-hold"
 wait
-expect_pass "release run: three runs released together onto a stale lock: exactly one wins (paused at mirror), two find it held" sh -c 'w=0 h=0; for n in 1 2 3; do case $(cat "$1/race.$n.st") in 2) grep -q "PAUSED at step 2/17 mirror" "$1/race.$n" && w=$((w + 1)) ;; 1) grep -q "another release run (pid" "$1/race.$n" && h=$((h + 1)) ;; esac; done; test "$w $h" = "1 2"' sh "$rs"
+expect_pass "release run: three runs released together onto a stale lock: exactly one wins (paused at the tag), two find it held" sh -c 'w=0 h=0; for n in 1 2 3; do case $(cat "$1/race.$n.st") in 2) grep -q "PAUSED at step 5/17 tag" "$1/race.$n" && w=$((w + 1)) ;; 1) grep -q "another release run (pid" "$1/race.$n" && h=$((h + 1)) ;; esac; done; test "$w $h" = "1 2"' sh "$rs"
 expect_pass "release run: ...and left no lock or mutex behind" sh -c '! ls -d "$1"/.lock* > /dev/null 2>&1' sh "$RW"
 mkdir "$RW/.lock.reap"
 expect_fail "release run: a reap mutex left by a killed run is reported (after 10 s)" rl
@@ -2761,7 +2847,7 @@ expect_pass "release run: ...saying how to remove it" grep -q "rmdir '.*/.lock.r
 rmdir "$RW/.lock.reap"
 # release.sh is one { ... } group ending in `exit`, so bash has read all of it before it runs any of
 # it: a copy rewritten IN PLACE (same inode, as an editor does) while it waits in the lock hook goes
-# on unaffected and pauses at mirror. The new text would exit 97, or fail on a fragment of a line,
+# on unaffected and pauses at the tag. The new text would exit 97, or fail on a fragment of a line,
 # wherever bash resumed reading: the control, the same copy without the group, is derailed by it.
 ri=$tmp/rel-immune
 for kind in wrapped unwrapped; do
@@ -2792,14 +2878,15 @@ f.close()' "$ri/tests/release/release.sh"
   rm -f "$rs/lock-hold"
   wait
 done
-expect_pass "release run: a copy of release.sh rewritten in place while it runs: unaffected, paused at mirror" sh -c 'test "$(cat "$1.st")" = 2 && grep -q "PAUSED at step 2/17 mirror" "$1" && ! grep -q "command not found" "$1"' sh "$rs/immune.wrapped"
+expect_pass "release run: a copy of release.sh rewritten in place while it runs: unaffected, paused at the tag" sh -c 'test "$(cat "$1.st")" = 2 && grep -q "PAUSED at step 5/17 tag" "$1" && ! grep -q "command not found" "$1"' sh "$rs/immune.wrapped"
 expect_pass "release run: ...the control, the copy without the { ... } group, is derailed by the same rewrite" sh -c 'st=$(cat "$1.st"); test "$st" = 97 || test "$st" = 127' sh "$rs/immune.unwrapped"
 rm -rf "$ri"
 
 # ---- the actions of steps 1-4 (PR 4), on a test ssh-agent's commit-signing key (git config names
 # the .pub, whose private half is only in the agent), with a pre-receive hook on the github bare repo
 # that logs each push to main (and refuses it while $rs/reject-push exists), the gh world's dispatch,
-# watch and rerun, and the release-verify stub. Each case starts from GitHub's main before the mirror.
+# watch and rerun, and the release-verify stub. Each case starts from GitHub's main at the release
+# commit, as a release does (nothing pushes main: every case checks that the hook logged no push to it).
 mkdir -p "$rs/agentkey" "$rs/agentpub"
 cp "$pf/key" "$rs/agentkey/key"
 cp "$pf/key.pub" "$rs/agentpub/key.pub"
@@ -2809,6 +2896,7 @@ trap 'kill "$rs_agent" 2> /dev/null; rm -rf "$tmp"' EXIT INT TERM
 SSH_AUTH_SOCK=$rs/agent.sock ssh-add -q "$rs/agentkey/key" 2> /dev/null
 RL_SOCK=$rs/agent.sock
 pg config user.signingkey "$rs/agentpub/key.pub"
+# A push to main (none is expected: the hook logs it, and refuses it while $rs/reject-push exists).
 # A tag push: refused while $rs/reject-tag exists (the tag ruleset); with $rs/tag-run-on-push, it
 # starts the tag's release.yml run in the gh world, which the fake advances one stage per look.
 cat > "$pf/github.git/hooks/pre-receive" << EOF2
@@ -2829,7 +2917,6 @@ while read -r old new ref; do
 done
 EOF2
 chmod +x "$pf/github.git/hooks/pre-receive"
-GMAIN0=$(pg rev-parse github/main)
 cp -R "$pf/github.git" "$rs/github.saved"
 ra_reset() {
   rm -rf "$pf/github.git" "$rs/world/runs" "$RW/logs" "$rs/reject-push"
@@ -2865,148 +2952,150 @@ calls_are() {
 }
 
 ra_reset
-ra_expect "release actions: no terminal at the confirmation: paused, exit 2" 2 'PAUSED at step 2/17 mirror' FIL_RELEASE_TTY= < /dev/null
+ra_expect "release actions: --from tag with the dry run undone is refused" 1 'FAILED at step 3/17 dry-run' -- --from tag < /dev/null
+expect_pass "release actions: ...saying the step before is not done" grep -q -- '--from tag: step 3 dry-run is not done' "$rs/ra.out"
 calls_are 0 0 0 0
+ra_expect "release actions: no terminal at the confirmation: paused at the tag, exit 2 (run ids found by listing)" 2 'PAUSED at step 5/17 tag' FIL_RELEASE_TTY= FAKE_NO_RUN_URL=1 < /dev/null
+calls_are 0 3 0 1
+expect_pass "release actions: ...and recorded the runs it found by listing" sh -c 'grep -qx dry_run=101 "$1" && grep -qx checks_linux=102 "$1" && grep -qx checks_macos=103 "$1"' sh "$RSTATE"
 ra_expect "release actions: a declined confirmation: paused, exit 2" 2 'not confirmed: nothing was done' <<< "yes"
 expect_pass "release actions: ...saying what it received, quoted" grep -q "nothing was done (received 'yes', not 0.9.0)" "$rs/ra.out"
 ra_expect "release actions: an answer with a control character: paused, the character shown" 2 "received [$]'0[.]9[.]0[\\]E\\[A', not 0[.]9[.]0" <<< $'0.9.0\e[A'
 ra_expect "release actions: no answer at all: paused, saying it received an empty line" 2 'received an empty line, not 0[.]9[.]0' < /dev/null
-expect_pass "release actions: ...the confirmation shows what becomes public, mirror and tag" sh -c 'grep -q "CONFIRM tag, for 0.9.0" "$1" && grep -q "step 2 mirror: GitHub.s main fast-forwarded from .* to the release commit" "$1" && grep -q "step 5 tag (this answer covers it too)" "$1"' sh "$rs/ra.out"
-calls_are 0 0 0 0
-ra_expect "release actions: --confirm-each asks for the mirror on its own" 2 'CONFIRM mirror, for 0.9.0' -- --confirm-each <<< ""
-expect_pass "release actions: ...and says the tag is asked for at step 5" grep -q 'the tag is asked for on its own, at step 5' "$rs/ra.out"
-ra_expect "release actions: --from dry-run with the mirror undone is refused" 1 'FAILED at step 2/17 mirror' -- --from dry-run < /dev/null
-expect_pass "release actions: ...saying the step before is not done" grep -q -- '--from dry-run: step 2 mirror is not done' "$rs/ra.out"
-calls_are 0 0 0 0
-# step 2 fails (GitHub refuses the push), then the same command again
-touch "$rs/reject-push"
-ra_expect "release actions: a refused mirror push fails at step 2" 1 'FAILED at step 2/17 mirror' <<< "0.9.0"
-expect_pass "release actions: ...with the known fix for a ruleset refusal" grep -q 'ruleset refused a fast-forward push' "$rs/ra.out"
-expect_pass "release actions: ...and the log's tail and path" sh -c 'grep -q "GH006" "$1" && grep -q "logs/02-mirror.log" "$1"' sh "$rs/ra.out"
-calls_are 0 0 0 0
-rm -f "$rs/reject-push"
-ra_expect "release actions: ...the same command again goes on to step 5 (run ids found by listing; the answer's white space ignored)" 2 'PAUSED at step 5/17 tag' FAKE_NO_RUN_URL=1 -- --confirm-each <<< $'  0.9.0 \r'
-calls_are 1 3 0 1
-expect_pass "release actions: ...and recorded the runs it found by listing" sh -c 'grep -qx dry_run=101 "$1" && grep -qx checks_linux=102 "$1" && grep -qx checks_macos=103 "$1"' sh "$RSTATE"
+expect_pass "release actions: ...the confirmation shows what becomes public: the tag, and nothing of main" sh -c 'grep -q "CONFIRM tag, for 0.9.0" "$1" && grep -q "step 5 tag: the tag v0.9.0 on the release commit" "$1" && ! grep -qi "mirror" "$1"' sh "$rs/ra.out"
+ra_expect "release actions: --confirm-each asks for the tag the same way" 2 'CONFIRM tag, for 0.9.0' -- --confirm-each <<< ""
+calls_are 0 3 0 1
+# the tag confirmed, with the answer's white space ignored: the tag is made; GitHub refuses its push
+# (the tag ruleset), so nothing more happens
+touch "$rs/reject-tag"
+ra_expect "release actions: confirmed (the answer's white space ignored): the tag push refused, fails at step 5" 1 'FAILED at step 5/17 tag' <<< $'  0.9.0 \r'
+calls_are 0 3 0 1
+rm -f "$rs/reject-tag"
+pg tag -d v0.9.0 > /dev/null 2>&1 || true
 
 # step 3 fails (the wait dies), then the state is lost while the runs are still going
 ra_reset
-ra_expect "release actions: a wait that dies fails at step 3" 1 'FAILED at step 3/17 dry-run' FAKE_WATCH_FAIL=1 <<< "0.9.0"
+ra_expect "release actions: a wait that dies fails at step 3" 1 'FAILED at step 3/17 dry-run' FAKE_WATCH_FAIL=1 < /dev/null
 expect_pass "release actions: ...saying a re-run re-attaches" grep -q 're-attaches to the run' "$rs/ra.out"
-calls_are 1 3 0 0
+calls_are 0 3 0 0
 rm -f "$RSTATE"
 ra_expect "release actions: ...the state deleted, the same command again attaches to the running runs" 2 'PAUSED at step 5/17 tag' < /dev/null
-calls_are 1 3 0 1
+calls_are 0 3 0 1
 expect_pass "release actions: ...and re-derived the state" sh -c 'grep -qx "github_commit=$(git -C "$2" rev-parse refs/heads/main)" "$1" && grep -qx dry_run=101 "$1" && grep -q "^dry_verify=ok 101 " "$1"' sh "$RSTATE" "$pf/github.git"
 
 # step 3 fails (a job fails): the rerun offer declined, then no terminal, then accepted
 ra_reset
-ra_expect "release actions: a failed check fails at step 3, the rerun declined" 1 'FAILED at step 3/17 dry-run' FAKE_RUN_FAIL=linux-check.yml <<< "$(printf '0.9.0\nn')"
+ra_expect "release actions: a failed check fails at step 3, the rerun declined" 1 'FAILED at step 3/17 dry-run' FAKE_RUN_FAIL=linux-check.yml <<< "n"
 expect_pass "release actions: ...with the failed job's log" grep -q 'Process completed with exit code 1' "$rs/ra.out"
-calls_are 1 3 0 0
+calls_are 0 3 0 0
 ra_expect "release actions: ...again without a terminal: paused (exit 2) for the decision, saying how to rerun" 2 'gh run rerun ID --failed' FIL_RELEASE_TTY= < /dev/null
 expect_pass "release actions: ...and that whether it blocks the release is decided at a terminal" grep -q 'whether they block the release is your decision, at a terminal' "$rs/ra.out"
-calls_are 1 3 0 0
+calls_are 0 3 0 0
 ra_expect "release actions: ...again, the rerun accepted: on to step 5" 2 'PAUSED at step 5/17 tag' <<< "y"
-calls_are 1 3 1 1
+calls_are 0 3 1 1
 
 # step 4 fails (a rebuild that differs; the VM down), then the same command again
 ra_reset
-ra_expect "release actions: a dry run that does not verify fails at step 4" 1 'FAILED at step 4/17 dry-verify' FAKE_VERIFY_FAIL=mismatch <<< "0.9.0"
+ra_expect "release actions: a dry run that does not verify fails at step 4" 1 'FAILED at step 4/17 dry-verify' FAKE_VERIFY_FAIL=mismatch < /dev/null
 expect_pass "release actions: ...saying never to tag" grep -q 'STOP: do NOT tag' "$rs/ra.out"
 expect_pass "release actions: ...and recording nothing for it" sh -c '! grep -q "^dry_verify=" "$1"' sh "$RSTATE"
 ra_expect "release actions: ...the VM down fails at step 4 too" 1 'do: +limactl start fil' FAKE_VERIFY_FAIL=lima < /dev/null
-calls_are 1 3 0 2
+calls_are 0 3 0 2
 ra_expect "release actions: ...the same command again: on to step 5" 2 'PAUSED at step 5/17 tag' < /dev/null
-calls_are 1 3 0 3
+calls_are 0 3 0 3
 # a state bound to another commit, mid-way: rebound by itself while there is no v0.9.0 and HEAD is
-# Gitea's main (as --reset-state); the runs are found again by listing, the dry run verified again
+# GitHub's main (as --reset-state); the runs are found again by listing, the dry run verified again
 cp "$RSTATE" "$rs/state.mid"
 sed "s/^release_commit=.*/release_commit=0123456789012345678901234567890123456789/" "$rs/state.mid" > "$RSTATE"
 ra_expect "release actions: a state bound to another commit, no tag yet: rebound to HEAD" 2 'PAUSED at step 5/17 tag' < /dev/null
 expect_pass "release actions: ...saying so" grep -q 'the state was bound to 0.9.0 at 012345678901, HEAD is .*, and there is no v0.9.0 yet .*: the state is rebound to' "$rs/ra.out"
 expect_pass "release actions: ...the state bound to HEAD" grep -qx "release_commit=$RR" "$RSTATE"
-calls_are 1 3 0 4
-# ...but not once a v0.9.0 exists: in the clone (an unpushed vV-gh, or Gitea's marker) or on GitHub
+calls_are 0 3 0 4
+# ...but not once a v0.9.0 exists: in the clone (an unpushed tag an earlier run made) or on GitHub
 sed "s/^release_commit=.*/release_commit=0123456789012345678901234567890123456789/" "$rs/state.mid" > "$RSTATE"
 cp "$RSTATE" "$rs/state.other"
-for t in v0.9.0-gh v0.9.0; do
-  pg tag "$t" "$RR"
-  ra_expect "release actions: ...a local $t: refused, nothing rebound" 1 "v0.9.0 exists in the clone \\(refs/tags/$t\\), not on github: it may be a tag" < /dev/null
-  expect_pass "release actions: ...saying how to delete it" grep -q "git tag -d $t, then run it again (it rebinds)" "$rs/ra.out"
-  pg tag -d "$t" > /dev/null
-done
+pg tag v0.9.0 "$RR"
+ra_expect "release actions: ...a local v0.9.0: refused, nothing rebound" 1 "v0.9.0 exists in the clone \\(refs/tags/v0.9.0\\), not on github: it may be a tag" < /dev/null
+expect_pass "release actions: ...saying how to delete it" grep -q "git tag -d v0.9.0, then run it again (it rebinds)" "$rs/ra.out"
+pg tag -d v0.9.0 > /dev/null
+# (a local v0.9.0-gh, the name 0.1.0 and 0.2.0 gave the tag, is no longer this command's)
+pg tag v0.9.0-gh "$RR"
+ra_expect "release actions: ...a local v0.9.0-gh is not a v0.9.0: rebound" 2 'PAUSED at step 5/17 tag' < /dev/null
+pg tag -d v0.9.0-gh > /dev/null
+cp "$rs/state.other" "$RSTATE"
 git --git-dir="$pf/github.git" update-ref refs/tags/v0.9.0 "$RR"
 ra_expect "release actions: ...v0.9.0 on GitHub: refused, nothing rebound" 1 'and v0.9.0 is on github: the tag binds its commit' < /dev/null
 git --git-dir="$pf/github.git" update-ref -d refs/tags/v0.9.0
 expect_pass "release actions: ...the state untouched by the refusals" cmp -s "$RSTATE" "$rs/state.other"
-# ...nor when HEAD is not Gitea's main (a checkout by mistake would lose the records)
+# ...nor when HEAD is not GitHub's main (a checkout by mistake would lose the records)
 pg checkout -q --detach "$PF_BASE"
-ra_expect "release actions: ...HEAD not Gitea's main: refused, nothing rebound" 1 "which is not origin's main; no v0.9.0 yet" < /dev/null
+ra_expect "release actions: ...HEAD not GitHub's main: refused, nothing rebound" 1 "which is not github's main; no v0.9.0 yet" < /dev/null
 pg checkout -q main
 expect_pass "release actions: ...the state untouched" cmp -s "$RSTATE" "$rs/state.other"
-calls_are 1 3 0 4
+calls_are 0 3 0 5
 
-# Gitea's main moves on (a fix merged after the run above): a clean main behind it is
-# fast-forwarded and the state rebound; a dirty tree, a main with commits Gitea's lacks, or a vV
+# GitHub's main moves on (a fix merged after the run above): a clean main behind it is
+# fast-forwarded and the state rebound; a dirty tree, a main with commits GitHub's lacks, or a vV
 # that exists stop as before, with nothing moved
 cp "$rs/state.mid" "$RSTATE"
 pg commit -q --allow-empty --no-gpg-sign -m ahead
 RAH=$(pg rev-parse HEAD)
-pg push -q origin main
+git --git-dir="$pf/github.git" fetch -q "$pf/clone" "$RAH:refs/heads/main"
+pg fetch -q github
 pg reset -q --hard "$RR"
 echo dirty >> "$pf/clone/CHANGELOG.md"
-ra_expect "release actions: main behind Gitea's, the tree dirty: not fast-forwarded, the tree check stops" 1 'FAILED at step 1/17 candidate' < /dev/null
+ra_expect "release actions: main behind GitHub's, the tree dirty: not fast-forwarded, the tree check stops" 1 'FAILED at step 1/17 candidate' < /dev/null
 expect_pass "release actions: ...with the tree check's advice" grep -q 'uncommitted changes to tracked files' "$rs/ra.out"
 expect_pass "release actions: ...HEAD not moved" test "$(pg rev-parse HEAD)" = "$RR"
-# the mirror is done (GitHub's main is the release commit), the candidate is not: neither the
+# on-main is done (the release commit is on GitHub's main), the candidate is not: neither the
 # status nor the failure reads it as done
-expect_pass "release actions: ...the then line names the steps done, not 'steps 1-N'" sh -c 'grep -q "(step 1 candidate is not done; done already, and skipped: 2 mirror, 3 dry-run, 4 dry-verify)" "$1" && ! grep -q "steps 1-" "$1"' sh "$rs/ra.out"
-rl_kind 1 candidate next "a dirty tree, with the mirror done: not implied"
+expect_pass "release actions: ...the then line names the steps done, not 'steps 1-N'" sh -c 'grep -q "(step 1 candidate is not done; done already, and skipped: 2 on-main, 3 dry-run, 4 dry-verify)" "$1" && ! grep -q "steps 1-" "$1"' sh "$rs/ra.out"
+rl_kind 1 candidate next "a dirty tree, with on-main done: not implied"
 pg checkout -q -- CHANGELOG.md
 pg commit -q --allow-empty --no-gpg-sign -m local
-ra_expect "release actions: main with a commit Gitea's lacks: not fast-forwarded, the tree check stops" 1 "is not origin's main" < /dev/null
+ra_expect "release actions: main with a commit GitHub's lacks: not fast-forwarded, the tree check stops" 1 "is not github's main" < /dev/null
 pg reset -q --hard "$RR"
-pg tag v0.9.0-gh "$RR"
-ra_expect "release actions: main behind Gitea's with a local v0.9.0-gh: not fast-forwarded" 1 "and v0.9.0 exists in the clone \\(refs/tags/v0.9.0-gh\\), not on github: not fast-forwarded" < /dev/null
+pg tag v0.9.0 "$RR"
+ra_expect "release actions: main behind GitHub's with a local v0.9.0: not fast-forwarded" 1 "and v0.9.0 exists in the clone \\(refs/tags/v0.9.0\\), not on github: not fast-forwarded" < /dev/null
 expect_pass "release actions: ...HEAD not moved" test "$(pg rev-parse HEAD)" = "$RR"
-pg tag -d v0.9.0-gh > /dev/null
-ra_expect "release actions: a clean main behind Gitea's: fast-forwarded, rebound, on to the mirror" 2 'PAUSED at step 2/17 mirror' < /dev/null
-expect_pass "release actions: ...saying so" sh -c 'grep -q "main was behind origin.s main: fast-forwarded from $(echo "$2" | cut -c1-12) to $(echo "$3" | cut -c1-12) (git merge --ff-only origin/main; new commits: 1)" "$1" && grep -q "the state is rebound to $(echo "$3" | cut -c1-12)" "$1"' sh "$rs/ra.out" "$RR" "$RAH"
-expect_pass "release actions: ...the mirror's confirmation names the change (one commit: singular)" sh -c 'grep -A20 "CONFIRM tag" "$1" | grep -qF -- "  - the release commit changed in this run: $2 -> $3 (1 new commit; the earlier records, any waiver included, were dropped)"' sh "$rs/ra.out" "$RR" "$RAH"
-expect_pass "release actions: ...HEAD and the state at Gitea's main" sh -c 'test "$(git -C "$1" rev-parse HEAD)" = "$3" && grep -qx "release_commit=$3" "$2"' sh "$pf/clone" "$RSTATE" "$RAH"
-# put Gitea's main back for the cases below (a scratch remote)
+pg tag -d v0.9.0 > /dev/null
+ra_expect "release actions: a clean main behind GitHub's: fast-forwarded, rebound, on to the tag" 2 'PAUSED at step 5/17 tag' < /dev/null
+expect_pass "release actions: ...saying so" sh -c 'grep -q "main was behind github.s main: fast-forwarded from $(echo "$2" | cut -c1-12) to $(echo "$3" | cut -c1-12) (git merge --ff-only github/main; new commits: 1)" "$1" && grep -q "the state is rebound to $(echo "$3" | cut -c1-12)" "$1"' sh "$rs/ra.out" "$RR" "$RAH"
+expect_pass "release actions: ...the tag's confirmation names the change (one commit: singular)" sh -c 'grep -A20 "CONFIRM tag" "$1" | grep -qF -- "  - the release commit changed in this run: $2 -> $3 (1 new commit; the earlier records, any waiver included, were dropped)"' sh "$rs/ra.out" "$RR" "$RAH"
+expect_pass "release actions: ...HEAD and the state at GitHub's main" sh -c 'test "$(git -C "$1" rev-parse HEAD)" = "$3" && grep -qx "release_commit=$3" "$2"' sh "$pf/clone" "$RSTATE" "$RAH"
+# put GitHub's main back for the cases below (a scratch remote)
 pg reset -q --hard "$RR"
-pg push -q -f origin "$RR:refs/heads/main"
+git --git-dir="$pf/github.git" update-ref refs/heads/main "$RR"
+pg fetch -q github
 
-# a mistyped version (Gitea's main is not at it) fast-forwards nothing
+# a mistyped version (GitHub's main is not at it) fast-forwards nothing
 pg commit -q --allow-empty --no-gpg-sign -m ahead
-pg push -q origin main
+git --git-dir="$pf/github.git" fetch -q "$pf/clone" "$(pg rev-parse HEAD):refs/heads/main"
 pg reset -q --hard "$RR"
 st=0
 rlx FIL_RELEASE_TTY=1 "$RL" 0.9.1 --repo o/r --tap "$rs/tap" > "$rs/ra.out" 2>&1 < /dev/null || st=$?
-if [ "$st" != 0 ] && [ "$(pg rev-parse HEAD)" = "$RR" ] && grep -q "whose Cargo.toml is not at 0.9.1: not fast-forwarded" "$rs/ra.out"; then pass "release actions: a version Gitea's main is not at: main not fast-forwarded"; else
-  flunk "release actions: a version Gitea's main is not at: main not fast-forwarded (exit $st)"; sed 's/^/       | /' "$rs/ra.out" | tail -15
+if [ "$st" != 0 ] && [ "$(pg rev-parse HEAD)" = "$RR" ] && grep -q "whose Cargo.toml is not at 0.9.1: not fast-forwarded" "$rs/ra.out"; then pass "release actions: a version GitHub's main is not at: main not fast-forwarded"; else
+  flunk "release actions: a version GitHub's main is not at: main not fast-forwarded (exit $st)"; sed 's/^/       | /' "$rs/ra.out" | tail -15
 fi
 rm -rf "$pf/clone/target/release-verify/0.9.1"
-pg push -q -f origin "$RR:refs/heads/main"
+git --git-dir="$pf/github.git" update-ref refs/heads/main "$RR"
+pg fetch -q github
 
-# Gitea's main moves on while the run waits on the dry run: the run is not stopped (the candidate is
-# checked at its start), and goes on to the tag
+# GitHub's main moves on (merges) while the run waits on the dry run, after the dispatches: the run
+# is not stopped (the candidate is checked at its start, the runs are on the release commit), and
+# goes on to the tag
 ra_reset
-rm -f "$rs/world/origin-moved"
-ra_expect "release actions: Gitea's main moves during the dry run: the run goes on to step 5" 2 'PAUSED at step 5/17 tag' FAKE_ORIGIN_MOVE=1 -- --confirm-each <<< "0.9.0"
-expect_pass "release actions: ...and Gitea's main did move" sh -c 'test "$(git --git-dir="$1" rev-parse refs/heads/main)" != "$2"' sh "$pf/origin.git" "$RR"
-OM=$(cat "$rs/world/origin-moved")
-# the agents fast-forward GitHub's main to it: the next run fast-forwards, rebinds, finds the
-# mirror done, dry-runs the new commit, and its first confirmation (the tag's) names the change
-pg fetch -q origin
-pg push -q github "$OM:refs/heads/main"
+rm -f "$rs/world/main-moved"
+ra_expect "release actions: GitHub's main moves during the dry run: the run goes on to step 5" 2 'PAUSED at step 5/17 tag' FAKE_MAIN_MOVE=1 -- --confirm-each < /dev/null
+OM=$(cat "$rs/world/main-moved")
+expect_pass "release actions: ...and GitHub's main did move" sh -c 'test "$(git --git-dir="$1" rev-parse refs/heads/main)" = "$2" && test "$2" != "$3"' sh "$pf/github.git" "$OM" "$RR"
+calls_are 0 3 0 1
+# the next run fast-forwards, rebinds, dry-runs the new commit, and its first confirmation (the
+# tag's) names the change
 ra_expect "release actions: ...the next run: fast-forwarded and rebound, the tag's confirmation names the change" 2 'PAUSED at step 5/17 tag' < /dev/null
 expect_pass "release actions: ...the change with full commits, in the confirmation" sh -c 'grep -A20 "CONFIRM tag" "$1" | grep -qF -- "  - the release commit changed in this run: $2 -> $3 (2 new commits; the earlier records, any waiver included, were dropped)"' sh "$rs/ra.out" "$RR" "$OM"
 pg reset -q --hard "$RR"
-pg push -q -f origin "$RR:refs/heads/main"
-rm -f "$rs/world/origin-moved"
+rm -f "$rs/world/main-moved"
 
 # the crates cannot be fetched (no network) at the start: the candidate is unknown, the failure
 # says it is the network
@@ -3055,11 +3144,15 @@ ra_pty() { # NAME STATUS PATTERN AHEAD ANSWERS [-- ARGS]: ra_expect on a pseudo-
   fi
 }
 ra_reset
-ra_pty "release actions: a terminal: the version typed ahead is discarded, not a confirmation" 2 'PAUSED at step 2/17 mirror' '0.9.0\n' '' -- --confirm-each
+ra_pty "release actions: a terminal: the version typed ahead is discarded, not a confirmation" 2 'PAUSED at step 5/17 tag' '0.9.0\n' '' -- --confirm-each
 expect_pass "release actions: ...it read the end of input, not the typed-ahead version" grep -q 'received an empty line, not 0.9.0' "$rs/ra.out"
-calls_are 0 0 0 0
-ra_pty "release actions: a terminal: Enter typed ahead is discarded, the answer after the question counts" 2 'PAUSED at step 5/17 tag' '\n\n' '0.9.0' -- --confirm-each
-calls_are 1 3 0 1
+calls_are 0 3 0 1
+# (the tag push refused: the answer that counted makes the tag, and nothing goes further)
+touch "$rs/reject-tag"
+ra_pty "release actions: a terminal: Enter typed ahead is discarded, the answer after the question counts" 1 'FAILED at step 5/17 tag' '\n\n' '0.9.0' -- --confirm-each
+rm -f "$rs/reject-tag"
+pg tag -d v0.9.0 > /dev/null 2>&1 || true
+calls_are 0 3 0 1
 
 # ra_midprompt ACTION [ENV=VALUE ...]: a run that waits at the confirmation (after the preflight)
 # while the test changes the world (ACTION, shell code), then gets 0.9.0 typed; RA_ST is its exit
@@ -3099,123 +3192,123 @@ gh_move_main() {
 printf '#!/bin/sh\nfor a; do f=$a; done\n: > "$f.sig"\n' > "$rs/emptysig"
 chmod +x "$rs/emptysig"
 
-# GitHub's main moves during the confirmation to a commit the release commit lacks: the step reads
-# main again after the answer and refuses it itself (nothing pushed, never forced); the same command
-# again refuses the diverged main in the preflight
+# GitHub's main moves during the tag's confirmation: the step reads main again after the answer.
+# To a commit without the release commit (main rewritten): refused, nothing tagged; the same command
+# again stops at the candidate (HEAD is not GitHub's main)
 ra_reset
-ra_midprompt 'GMOVED=$(gh_move_main "$GMAIN0")'
-ra_check "release actions: main moved during the confirmation to a diverged commit: refused at step 2" 1 'FAILED at step 2/17 mirror'
-expect_pass "release actions: ...by the step itself, after the confirmation" grep -q "GitHub's main moved during the confirmation to .*, which the release commit does not contain; the mirror only fast-forwards" "$rs/ra.out"
-calls_are 0 0 0 0
-ra_expect "release actions: ...the same command again: a diverged main is refused at step 2" 1 'FAILED at step 2/17 mirror' -- --confirm-each <<< "0.9.0"
-expect_pass "release actions: ...saying the mirror only fast-forwards" grep -q 'step mirror only fast-forwards (it never forces)' "$rs/ra.out"
-calls_are 0 0 0 0
+ra_midprompt 'GMOVED=$(gh_move_main "$PF_BASE")'
+ra_check "release actions: main moved during the tag's confirmation to a commit without R: refused at step 5" 1 'FAILED at step 5/17 tag'
+expect_pass "release actions: ...by the step itself, after the confirmation, with no tag made or pushed" sh -c 'grep -q "which does not have the release commit .*: the tag is not made" "$1" && ! grep -q "^push refs/tags/" "$2" && ! git -C "$3" rev-parse -q --verify refs/tags/v0.9.0 > /dev/null' sh "$rs/ra.out" "$rs/calls.log" "$pf/clone"
+calls_are 0 3 0 1
+ra_expect "release actions: ...the same command again: the candidate is refused (HEAD is not GitHub's main)" 1 'FAILED at step 1/17 candidate' < /dev/null
+calls_are 0 3 0 1
 expect_pass "release actions: ...and GitHub's main is untouched" test "$(git --git-dir="$pf/github.git" rev-parse refs/heads/main)" = "$GMOVED"
-rl_kind 2 mirror next "github's main diverged"
-expect_pass "release status: ...saying it cannot be fast-forwarded" grep -q 'has commits the release commit lacks: it cannot be fast-forwarded' "$rs/status.out"
-# ... and to the release commit itself (the agents pushed it meanwhile): the push is a no-op
+rl_kind 1 candidate next "github's main without the release commit"
+expect_pass "release status: ...saying HEAD is not GitHub's main" grep -q "HEAD (.*) is not github's main" "$rs/status.out"
+# ... past R, with another .github/release-signers: refused, nothing tagged
 ra_reset
-ra_midprompt 'git --git-dir="$pf/github.git" update-ref refs/heads/main "$RR"' -- --confirm-each
-ra_check "release actions: main moved to the release commit during the confirmation: on to step 5" 2 'PAUSED at step 5/17 tag'
+RSIG=$({ pg show "$RR:.github/release-signers"; echo '# changed'; } | pg hash-object -w --stdin)
+RSIG=$({ pg ls-tree "$RR:.github" | awk -F '\t' '$2 != "release-signers"'; printf '100644 blob %s\trelease-signers\n' "$RSIG"; } | pg mktree)
+RSIG=$({ pg ls-tree "$RR" | awk -F '\t' '$2 != ".github"'; printf '040000 tree %s\t.github\n' "$RSIG"; } | pg mktree)
+RSIG=$(pg commit-tree "$RSIG" -p "$RR" -m signers)
+git --git-dir="$pf/github.git" fetch -q "$pf/clone" "$RSIG:refs/heads/r-signers"
+ra_midprompt 'git --git-dir="$pf/github.git" update-ref refs/heads/main "$RSIG"'
+ra_check "release actions: main moved past R with another release-signers during the confirmation: refused at step 5" 1 'FAILED at step 5/17 tag'
+expect_pass "release actions: ...saying the signers differ, with no tag made or pushed" sh -c 'grep -q "has a .github/release-signers that differs from the release commit.s: the tag and the verifications read it from main: the tag is not made" "$1" && ! grep -q "^push refs/tags/" "$2" && ! git -C "$3" rev-parse -q --verify refs/tags/v0.9.0 > /dev/null' sh "$rs/ra.out" "$rs/calls.log" "$pf/clone"
 calls_are 0 3 0 1
-# ... and past it, to a commit only GitHub has: nothing to push (main is not rewound), and the
-# commit past R is refused (it is not on Gitea's main, and its signers would be the tag's)
+rls > "$rs/status.out" 2>&1 || true
+expect_pass "release status: ...and --status warns of the signers on main" grep -q "WARNING: github's main .* has a .github/release-signers that differs" "$rs/status.out"
+# ... past R, with R's signers (a merge): the tag is made on R and verified against the new main
+# (its push refused here, so nothing goes further)
 ra_reset
-git --git-dir="$pf/github.git" fetch -q "$pf/clone" "$RR:refs/heads/r-objects"
-ra_midprompt 'GMOVED=$(gh_move_main "$RR")' -- --confirm-each
-ra_check "release actions: main moved past the release commit during the confirmation: refused" 1 "FAILED at step 2/17 mirror"
-expect_pass "release actions: ...saying the commits past R are not Gitea's, and nothing was pushed" sh -c 'grep -q "is past the release commit with commits Gitea.s main (origin/main) lacks" "$1" && grep -q "nothing to push" "$1"' sh "$rs/ra.out"
-calls_are 0 0 0 0
-expect_pass "release actions: ...and GitHub's main is still the moved one" test "$(git --git-dir="$pf/github.git" rev-parse refs/heads/main)" = "$GMOVED"
-rl_kind 2 mirror next "github's main past R with a commit only GitHub has"
-# GitHub's main already at the release commit before the run (the agents' fast-forward): the mirror
-# is done, nothing is pushed, and the tag is confirmed at step 5 on its own
-ra_reset
-git --git-dir="$pf/github.git" update-ref refs/heads/main "$RR"
-pg fetch -q github
-rl_kind 2 mirror "done (checked)" "github's main is the release commit"
-ra_expect "release actions: GitHub's main already the release commit: --from dry-run is accepted" 2 'PAUSED at step 5/17 tag' -- --from dry-run < /dev/null
+touch "$rs/reject-tag"
+ra_midprompt 'GMOVED=$(gh_move_main "$RR")'
+rm -f "$rs/reject-tag"
+ra_check "release actions: main moved past R (a merge) during the confirmation: the tag is made on R" 1 'FAILED at step 5/17 tag'
+expect_pass "release actions: ...the tag on R, verified, its push refused by the ruleset" sh -c 'grep -q "GH013" "$1" && test "$(git -C "$2" rev-parse "refs/tags/v0.9.0^{commit}")" = "$3"' sh "$rs/ra.out" "$pf/clone" "$RR"
+pg tag -d v0.9.0 > /dev/null 2>&1 || true
 calls_are 0 3 0 1
-expect_pass "release actions: ...recording it as GitHub's commit, and asking for the tag at step 5" sh -c 'grep -qx "github_commit=$2" "$1" && grep -q "CONFIRM tag, for 0.9.0" "$3" && ! grep -q "CONFIRM mirror" "$3"' sh "$RSTATE" "$RR" "$rs/ra.out"
-# ... and moved on past it (the agents pushed later merges): the mirror is done, but the dry run,
-# which builds main's head, is not dispatched
+# GitHub's main moved on past R before the run (merges, R's signers): for R, on-main is done; a run
+# on a clean main fast-forwards to main's head and releases that (the dry run builds main's head)
 ra_reset
-git --git-dir="$pf/github.git" fetch -q "$pf/clone" "$RR:refs/heads/main"
 GMOVED=$(gh_move_main "$RR")
 pg fetch -q github
-rl_kind 2 mirror next "github's main past the release commit, with a commit only GitHub has"
-expect_pass "release status: ...saying its commits must reach Gitea's main first" grep -q "lacks: they must reach Gitea's main first" "$rs/status.out"
-# (on Gitea's main too: the mirror is done)
-git --git-dir="$pf/origin.git" fetch -q "$pf/github.git" "$GMOVED:refs/heads/main"
-pg fetch -q origin
-rl_kind 2 mirror "done (checked)" "github's main past the release commit, on Gitea's main"
-git --git-dir="$pf/origin.git" update-ref refs/heads/main "$RR"
-pg fetch -q origin
+rl_kind 2 on-main "done (checked)" "github's main past the release commit"
+ra_expect "release actions: GitHub's main past R before the run: fast-forwarded, the new main dry-run" 2 'PAUSED at step 5/17 tag' < /dev/null
+expect_pass "release actions: ...saying so" grep -q "main was behind github.s main: fast-forwarded" "$rs/ra.out"
+calls_are 0 3 0 1
+expect_pass "release actions: ...dispatched at main's head" grep -qx "workflow run linux-check.yml --repo o/r --ref main -f suite=all -f ref=$GMOVED" "$pf/gh.log"
+pg reset -q --hard "$RR"
 # GitHub's main moves on past R between the dispatches (the fake moves it after the first): the
 # next is not dispatched, since a dispatch on main would test another commit
 ra_reset
-ra_expect "release actions: main moves past the release commit between the dispatches: no further dispatch" 1 'not the release commit .*: a dispatch on main would test another commit' FAKE_DISPATCH_MOVE=1 <<< "0.9.0"
-expect_pass "release actions: ...saying to hold the pushes of main" grep -q "hold the agents' pushes of main" "$rs/ra.out"
-calls_are 1 1 0 0
-# the dispatch refused (422), then GitHub's main moves past the release commit: no dispatch
+ra_expect "release actions: main moves past the release commit between the dispatches: no further dispatch" 1 'not the release commit .*: a dispatch on main would test another commit' FAKE_DISPATCH_MOVE=1 < /dev/null
+expect_pass "release actions: ...saying to hold the merges to main" grep -q "hold the merges to main" "$rs/ra.out"
+calls_are 0 1 0 0
+# the dispatch refused (422)
 ra_reset
-ra_expect "release actions: a refused dispatch fails at step 3" 1 'FAILED at step 3/17 dry-run' FAKE_DISPATCH_FAIL=1 <<< "0.9.0"
+ra_expect "release actions: a refused dispatch fails at step 3" 1 'FAILED at step 3/17 dry-run' FAKE_DISPATCH_FAIL=1 < /dev/null
 expect_pass "release actions: ...with the known fix for it" grep -q 'needs workflow_dispatch' "$rs/ra.out"
-calls_are 1 1 0 0
-GMOVED=$(gh_move_main "$(git --git-dir="$pf/github.git" rev-parse refs/heads/main)")
-ra_expect "release actions: ...then GitHub's main past the release commit, with a commit only GitHub has: refused at step 2" 1 'FAILED at step 2/17 mirror' < /dev/null
-expect_pass "release actions: ...saying its commits are not Gitea's" grep -q 'is past the release commit with commits origin/main lacks' "$rs/ra.out"
-calls_are 1 1 0 0
-# the state lost while the runs go on: a run someone else dispatched, or one older than the mirror
+calls_are 0 1 0 0
+# GitHub's main moves past R with another release-signers while the dry run is waited for: after
+# it, on-main no longer detects as done, and the run stops there
+ra_reset
+git --git-dir="$pf/github.git" fetch -q "$pf/clone" "$RSIG:refs/heads/r-signers"
+rm -f "$rs/world/main-moved"
+ra_expect "release actions: main past R with another release-signers during the dry run: stopped after it" 1 'FAILED at step 3/17 dry-run' FAKE_MAIN_MOVE="$RSIG" < /dev/null
+expect_pass "release actions: ...saying on-main no longer holds, because of the signers" grep -q 'step 2 on-main, done before, no longer detects as done: .* has a .github/release-signers that differs from the release commit' "$rs/ra.out"
+calls_are 0 3 0 0
+rm -f "$rs/world/main-moved"
+# the state lost while the runs go on: a run someone else dispatched, or one older than the release
 # commit, is not attached to (a new one is dispatched); this release's is
 ra_reset
-ra_expect "release actions: a wait that dies, again" 1 'FAILED at step 3/17 dry-run' FAKE_WATCH_FAIL=1 <<< "0.9.0"
+ra_expect "release actions: a wait that dies, again" 1 'FAILED at step 3/17 dry-run' FAKE_WATCH_FAIL=1 < /dev/null
 python3 -I -c 'import json, sys
 for f, k, v in ((sys.argv[1], "actor", "someone-else"), (sys.argv[2], "created", "2020-01-01T00:00:00Z")):
     r = json.load(open(f)); r[k] = v; json.dump(r, open(f, "w"))' "$rs/world/runs/101.json" "$rs/world/runs/102.json"
 rm -f "$RSTATE"
 ra_expect "release actions: ...the state deleted: foreign and older running runs are not attached to" 2 'PAUSED at step 5/17 tag' < /dev/null
-calls_are 1 5 0 1
+calls_are 0 5 0 1
 expect_pass "release actions: ...two new runs, and this release's macos-check run kept" sh -c 'grep -qx dry_run=104 "$1" && grep -qx checks_linux=105 "$1" && grep -qx checks_macos=103 "$1"' sh "$RSTATE"
 # a fresh state (the first run, or a deleted one): a green suite=all run on R created before this
 # run, though after R's commit time, is not this release's: it is passed over and dispatched again
 ra_reset
-ra_expect "release actions: a first run through dry-verify" 2 'PAUSED at step 5/17 tag' -- --confirm-each <<< "0.9.0"
-calls_are 1 3 0 1
+ra_expect "release actions: a first run through dry-verify" 2 'PAUSED at step 5/17 tag' -- --confirm-each < /dev/null
+calls_are 0 3 0 1
 rm -f "$RSTATE"
 python3 -I -c 'import json, sys, time; r = json.load(open(sys.argv[1])); r["created"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 301)); json.dump(r, open(sys.argv[1], "w"))' "$rs/world/runs/102.json"
 ra_expect "release actions: ...the state deleted: a green run from before the new bind is not attached" 2 'PAUSED at step 5/17 tag' < /dev/null
-calls_are 1 4 0 2
+calls_are 0 4 0 2
 expect_pass "release actions: ...a new linux-check run is dispatched and recorded, the others kept" sh -c 'grep -qx dry_run=101 "$1" && grep -qx checks_linux=104 "$1" && grep -qx checks_macos=103 "$1" && grep -Eqx "bound_at=[0-9]+" "$1"' sh "$RSTATE"
 # a recorded run GitHub no longer has: forgotten, and the step goes on as if none was recorded
 ra_reset
-ra_expect "release actions: a wait that dies, once more" 1 'FAILED at step 3/17 dry-run' FAKE_WATCH_FAIL=1 <<< "0.9.0"
+ra_expect "release actions: a wait that dies, once more" 1 'FAILED at step 3/17 dry-run' FAKE_WATCH_FAIL=1 < /dev/null
 rm -f "$rs/world/runs/101.json"
 ra_expect "release actions: ...a recorded run deleted on GitHub is forgotten, and dispatched again" 2 'PAUSED at step 5/17 tag' < /dev/null
-calls_are 1 4 0 1
+calls_are 0 4 0 1
 expect_pass "release actions: ...recording the new run" grep -qx dry_run=104 "$RSTATE"
 
 # the happy path, from the start
 ra_reset
-ra_expect "release actions: the happy path through dry-verify, paused at step 5 (--confirm-each: the tag asks again)" 2 'PAUSED at step 5/17 tag' -- --confirm-each <<< "0.9.0"
-calls_are 1 3 0 1
+ra_expect "release actions: the happy path through dry-verify, paused at step 5 (the tag's confirmation, unanswered)" 2 'PAUSED at step 5/17 tag' -- --confirm-each < /dev/null
+calls_are 0 3 0 1
 RG=$(git -C "$pf/github.git" rev-parse refs/heads/main)
 # the signers file of the agent's commit-signing key (the tap's formula commit is checked with it)
 printf 't@example.invalid namespaces="git" %s\n' "$(cut -d' ' -f1,2 "$pf/key.pub")" > "$rs/allowed"
-expect_pass "release actions: ...GitHub's main is the release commit itself, fast-forwarded from its old main" sh -c 'test "$1" = "$2" && grep -qx "push refs/heads/main $2" "$3" && git -C "$4" merge-base --is-ancestor "$5" "$2"' sh "$RG" "$RR" "$rs/calls.log" "$pf/clone" "$GMAIN0"
+expect_pass "release actions: ...GitHub's main is the release commit itself, and nothing was pushed to it" sh -c 'test "$1" = "$2" && ! grep -q "^push refs/heads/main " "$3"' sh "$RG" "$RR" "$rs/calls.log"
 expect_pass "release actions: ...dispatched the three on main, the checks suite=all at the release commit" sh -c 'grep -qx "workflow run release.yml --repo o/r --ref main" "$1" && grep -qx "workflow run linux-check.yml --repo o/r --ref main -f suite=all -f ref=$2" "$1" && grep -qx "workflow run macos-check.yml --repo o/r --ref main -f suite=all -f ref=$2" "$1"' sh "$pf/gh.log" "$RG"
 expect_pass "release actions: ...verified the dry run at the release commit" grep -qx "verify 0.9.0 --dry-run --from-run 101 --ref $RG --repo o/r" "$rs/calls.log"
 expect_pass "release actions: ...and recorded it all" sh -c 'grep -qx "github_commit=$2" "$1" && grep -qx dry_run=101 "$1" && grep -qx checks_linux=102 "$1" && grep -qx checks_macos=103 "$1" && grep -Eq "^dry_verify=ok 101 $2 [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$" "$1"' sh "$RSTATE" "$RG"
-expect_pass "release actions: ...one log per step that acted" sh -c 'test -s "$1/02-mirror.log" && test -s "$1/03-dry-run.log" && test -s "$1/04-dry-verify.log"' sh "$RW/logs"
+expect_pass "release actions: ...one log per step that acted (on-main has no action)" sh -c '! test -e "$1/02-on-main.log" && test -s "$1/03-dry-run.log" && test -s "$1/04-dry-verify.log"' sh "$RW/logs"
 expect_pass "release actions: ...and asked for the tag on its own, with nothing pushed" sh -c 'grep -q "CONFIRM tag, for 0.9.0" "$1" && grep -q "not confirmed: nothing was done" "$1" && ! grep -q "^push refs/tags/" "$2"' sh "$rs/ra.out" "$rs/calls.log"
 ra_expect "release actions: the same command again does nothing new" 2 'PAUSED at step 5/17 tag' < /dev/null
-calls_are 1 3 0 1
+calls_are 0 3 0 1
 ra_expect "release actions: --from tag with steps 1-4 done is accepted" 2 'PAUSED at step 5/17 tag' -- --from tag < /dev/null
 # the status after dry-verify, against its golden
 rls 2>&1 | awk '$1 ~ /^[0-9]+\/17$/ { k = $3; if (k == "done") k = k " " $4; print $1, $2, k }' > "$rs/golden4.out"
 cat > "$rs/golden4" << 'EOF2'
 1/17 candidate done (checked)
-2/17 mirror done (checked)
+2/17 on-main done (checked)
 3/17 dry-run done (checked)
 4/17 dry-verify done (recorded)
 5/17 tag next
@@ -3240,11 +3333,11 @@ pg config user.signingkey "$pf/key.pub"
 # moved on to a commit the clone has not fetched: the recorded GitHub commit is not proof enough
 # (status does not fetch)
 : > "$rs/keys-locked"
-rl_kind 2 mirror "done (checked)"
+rl_kind 2 on-main "done (checked)"
 git clone -q -b main "$pf/github.git" "$rs/other"
 git -C "$rs/other" commit -q --allow-empty --no-gpg-sign -m later
 git -C "$rs/other" push -q origin HEAD:main
-rl_kind 2 mirror "next (unknown)" "github's main not in the clone"
+rl_kind 1 candidate next "github's main not in the clone (HEAD is not main)"
 expect_pass "release status: ...says to fetch it" grep -q 'git fetch github' "$rs/status.out"
 git -C "$rs/other" push -q -f origin "$RG:refs/heads/main"
 rm -rf "$rs/other"
@@ -3293,61 +3386,62 @@ cp "$rs/run102.saved" "$rs/world/runs/102.json"
 rl_paused 5 tag
 
 # 4: burned tags: one the signers on main do not list, one on a commit of another tree
-pg -c user.signingkey="$pf/otherkey.pub" tag -s -m 'fil 0.9.0' v0.9.0-gh "$RG"
-pg push -q github v0.9.0-gh:refs/tags/v0.9.0
+pg -c user.signingkey="$pf/otherkey.pub" tag -s -m 'fil 0.9.0' v0.9.0-hand "$RG"
+pg push -q github v0.9.0-hand:refs/tags/v0.9.0
 rl_kind 5 tag BURNED "signed by a key not on main"
 expect_fail "release run: a burned tag is a hard stop" rl
 last
 expect_pass "release run: ...this version is burned" grep -q 'this version is burned: bump to the next patch' "$rs/last.log"
 pg push -q github :refs/tags/v0.9.0
-pg tag -d v0.9.0-gh > /dev/null
-# (a commit on GitHub's main past the release commit: the release commit's tree and one more file,
-# a tree no commit on origin's main has)
+pg tag -d v0.9.0-hand > /dev/null
+# (a commit on GitHub's main past the release commit: the release commit's tree and one more file)
 RX=$({ git --git-dir="$pf/github.git" ls-tree "$RG"; printf '100644 blob %s\tside\n' "$(echo side | git --git-dir="$pf/github.git" hash-object -w --stdin)"; } | git --git-dir="$pf/github.git" mktree)
 RX=$(git --git-dir="$pf/github.git" commit-tree "$RX" -p "$RG" -m side)
 git --git-dir="$pf/github.git" update-ref refs/heads/main "$RX"
 pg fetch -q github
-pg tag -s -m 'fil 0.9.0' v0.9.0-gh "$RX"
-pg push -q github v0.9.0-gh:refs/tags/v0.9.0
+pg tag -s -m 'fil 0.9.0' v0.9.0-hand "$RX"
+pg push -q github v0.9.0-hand:refs/tags/v0.9.0
 rl_kind 5 tag BURNED "on a commit without the release commit's tree"
-# the same tag with nothing bound: a run has fetched origin and finds no commit on its main with the
-# tag's tree, so the tag is burned (not a checkout of another commit)
+# the same tag with nothing bound: the tag must be on GitHub's main to verify, and its commit is a
+# commit of main, so it is not burned: the run names the commit to check out and records nothing
 cp "$RSTATE" "$rs/state.b"
 rm -f "$RSTATE"
-expect_fail "release run: a good tag of a tree no commit on origin's main has, nothing bound, is burned" rl
+expect_fail "release run: a good tag of another commit of GitHub's main, nothing bound, fails" rl
 last
-expect_pass "release run: ...saying why, and that the version is burned" sh -c 'grep -q "no commit on origin.s main has that tree" "$1" && grep -q "this version is burned: bump to the next patch" "$1"' sh "$rs/last.log"
+expect_pass "release run: ...not as burned, naming the commit to check out" sh -c 'grep -q "git checkout $2" "$1" && ! grep -q "this version is burned" "$1"' sh "$rs/last.log" "$RX"
+expect_pass "release run: ...and recording nothing" test ! -e "$RSTATE"
 cp "$rs/state.b" "$RSTATE"
 pg push -q github :refs/tags/v0.9.0
-pg tag -d v0.9.0-gh > /dev/null
+pg tag -d v0.9.0-hand > /dev/null
 git --git-dir="$pf/github.git" update-ref refs/heads/main "$RG"
 pg fetch -q github
 # the real tag
-pg tag -s -m 'fil 0.9.0' v0.9.0-gh "$RG"
-pg push -q github v0.9.0-gh:refs/tags/v0.9.0
+pg tag -s -m 'fil 0.9.0' v0.9.0-hand "$RG"
+pg push -q github v0.9.0-hand:refs/tags/v0.9.0
 rl_kind 5 tag "done (checked)"
 rl_kind 6 tag-run next
-# after the tag, GitHub's main moves past R: with a commit only GitHub has, or (on Gitea's main too)
-# with a changed .github/release-signers, every run stops before acting: the steps from here on
-# verify against the signers on GitHub's main
+# after the tag, GitHub's main moves past R: with merges that keep R's .github/release-signers, the
+# run goes on (main moving on is normal once the dry run is dispatched); with a changed
+# release-signers, every run stops before acting: the steps from here on verify against the signers
+# on GitHub's main
 GMOVED=$(gh_move_main "$RG")
-expect_fail "release run: after the tag, GitHub's main past R with a commit only GitHub has stops the run" rl
+expect_fail "release run: after the tag, GitHub's main past R (a merge) does not stop the run" rl
 last
-expect_pass "release run: ...saying its commits must reach Gitea's main, not that the version is burned" sh -c 'grep -q "FAILED at step 6/17 tag-run" "$1" && grep -q "with commits Gitea.s main (origin/main) lacks" "$1" && ! grep -q "this version is burned" "$1" && ! grep -q "^preflight: " "$1"' sh "$rs/last.log"
+expect_pass "release run: ...it goes on to the tag's run (which never appears here)" sh -c 'grep -q "FAILED at step 6/17 tag-run" "$1" && grep -q "no release.yml run of the tag push" "$1" && ! grep -q "release-signers that differs" "$1"' sh "$rs/last.log"
 rls > "$rs/status.out" 2>&1 || true
-expect_pass "release status: ...and --status warns of it" grep -q "WARNING: github's main .* with commits Gitea's main (origin/main) lacks" "$rs/status.out"
+expect_pass "release status: ...and --status has no warning of it" sh -c '! grep -q "WARNING" "$1" && grep -q " 6/17 tag-run " "$1"' sh "$rs/status.out"
 RS_SIG=$({ pg show "$RG:.github/release-signers"; echo '# changed'; } | pg hash-object -w --stdin)
 RS_SIG=$({ pg ls-tree "$RG:.github" | awk -F '\t' '$2 != "release-signers"'; printf '100644 blob %s\trelease-signers\n' "$RS_SIG"; } | pg mktree)
 RS_SIG=$({ pg ls-tree "$RG" | awk -F '\t' '$2 != ".github"'; printf '040000 tree %s\t.github\n' "$RS_SIG"; } | pg mktree)
 RS_SIG=$(pg commit-tree "$RS_SIG" -p "$RG" -m signers)
 git --git-dir="$pf/github.git" fetch -q "$pf/clone" "+$RS_SIG:refs/heads/main"
-git --git-dir="$pf/origin.git" fetch -q "$pf/clone" "+$RS_SIG:refs/heads/main"
-expect_fail "release run: after the tag, GitHub's main (on Gitea's main) with another release-signers stops the run" rl
+expect_fail "release run: after the tag, GitHub's main with another release-signers stops the run" rl
 last
 expect_pass "release run: ...saying the signers differ from the release commit's, before the preflight runs" sh -c 'grep -q "FAILED at step 6/17 tag-run" "$1" && grep -q "has a .github/release-signers that differs from the release commit" "$1" && ! grep -q "^preflight: " "$1"' sh "$rs/last.log"
+expect_pass "release run: ...and that the tag binds R: the release commit's file goes back on main" grep -q "put the release commit's .github/release-signers back on main" "$rs/last.log"
+rls > "$rs/status.out" 2>&1 || true
+expect_pass "release status: ...and --status warns of it" grep -q "WARNING: github's main .* has a .github/release-signers that differs" "$rs/status.out"
 git --git-dir="$pf/github.git" update-ref refs/heads/main "$RG"
-git --git-dir="$pf/origin.git" update-ref refs/heads/main "$RR"
-pg fetch -q origin
 pg fetch -q github
 expect_fail "release run: --reset-state after the tag is refused" rl -- --reset-state
 last
@@ -3356,7 +3450,7 @@ expect_fail "release run: the tag's run never appears: fails at 6 after its poll
 last
 expect_pass "release run: ...saying so" sh -c 'grep -q "FAILED at step 6/17 tag-run" "$1" && grep -q "no release.yml run of the tag push" "$1"' sh "$rs/last.log"
 cp "$rs/last.log" "$rs/run.out"
-expect_pass "release run: ...recorded the tag object" grep -qx "tag_object=$(pg rev-parse v0.9.0-gh)" "$RSTATE"
+expect_pass "release run: ...recorded the tag object" grep -qx "tag_object=$(pg rev-parse v0.9.0-hand)" "$RSTATE"
 expect_pass "release run: ...and the preflight was bound to the release commit" grep -q 'HEAD is the bound release commit' "$rs/run.out"
 
 # 5: the tag's run and its draft (synthetic release files)
@@ -3473,7 +3567,7 @@ if [ $st = 0 ] && grep -q 'release: fil 0.9.0 is released' "$rs/run.out"; then p
 rls FAKE_CRATES_PUBLISHED="fil-shell fil-proto" 2>&1 | awk '$1 ~ /^[0-9]+\/17$/ { k = $3; if (k == "done") k = k " " $4; print $1, $2, k }' > "$rs/golden.out"
 cat > "$rs/golden" << 'EOF2'
 1/17 candidate done (checked)
-2/17 mirror done (checked)
+2/17 on-main done (checked)
 3/17 dry-run done (checked)
 4/17 dry-verify done (recorded)
 5/17 tag done (checked)
@@ -3500,7 +3594,7 @@ rm -f "$RSTATE"
 echo later > "$pf/clone/later2"
 pg add later2
 pg commit -q --no-gpg-sign -m later2
-pg push -q origin HEAD:main
+pg push -q github HEAD:main
 expect_fail "release run: a good tag on another tree than HEAD, nothing bound, fails" rl FAKE_CRATES_PUBLISHED="fil-shell fil-proto"
 last
 expect_pass "release run: ...not as burned" sh -c '! grep -qi "burned" "$1"' sh "$rs/last.log"
@@ -3513,7 +3607,8 @@ rl_kind 16 brew "done (checked)" "...and shows the whole release" FAKE_CRATES_PU
 rl_heads > "$rs/heads.after"
 expect_pass "release status: ...showing another commit leaves HEAD and every ref unchanged" cmp -s "$rs/heads.before" "$rs/heads.after"
 pg reset -q --hard "$RR"
-pg push -q -f origin "$RR:main"
+pg push -q -f github "$RR:main"
+pg fetch -q github
 rl FAKE_CRATES_PUBLISHED="fil-shell fil-proto" > /dev/null 2>&1 || true
 echo "dry_verify=ok 101 $RG 2026-11-09T12:00:00Z" >> "$RSTATE"
 # ---- the actions of steps 5-12 (PR 5): the tag, the tag's run and its draft, the verification
@@ -3525,7 +3620,7 @@ ra5_reset() {
   ra_reset
   rm -rf "$rs/world/releases" "$rs/world/next-release-id" "$RW/files" "$RW"/files.signed-* "$RW/verified" "$rs/reject-tag"
   mkdir "$rs/world/releases"
-  for t in v0.9.0 v0.9.0-gh; do pg tag -d "$t" > /dev/null 2>&1 || true; done
+  for t in v0.9.0 v0.9.0-hand; do pg tag -d "$t" > /dev/null 2>&1 || true; done
   rm -f "$rs/keys-locked"
   touch "$rs/tag-run-on-push"
 }
@@ -3546,23 +3641,28 @@ calls5_are() {
 RK=$rs/agentpub/key.pub
 st5() { rls FIL_RELEASE_KEY="$rs/agentpub/key" 2>&1 | awk '$1 ~ /^[0-9]+\/17$/ { k = $3; if (k == "done") k = k " " $4; print $1, $2, k }'; }
 
-# the happy path, in one invocation from the start (keys locked: unlocked once, up front), with
-# Gitea's marker tag owning v0.9.0 in the clone (the local name is then v0.9.0-gh)
+# a local v0.9.0 this command did not make (0.1.0 and 0.2.0's Gitea marker tags were such): the
+# tag step refuses it, and nothing is pushed
+ra5_reset
+pg tag -a -m marker v0.9.0 "$RR"
+r5 "release draft: a local v0.9.0 that is not this release's: refused at 5" 1 'FAILED at step 5/17 tag' <<< "0.9.0"
+expect_pass "release draft: ...saying how to remove it, with nothing pushed" sh -c 'grep -q "the local tag v0.9.0 exists and is not this release.s" "$1" && grep -q "git tag -d v0.9.0" "$1" && ! grep -q "^push refs/tags/" "$2"' sh "$rs/ra.out" "$rs/calls.log"
+pg tag -d v0.9.0 > /dev/null
+# the happy path, in one invocation from the start (keys locked: unlocked once, up front)
 ra5_reset
 : > "$rs/keys-locked"
-pg tag -a -m marker v0.9.0 "$RR"
 r5 "release draft: the happy path, one invocation from the start through verify-signed, paused at 13 publish" 2 'PAUSED at step 13/17 publish' <<< "0.9.0"
-calls_are 1 3 0 3
+calls_are 0 3 0 3
 calls5_are 1 1 0 1 3 1 1
-expect_pass "release draft: ...one tag confirmation (it covers the mirror and the tag), then the publish one, unanswered" sh -c 'test "$(grep -c "release: CONFIRM " "$1")" = 2 && test "$(grep -c "release: CONFIRM tag" "$1")" = 1 && grep -q "release: CONFIRM publish" "$1"' sh "$rs/ra.out"
-expect_pass "release draft: ...the keys unlocked once, up front, all three" sh -c 'test "$(grep -c "^keys unlock " "$1")" = 1 && grep -qx "keys unlock --need ssh,gpg,apple --ttl 8h" "$1" && test "$(grep -n "^keys unlock" "$1" | cut -d: -f1)" -lt "$(grep -n "^push refs/heads/main" "$1" | cut -d: -f1)"' sh "$rs/calls.log"
+expect_pass "release draft: ...one tag confirmation (at step 5), then the publish one, unanswered" sh -c 'test "$(grep -c "release: CONFIRM " "$1")" = 2 && test "$(grep -c "release: CONFIRM tag" "$1")" = 1 && grep -q "release: CONFIRM publish" "$1"' sh "$rs/ra.out"
+expect_pass "release draft: ...the keys unlocked once, up front, all three" sh -c 'test "$(grep -c "^keys unlock " "$1")" = 1 && grep -qx "keys unlock --need ssh,gpg,apple --ttl 8h" "$1" && test "$(grep -n "^keys unlock" "$1" | cut -d: -f1)" -lt "$(grep -n "^push refs/tags/v0.9.0" "$1" | cut -d: -f1)"' sh "$rs/calls.log"
 RG5=$(git --git-dir="$pf/github.git" rev-parse refs/heads/main)
 git init -q --bare "$rs/tagchk"
 git -C "$rs/tagchk" fetch -q "$pf/github.git" "+refs/tags/v0.9.0:refs/tags/v0.9.0" "+refs/heads/main:refs/remotes/origin/main"
 expect_pass "release draft: ...the tag on GitHub verifies against the signers on main" "$RELEASE_DIR/verify-tag.sh" "$rs/tagchk" v0.9.0
-expect_pass "release draft: ...names the release commit, and is the local v0.9.0-gh (Gitea's marker kept v0.9.0)" sh -c 'test "$(git -C "$1" rev-parse "refs/tags/v0.9.0^{commit}")" = "$2" && test "$(git -C "$3" rev-parse refs/tags/v0.9.0-gh)" = "$(git -C "$1" rev-parse refs/tags/v0.9.0)" && test "$(git -C "$3" rev-parse "refs/tags/v0.9.0^{commit}")" = "$4" && test "$2" = "$4"' sh "$rs/tagchk" "$RG5" "$pf/clone" "$RR"
+expect_pass "release draft: ...names the release commit, and is the clone's local v0.9.0 (GitHub's name)" sh -c 'test "$(git -C "$1" rev-parse "refs/tags/v0.9.0^{commit}")" = "$2" && test "$(git -C "$3" rev-parse refs/tags/v0.9.0)" = "$(git -C "$1" rev-parse refs/tags/v0.9.0)" && test "$2" = "$4" && ! git -C "$3" rev-parse -q --verify refs/tags/v0.9.0-gh > /dev/null' sh "$rs/tagchk" "$RG5" "$pf/clone" "$RR"
 rm -rf "$rs/tagchk"
-expect_pass "release draft: ...recorded the tag object and the tag's run" sh -c 'grep -qx "tag_object=$(git -C "$2" rev-parse refs/tags/v0.9.0-gh)" "$1" && grep -qx tag_run=104 "$1"' sh "$RSTATE" "$pf/clone"
+expect_pass "release draft: ...recorded the tag object and the tag's run" sh -c 'grep -qx "tag_object=$(git -C "$2" rev-parse refs/tags/v0.9.0)" "$1" && grep -qx tag_run=104 "$1"' sh "$RSTATE" "$pf/clone"
 expect_pass "release draft: ...verified before signing and after, the second reusing the rebuild" sh -c 'grep -qx "verify 0.9.0 --pre-sign --repo o/r" "$1" && grep -qx "verify 0.9.0 --repo o/r --reuse-rebuild" "$1" && grep -qx "sign-macos 0.9.0 --repo o/r" "$1" && grep -qx "sign-packages 0.9.0 $2" "$1"' sh "$rs/calls.log" "$RW/files"
 expect_pass "release draft: ...uploaded the five signed files, once" grep -qx 'release upload v0.9.0 --repo o/r --clobber fil-0.9.0-1.x86_64.rpm fil-0.9.0-1.aarch64.rpm SHA256SUMS SHA256SUMS.asc SHA256SUMS.sig' "$pf/gh.log"
 expect_pass "release draft: ...SHA256SUMS.sig verifies with the release key" sh -c 'printf "release namespaces=\"fil-release\" %s\n" "$(cut -d" " -f1,2 "$1")" > "$3.signers"; ssh-keygen -Y verify -f "$3.signers" -I release -n fil-release -s "$2/SHA256SUMS.sig" < "$2/SHA256SUMS" > /dev/null 2>&1' sh "$RK" "$rs/world/releases/1/assets" "$rs/tmp5"
@@ -3570,7 +3670,7 @@ expect_pass "release draft: ...one log per step that acted" sh -c 'for n in 05-t
 st5 > "$rs/golden5.out"
 cat > "$rs/golden5" << 'EOF2'
 1/17 candidate done (checked)
-2/17 mirror done (checked)
+2/17 on-main done (checked)
 3/17 dry-run done (checked)
 4/17 dry-verify done (recorded)
 5/17 tag done (checked)
@@ -3591,7 +3691,7 @@ expect_pass "release status: the listing after verify-signed matches its golden"
 r5 "release draft: the same command again does nothing new" 2 'PAUSED at step 13/17 publish' < /dev/null
 calls5_are 1 1 0 1 3 1 1
 rl -- --lock-keys > "$rs/lk.out" 2>&1 && st=0 || st=$?
-expect_pass "release draft: --lock-keys forgets the keys (release-keys.sh forget), exit 0, and acts on nothing" sh -c 'test "$3" = 0 && grep -qx "keys forget --need ssh,gpg" "$1" && test "$(grep -c "^push " "$1")" = 2 && ! grep -q "PAUSED\|FAILED" "$2"' sh "$rs/calls.log" "$rs/lk.out" "$st"
+expect_pass "release draft: --lock-keys forgets the keys (release-keys.sh forget), exit 0, and acts on nothing" sh -c 'test "$3" = 0 && grep -qx "keys forget --need ssh,gpg" "$1" && test "$(grep -c "^push " "$1")" = 1 && ! grep -q "PAUSED\|FAILED" "$2"' sh "$rs/calls.log" "$rs/lk.out" "$st"
 rm -f "$rs/keys-locked"
 
 # a failure injected at each of steps 5-12, then the same command again: each resumes at its step,
@@ -3601,20 +3701,20 @@ touch "$rs/reject-tag"
 r5 "release draft: a refused tag push fails at 5" 1 'FAILED at step 5/17 tag' <<< "0.9.0"
 expect_pass "release draft: ...with the known fix for the tag ruleset" grep -q 'the v\* tag ruleset' "$rs/ra.out"
 calls5_are 0 0 0 0 1 0 0
-LT=$(pg rev-parse refs/tags/v0.9.0-gh)
-expect_pass "release draft: ...the local tag is v0.9.0-gh even with no marker in the clone (v0.9.0 is left to Gitea's)" sh -c '! git -C "$1" rev-parse -q --verify refs/tags/v0.9.0 > /dev/null' sh "$pf/clone"
+LT=$(pg rev-parse refs/tags/v0.9.0)
+expect_pass "release draft: ...the local tag is v0.9.0, GitHub's name (no v0.9.0-gh)" sh -c '! git -C "$1" rev-parse -q --verify refs/tags/v0.9.0-gh > /dev/null' sh "$pf/clone"
 rm -f "$rs/reject-tag"
 r5 "release draft: ...the same command again asks for the tag again (the confirmation is not kept), EOF: paused" 2 'PAUSED at step 5/17 tag' < /dev/null
 expect_pass "release draft: ...it showed the tag's confirmation" sh -c 'grep -q "CONFIRM tag, for 0.9.0" "$1" && grep -q "step 5 tag: the tag v0.9.0 on the release commit" "$1"' sh "$rs/ra.out"
 expect_pass "release draft: ...and nothing in the state says it was confirmed" sh -c '! grep -qi "confirm" "$1"' sh "$RSTATE"
 calls5_are 0 0 0 0 1 0 0
 r5 "release draft: ...confirmed: the tag is pushed; its publish fails, the rerun declined: fails at 6" 1 'FAILED at step 6/17 tag-run' FAKE_TAG_RUN_FAIL=publish <<< "$(printf '0.9.0\nn')"
-expect_pass "release draft: ...the tag pushed is the one the refused run made (reused, not made again)" sh -c 'test "$(git --git-dir="$1" rev-parse refs/tags/v0.9.0)" = "$2" && grep -q "reusing the local tag v0.9.0-gh" "$3"' sh "$pf/github.git" "$LT" "$RW/logs/05-tag.log"
+expect_pass "release draft: ...the tag pushed is the one the refused run made (reused, not made again)" sh -c 'test "$(git --git-dir="$1" rev-parse refs/tags/v0.9.0)" = "$2" && grep -q "reusing the local tag v0.9.0 " "$3"' sh "$pf/github.git" "$LT" "$RW/logs/05-tag.log"
 expect_pass "release draft: ...the rerun offer named the stale draft" grep -q 'deleting first the stale draft(s) 1 that the failed attempt left' "$rs/ra.out"
 calls5_are 1 1 0 0 1 0 0
 r5 "release draft: ...again, the rerun accepted: the stale draft deleted first; then the VM is down at 7" 1 'FAILED at step 7/17 verify-presign' FAKE_TAG_RUN_FAIL=publish FAKE_VERIFY_FAIL=lima <<< "y"
 expect_pass "release draft: ...one release of the tag left, the second draft" sh -c 'test "$(ls "$1")" = 2' sh "$rs/world/releases"
-calls_are 1 3 1 2
+calls_are 0 3 1 2
 calls5_are 1 2 1 0 2 0 0
 r5 "release draft: ...again: Apple rejects the notarization at 8" 1 'FAILED at step 8/17 sign-macos' FAKE_SIGN_FAIL=macos < /dev/null
 expect_pass "release draft: ...with the known fix" grep -q 'Apple rejected the notarization' "$rs/ra.out"
@@ -3636,7 +3736,7 @@ calls5_are 1 2 1 2 4 2 2
 r5 "release draft: ...again: verify-signed passes, paused at 13" 2 'PAUSED at step 13/17 publish' < /dev/null
 calls5_are 1 2 1 2 5 2 2
 r5 "release draft: ...and once more: nothing is repeated" 2 'PAUSED at step 13/17 publish' < /dev/null
-calls_are 1 3 1 5
+calls_are 0 3 1 5
 calls5_are 1 2 1 2 5 2 2
 st5 > "$rs/golden5.out"
 expect_pass "release status: ...the same listing as the happy path's" diff "$rs/golden5" "$rs/golden5.out"
@@ -3693,10 +3793,10 @@ cp "$pf/gh.log" "$rs/gh5.log"
 # the waiver of red suite=all checks (F5): offered only at a terminal, only with the dry run green,
 # recorded with the run ids and attempts, and honored for exactly those
 ra5_reset
-r5 "release waiver: a red linux-check, the rerun declined, waived: on to the tag" 2 'PAUSED at step 5/17 tag' FAKE_RUN_FAIL=linux-check.yml -- --confirm-each <<< "$(printf '0.9.0\nn\ny')"
+r5 "release waiver: a red linux-check, the rerun declined, waived: on to the tag" 2 'PAUSED at step 5/17 tag' FAKE_RUN_FAIL=linux-check.yml -- --confirm-each <<< "$(printf 'n\ny')"
 expect_pass "release waiver: ...it asked whether they block the release" grep -q 'waive them, i.e. they do NOT block the release' "$rs/ra.out"
 expect_pass "release waiver: ...recorded the failed run and its attempt, nothing for macos-check" grep -Eqx 'checks_waived=102\.1 - [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z' "$RSTATE"
-calls_are 1 3 0 1
+calls_are 0 3 0 1
 rl_kind 3 dry-run "done (waived)"
 expect_pass "release waiver: ...--status names the waived run" grep -q 'WAIVED by you .*linux-check run 102' "$rs/status.out"
 rl_kind 4 dry-verify "done (recorded)" "with the waiver"
@@ -3718,30 +3818,29 @@ printf '3/17 dry-run done (waived)\n4/17 dry-verify done (recorded)\n5/17 tag ne
 expect_pass "release status: the waiver's listing matches its golden" diff "$rs/goldenw" "$rs/goldenw.out"
 # --redo dry-run before the tag: new runs, the waiver and dry-verify forgotten
 r5 "release redo: --redo dry-run before the tag: three new runs and a new dry-verify" 2 'PAUSED at step 5/17 tag' -- --redo dry-run < /dev/null
-calls_are 1 6 0 2
+calls_are 0 6 0 2
 expect_pass "release redo: ...the waiver is gone and the new runs are recorded" sh -c '! grep -q "^checks_waived=" "$1" && grep -qx dry_run=104 "$1" && grep -qx checks_linux=105 "$1" && grep -q "^dry_verify=ok 104 " "$1"' sh "$RSTATE"
 rl_kind 3 dry-run "done (checked)" "after --redo"
 r5 "release redo: --redo upload before the tag: nothing to redo" 1 '--redo upload: the step is not done' -- --redo upload < /dev/null
-# the waiver in the default mode: the tag confirmation given before the mirror did not know of it,
-# so step 5 asks again, listing it
+# the waiver in the default mode: the tag's confirmation, at step 5, after it, lists it
 ra5_reset
-r5 "release waiver: default mode: waived after the tag confirmation, which step 5 then asks again" 2 'PAUSED at step 5/17 tag' FAKE_RUN_FAIL=linux-check.yml <<< "$(printf '0.9.0\nn\ny')"
-expect_pass "release waiver: ...two tag confirmations, the second naming the waiver, nothing pushed" sh -c 'test "$(grep -c "CONFIRM tag, for 0.9.0" "$1")" = 2 && grep -q "the red suite=all checks you waived: 102\.1 -" "$1" && ! grep -q "^push refs/tags/" "$2"' sh "$rs/ra.out" "$rs/calls.log"
+r5 "release waiver: default mode: waived, then the tag's confirmation" 2 'PAUSED at step 5/17 tag' FAKE_RUN_FAIL=linux-check.yml <<< "$(printf 'n\ny')"
+expect_pass "release waiver: ...one tag confirmation, naming the waiver, nothing pushed" sh -c 'test "$(grep -c "CONFIRM tag, for 0.9.0" "$1")" = 1 && grep -q "the red suite=all checks you waived: 102\.1 -" "$1" && ! grep -q "^push refs/tags/" "$2"' sh "$rs/ra.out" "$rs/calls.log"
 # a matrix leg of the tag's run fails while the run goes on: waited for, the rerun offered once it
 # has completed
 r5 "release tag-run: a leg fails mid-run: waited for, then the rerun declined: fails at 6" 1 'FAILED at step 6/17 tag-run' FAKE_TAG_RUN_FAIL=leg <<< "$(printf '0.9.0\nn')"
 expect_pass "release tag-run: ...it said it waits for the run to finish, before offering the rerun" sh -c 'a=$(grep -n "waiting for the run to finish before offering a rerun" "$1" | cut -d: -f1 | head -n 1); b=$(grep -n "re-run its failed jobs" "$1" | cut -d: -f1 | head -n 1); test -n "$a" && test -n "$b" && test "$a" -lt "$b"' sh "$rs/ra.out"
 r5 "release tag-run: ...the rerun accepted (of a completed run): on to 13" 2 'PAUSED at step 13/17 publish' <<< "y"
-calls_are 1 3 1 3
+calls_are 0 3 1 3
 # no terminal at the red checks: paused (exit 2), nothing waived
 ra5_reset
-r5 "release waiver: a red check, no answer at the prompts: failed at 3, nothing waived" 1 'FAILED at step 3/17 dry-run' FAKE_RUN_FAIL=linux-check.yml -- --confirm-each <<< "0.9.0"
+r5 "release waiver: a red check, no answer at the prompts: failed at 3, nothing waived" 1 'FAILED at step 3/17 dry-run' FAKE_RUN_FAIL=linux-check.yml -- --confirm-each < /dev/null
 expect_pass "release waiver: ...said not waived" grep -q 'not re-run, not waived' "$rs/ra.out"
 r5 "release waiver: ...again without a terminal: paused, exit 2" 2 'PAUSED at step 3/17 dry-run' FIL_RELEASE_TTY= < /dev/null
 expect_pass "release waiver: ...no prompt shown, nothing recorded" sh -c '! grep -q "waive them" "$1" && ! grep -q "^checks_waived=" "$2"' sh "$rs/ra.out" "$RSTATE"
 # a red dry run (release.yml) is never offered the waiver
 ra5_reset
-r5 "release waiver: a red release.yml dry run: failed at 3, no waiver offered" 1 'FAILED at step 3/17 dry-run' FAKE_RUN_FAIL=release.yml -- --confirm-each <<< "$(printf '0.9.0\nn\ny')"
+r5 "release waiver: a red release.yml dry run: failed at 3, no waiver offered" 1 'FAILED at step 3/17 dry-run' FAKE_RUN_FAIL=release.yml -- --confirm-each <<< "$(printf 'n\ny')"
 expect_pass "release waiver: ...no prompt shown, nothing recorded" sh -c '! grep -q "waive them" "$1" && ! grep -q "^checks_waived=" "$2"' sh "$rs/ra.out" "$RSTATE"
 rm -f "$rs/tag-run-on-push"
 
@@ -3787,7 +3886,7 @@ json.dump(r, open(p, "w"))' "$rs/world/runs/$1.json" "${@:2}"
 r6_reset
 : > "$rs/keys-locked"
 r5 "release publish: the happy path, one invocation from the start through finish: exit 0" 0 '^release: fil 0.9.0 is released$' <<< "$(printf '0.9.0\n0.9.0')"
-calls_are 1 3 0 4
+calls_are 0 3 0 4
 calls5_are 1 1 0 1 4 1 1
 calls6_are 1 1 2 1
 cp "$rs/ra.out" "$rs/happy6.out"
@@ -3899,7 +3998,7 @@ expect_pass "release finish: ...with the known fix" grep -q 'tests/release/just.
 r5 "release finish: ...again: exit 0" 0 'fil 0.9.0 is released' < /dev/null
 r5 "release brew: --redo brew after the failed install test: installs, pushes nothing, asks nothing" 0 'is released' -- --redo brew < /dev/null
 expect_pass "release brew: ...installed this time" sh -c 'test "$(grep -c "^brew install o/tap/fil$" "$1")" = 2 && ! grep -q "release: CONFIRM" "$2"' sh "$rs/calls.log" "$rs/ra.out"
-calls_are 1 3 1 5
+calls_are 0 3 1 5
 calls6_are 1 2 2 1
 st5 > "$rs/golden6.out"
 expect_pass "release status: ...the same listing as the happy path's" diff "$rs/golden6" "$rs/golden6.out"

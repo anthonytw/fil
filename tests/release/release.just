@@ -139,9 +139,9 @@ release-verify version *args:
     tests/release/verify.sh "$@"
 
 # Everything a release needs, checked before anything is done (docs/m4/release.md section 9.4):
-# the tools, disk, a clean HEAD at Gitea's main, the version and changelog, the lockfiles, GitHub's
-# main, gh and ssh as the owner, commit signing, the crates-io environment, the tag ruleset, the
-# version still free, Docker, the VM (Rosetta), the release and package keys (present, not unlocked)
+# the tools, disk, a clean HEAD at GitHub's main, the version and changelog, the lockfiles, GitHub's
+# main (the release commit on it), gh and ssh as the owner, commit signing, the crates-io
+# environment, the tag ruleset, the version still free, Docker, the VM (Rosetta), the release and package keys (present, not unlocked)
 # and the Developer ID. Read-only; each failure says what it catches and what to do.
 # `--from STEP` checks only what STEP and later steps need; `--list` shows the map.
 [positional-arguments]
@@ -152,10 +152,11 @@ release-preflight version *args:
 # The one-command release (docs/m4/release.md section 9.5): binds the run to VERSION and HEAD, takes
 # the lock, works out from the world (git refs, GitHub's runs and releases, crates.io, the tap) which
 # of the seventeen steps are done, runs the preflight for the rest, unlocks the keys, then does every
-# step that is left: the mirror (GitHub's main fast-forwarded to the release commit) and the tag
-# (after one typed confirmation); the dry run and the suite=all checks, with a waiver of red checks
-# asked at a terminal; the dry run's verification; the tag's run and its draft; the verification,
-# the macOS, package and SHA256SUMS signatures, the upload and the verification after it; then
+# step that is left: the check that the release commit is on GitHub's main (nothing pushes main);
+# the dry run and the suite=all checks, with a waiver of red checks asked at a terminal; the dry
+# run's verification; the tag (after one typed confirmation); the tag's run and its draft; the
+# verification, the macOS, package and SHA256SUMS signatures, the upload and the verification after
+# it; then
 # (after the second confirmation) publish, the verification of what is published, the crates-io
 # deployment's approval, the Homebrew tap and its install test; and finish (the AUR PKGBUILD, the
 # coordinator's copy, the keys forgotten). Re-run it after any failure; `--redo STEP` does a done

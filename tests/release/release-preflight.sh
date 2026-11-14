@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # `tests/release/just.sh release-preflight X.Y.Z`: everything a release needs, checked before anything is done
-# (docs/m4/release.md section 9.4). Read-only: it changes nothing in the clone, on GitHub or on
-# Gitea, and pulls nothing. Its traces: the crates the lockfiles name, fetched into the cargo cache
+# (docs/m4/release.md section 9.4). Read-only: it changes nothing in the clone or on GitHub, and
+# pulls nothing. Its traces: the crates the lockfiles name, fetched into the cargo cache
 # (outside the clone) when it lacks them; a dangling signed commit object (the commit-signing check:
 # `git commit-tree -S` of the empty tree), which `git gc` removes; in the VM, a removed container,
 # run only from the cross image if it is already there; and the keychain's "Always Allow" for
@@ -9,26 +9,32 @@
 # starts Docker or the VM; it says how.
 #
 #   release-preflight.sh VERSION [--from STEP] [--only CHECK[,CHECK...]] [--commit SHA]
-#                                [--repo OWNER/REPO] [--vm NAME] [--origin REMOTE] [--github REMOTE]
+#                                [--repo OWNER/REPO] [--vm NAME] [--github REMOTE]
 #   release-preflight.sh --list
 #
 #   --from STEP    only the checks that STEP and the steps after it need (default: the first step,
 #                  so every check). The steps are those of `tests/release/just.sh release` (PR 3; `--list` shows the
 #                  map): a resume at `crates` does not need the VM.
 #   --only CHECKS  exactly these checks (comma-separated), plus the override check, which always runs.
-#   --commit SHA   the release commit R the run is bound to: HEAD must be R, and R on --origin's main
-#                  (main may have moved on). Without it, HEAD must BE --origin's main, as before the
+#   --commit SHA   the release commit R the run is bound to: HEAD must be R, and R on GitHub's main
+#                  (main may have moved on). Without it, HEAD must BE GitHub's main, as before the
 #                  tag; a --from step after `tag` without --commit binds to HEAD.
+#   --github REMOTE  the clone's remote for GitHub (default: the remote whose URL is github.com's
+#                  OWNER/REPO, whatever its name: `origin` once GitHub is the home, `github` before).
+#
+# GitHub is the release's only remote: the release commit is on GitHub's main, the tag is pushed
+# there, and everything is verified against the signers on GitHub's main. Gitea (a backup mirror of
+# GitHub, fed by a launchd job on the Mac) is never read or written: nothing here depends on it.
 #
 # Every failure names the 0.1.0 class of trouble it catches and the exact fix. All checks run (a
 # failure does not stop the rest), except the override check, which is fatal. Exit 0 when nothing
 # failed (warnings are printed), 1 otherwise.
 #
-# Not here: the Gitea CI status of R (owner 2026-11-09: skipped, main is handed over green) and the
+# Not here: any CI status of R (owner 2026-11-09: skipped, main is handed over green) and the
 # key UNLOCKS (`release-keys.sh`, PR 2). This only checks that the keys exist and are listed.
 #
 # Sourcing (for release.sh): `source release-preflight.sh` defines the functions and runs nothing.
-# Then `pf_init VERSION`, optionally set PF_REPO, PF_VM, PF_ORIGIN, PF_GITHUB, PF_COMMIT (the bound
+# Then `pf_init VERSION`, optionally set PF_REPO, PF_VM, PF_GITHUB, PF_COMMIT (the bound
 # release commit: set it once the tag exists, from the state's release_commit), PF_AGAIN
 # (the "then" line of each failure), PF_LOCK_OWNER (the pid holding the release lock: the caller's,
 # default $$), and `pf_run $(pf_checks_from STEP)` or `pf_run CHECK...`; it
@@ -59,13 +65,13 @@ PF_OVERRIDES=$(printf '%s\n' $TEST_OVERRIDES | grep -vx FIL_RELEASE_SELFTEST | t
 # The checks, in the order they run.
 PF_CHECKS="overrides tools lock disk tree recipes version lockfiles github-main gh github-ssh commit-signing crates-env tag-ruleset tag-free docker vm release-key package-key apple"
 # The steps of `tests/release/just.sh release` (docs: the design's section 5), in order.
-PF_STEPS="candidate mirror dry-run dry-verify tag tag-run verify-presign sign-macos sign-packages sign-sums upload verify-signed publish verify-published crates brew finish"
+PF_STEPS="candidate on-main dry-run dry-verify tag tag-run verify-presign sign-macos sign-packages sign-sums upload verify-signed publish verify-published crates brew finish"
 
 # pf_step_checks STEP: the checks STEP needs (besides the ones every invocation runs).
 pf_step_checks() {
   case $1 in
     candidate) echo "version lockfiles" ;;
-    mirror) echo "github-main gh github-ssh release-key" ;;
+    on-main) echo "github-main" ;;
     dry-run) echo "gh" ;;
     dry-verify) echo "docker vm" ;;
     tag) echo "tag-free tag-ruleset crates-env release-key github-ssh gh" ;;
@@ -145,7 +151,7 @@ pf_tool() {
 }
 
 # ---- reporting (the settings default to empty until pf_init: the script runs under set -u)
-PF_FAILS=0 PF_CUR='' PF_CARGO_FETCH=${PF_CARGO_FETCH:-1} PF_LOCK_OWNER=${PF_LOCK_OWNER:-$$} PF_AGAIN=${PF_AGAIN:-} PF_COMMIT=${PF_COMMIT:-} PF_REPO=${PF_REPO:-} PF_VM=${PF_VM:-} PF_ORIGIN=${PF_ORIGIN:-} PF_GITHUB=${PF_GITHUB:-} PF_R='' PF_G=''
+PF_FAILS=0 PF_CUR='' PF_CARGO_FETCH=${PF_CARGO_FETCH:-1} PF_LOCK_OWNER=${PF_LOCK_OWNER:-$$} PF_AGAIN=${PF_AGAIN:-} PF_COMMIT=${PF_COMMIT:-} PF_REPO=${PF_REPO:-} PF_VM=${PF_VM:-} PF_GITHUB=${PF_GITHUB:-} PF_R='' PF_G=''
 pf_ok() { echo "preflight: ok    $PF_CUR: $*" >&2; }
 pf_note() { echo "preflight: note  $PF_CUR: $*" >&2; }
 pf_warn() { echo "preflight: WARN  $PF_CUR: $*" >&2; }
@@ -167,8 +173,7 @@ pf_init() {
   PF_TAG=v$PF_VERSION
   PF_REPO=${PF_REPO:-anthonytw/fil}
   PF_VM=${PF_VM:-${FIL_VM:-fil}}
-  PF_ORIGIN=${PF_ORIGIN:-origin}
-  PF_GITHUB=${PF_GITHUB:-github}
+  PF_GITHUB=${PF_GITHUB:-$(pf_github_remote || true)}
   PF_COMMIT=${PF_COMMIT:-}
   PF_AGAIN=${PF_AGAIN:-just release-preflight $PF_VERSION}
   PF_KEY=${FIL_RELEASE_KEY:-$HOME/.ssh/fil-release}
@@ -178,6 +183,87 @@ pf_init() {
 }
 
 pf_git() { git -C "$ROOT" "$@"; }
+
+# pf_url_is_repo URL OWNER/REPO: URL (as configured, before any insteadOf) names OWNER/REPO on
+# github.com: ssh://[user@]github.com[:22]/O/R, https://[user@]github.com[:443]/O/R or the scp form
+# [user@]github.com:O/R, with or without .git or a trailing slash, in any case (GitHub's names are
+# not case-sensitive). The host is parsed: userinfo is stripped only inside the authority (so
+# https://evil.com/@github.com/O/R is evil.com), and a bare github.com/O/R (a local path to git) is
+# no URL.
+pf_url_is_repo() {
+  local u want rest auth path
+  u=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  want=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+  case $u in
+    ssh://* | git+ssh://* | https://*)
+      rest=${u#*://}
+      case $rest in */*) ;; *) return 1 ;; esac
+      auth=${rest%%/*} path=${rest#*/}
+      case $auth in *@*) auth=${auth##*@} ;; esac
+      case $u:$auth in
+        https://*:github.com | https://*:github.com:443) ;;
+        *ssh://*:github.com | *ssh://*:github.com:22) ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *://*) return 1 ;;
+    *:*)
+      # scp form: [user@]host:path, the host before any '/' (a ':' after a '/' is a local path)
+      auth=${u%%:*} path=${u#*:}
+      case $auth in */*) return 1 ;; esac
+      case $auth in *@*) auth=${auth#*@} ;; esac
+      [ "$auth" = github.com ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  path=${path%/}
+  path=${path%.git}
+  [ -n "$want" ] && [ "$path" = "$want" ]
+}
+# pf_remote_is_repo NAME: the clone's remote NAME reads from and pushes to github.com's PF_REPO and
+# nowhere else: every remote.NAME.url and remote.NAME.pushurl names it (git fetches from the first
+# url and pushes to all of them, or to the pushurls), and the URLs git fetches from are exactly the
+# ones it pushes to after any rewriting (git remote get-url --all and --push --all: catches a
+# url.*.pushInsteadOf; an insteadOf rewrites both alike).
+pf_remote_is_repo() {
+  local n=$1 u any=0 fetch push
+  while IFS= read -r u; do
+    any=1
+    pf_url_is_repo "$u" "$PF_REPO" || return 1
+  done < <(pf_git config --get-all "remote.$n.url" 2> /dev/null || true)
+  [ "$any" = 1 ] || return 1
+  while IFS= read -r u; do
+    pf_url_is_repo "$u" "$PF_REPO" || return 1
+  done < <(pf_git config --get-all "remote.$n.pushurl" 2> /dev/null || true)
+  fetch=$(pf_git remote get-url --all "$n" 2> /dev/null) || return 1
+  push=$(pf_git remote get-url --push --all "$n" 2> /dev/null) || return 1
+  [ -n "$fetch" ] && [ "$fetch" = "$push" ]
+}
+# pf_github_remote: the name of the clone's remote for GitHub's PF_REPO, found by its URLs
+# (pf_remote_is_repo), not its name (`github` while Gitea was the home, `origin` since GitHub is):
+# `origin` if it is one, else the first that is. Fails (prints nothing) when no remote is.
+pf_github_remote() {
+  local n found=''
+  for n in $(pf_git remote 2> /dev/null); do
+    pf_remote_is_repo "$n" || continue
+    [ "$n" != origin ] || { echo origin; return 0; }
+    [ -n "$found" ] || found=$n
+  done
+  [ -n "$found" ] || return 1
+  echo "$found"
+}
+# pf_need_github: there is a GitHub remote (pf_fail, and 1, if not).
+pf_need_github() {
+  if [ -z "$PF_GITHUB" ]; then
+    pf_fail "no remote of the clone is github.com's $PF_REPO (its fetch and push URLs all github.com's, and nothing else)" - "git remote add origin git@github.com:$PF_REPO.git (or fix the remote: git remote -v; git config --get-regexp '^remote\\.|insteadof')"
+    return 1
+  fi
+  # a remote named by --github is held to the same rule (only the self-test may name a local path)
+  if ! pf_remote_is_repo "$PF_GITHUB" && [ "${FIL_RELEASE_SELFTEST:-}" != 1 ]; then
+    pf_fail "the remote '$PF_GITHUB' is not github.com's $PF_REPO alone (every url and pushurl, and where git really fetches and pushes, must be)" - "git remote -v; name the remote whose fetch and push URLs are all git@github.com:$PF_REPO.git (or leave --github out: it is found by its URL)"
+    return 1
+  fi
+}
 
 # ---- the checks. Each prints its findings and returns 1 if it failed (pf_fail was called).
 
@@ -287,9 +373,11 @@ pf_check_tree() {
     pf_fail "the clone has uncommitted changes to tracked files" - "git status; commit them on a branch or discard them (git restore .), then check out main"
     bad=1
   fi
-  main=$(pf_git ls-remote --exit-code "$PF_ORIGIN" refs/heads/main 2> /dev/null | awk '{ print $1 }') || main=''
-  if [ -z "$main" ]; then
-    pf_fail "cannot read main on remote '$PF_ORIGIN' (Gitea)" - "check the remote: git remote -v; git ls-remote $PF_ORIGIN main"
+  main=''
+  if ! pf_need_github; then
+    bad=1
+  elif ! main=$(pf_git ls-remote --exit-code "$PF_GITHUB" refs/heads/main 2> /dev/null | awk '{ print $1 }') || [ -z "$main" ]; then
+    pf_fail "cannot read main on remote '$PF_GITHUB' (GitHub)" - "check the remote: git remote -v; git ls-remote $PF_GITHUB main"
     bad=1
   elif [ -n "$PF_COMMIT" ]; then
     # Bound (the tag exists): HEAD is the release commit, which is on main; main may have moved on.
@@ -297,19 +385,19 @@ pf_check_tree() {
       pf_fail "HEAD ($head) is not the release commit this run is bound to ($PF_COMMIT)" - "git checkout $PF_COMMIT (a new commit after the tag is a new version)"
       bad=1
     elif ! pf_git cat-file -e "$main^{commit}" 2> /dev/null; then
-      pf_fail "$PF_ORIGIN's main ($main) is not in the clone" - "git fetch $PF_ORIGIN"
+      pf_fail "$PF_GITHUB's main ($main) is not in the clone" - "git fetch $PF_GITHUB"
       bad=1
     elif ! pf_git merge-base --is-ancestor "$PF_COMMIT" "$main"; then
-      pf_fail "the release commit $PF_COMMIT is not on $PF_ORIGIN's main ($main)" - "check out the commit the tag was made from; a commit that is not on main is not a release"
+      pf_fail "the release commit $PF_COMMIT is not on $PF_GITHUB's main ($main)" - "check out the commit the tag was made from; a commit that is not on main is not a release"
       bad=1
     fi
   elif [ "$head" != "$main" ]; then
-    pf_fail "HEAD ($head) is not $PF_ORIGIN's main ($main)" - "git fetch $PF_ORIGIN && git checkout main && git merge --ff-only $PF_ORIGIN/main"
+    pf_fail "HEAD ($head) is not $PF_GITHUB's main ($main)" - "git fetch $PF_GITHUB && git checkout main && git merge --ff-only $PF_GITHUB/main"
     bad=1
   fi
   PF_R=$head
   if [ "$bad" = 0 ]; then
-    if [ -n "$PF_COMMIT" ]; then pf_ok "clean, HEAD is the bound release commit $head, on $PF_ORIGIN's main"; else pf_ok "clean, HEAD is $PF_ORIGIN's main: release commit $head"; fi
+    if [ -n "$PF_COMMIT" ]; then pf_ok "clean, HEAD is the bound release commit $head, on $PF_GITHUB's main"; else pf_ok "clean, HEAD is $PF_GITHUB's main: release commit $head"; fi
   fi
   return "$bad"
 }
@@ -321,7 +409,7 @@ pf_check_recipes() {
     pf_ok "${out#recipes: }"
   else
     pf_fail "$(printf '%s' "$out" | sed 's/^recipes: //' | tr '\n' ' ')" "a release path that reads a file with no code owner (the justfile, or one release.just imports)" \
-      "a PR on Gitea that keeps tests/release/release.just self-contained and the release scripts on tests/release/just.sh (tests/release/recipes.sh says what it requires), merged to main"
+      "a PR that keeps tests/release/release.just self-contained and the release scripts on tests/release/just.sh (tests/release/recipes.sh says what it requires), merged to main"
     return 1
   fi
 }
@@ -340,17 +428,17 @@ pf_check_version() {
   r=$(pf_r)
   v=$(pf_cargo_version "$r")
   if [ "$v" != "$PF_VERSION" ]; then
-    pf_fail "Cargo.toml's version is '${v:-none}', not $PF_VERSION" - "a PR on Gitea: just set-version $PF_VERSION (and the CHANGELOG.md section), merged to main"
+    pf_fail "Cargo.toml's version is '${v:-none}', not $PF_VERSION" - "a PR: just set-version $PF_VERSION (and the CHANGELOG.md section), merged to main"
     bad=1
   fi
   pins=$(pf_git show "$r:Cargo.toml" 2> /dev/null | sed -n 's/.*version = "=\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ')
   if [ -n "$pins" ] && [ "$pins" != "$PF_VERSION " ]; then
-    pf_fail "the =X.Y.Z pins in Cargo.toml are '${pins% }', not =$PF_VERSION" - "a PR on Gitea: just set-version $PF_VERSION, merged to main"
+    pf_fail "the =X.Y.Z pins in Cargo.toml are '${pins% }', not =$PF_VERSION" - "a PR: just set-version $PF_VERSION, merged to main"
     bad=1
   fi
   vre=$(printf '%s' "$PF_VERSION" | sed 's/[.]/[.]/g')
   if ! pf_git show "$r:CHANGELOG.md" 2> /dev/null | grep -Eq "^##[[:space:]]+\[?v?${vre}\]?([[:space:]]|\$)"; then
-    pf_fail "CHANGELOG.md has no section for $PF_VERSION" - "a PR on Gitea: rename [Unreleased] to [$PF_VERSION] - DATE in CHANGELOG.md, merged to main"
+    pf_fail "CHANGELOG.md has no section for $PF_VERSION" - "a PR: rename [Unreleased] to [$PF_VERSION] - DATE in CHANGELOG.md, merged to main"
     bad=1
   fi
   [ "$bad" = 1 ] || pf_ok "Cargo.toml, its pins and CHANGELOG.md are at $PF_VERSION"
@@ -371,7 +459,7 @@ pf_check_lockfiles() {
       if ! err=$(cd "$ROOT" && "$cargo" fetch --locked --manifest-path "$m" 2>&1 > /dev/null); then
         if printf '%s' "$err" | grep -qiE 'lock ?file|--locked'; then
           pf_fail "the lockfile of $m is not current: $(printf '%s' "$err" | grep -m1 -i 'error' | head -c 200)" "stale exporter lock" \
-            "a PR on Gitea with just set-version $PF_VERSION (it updates both locks; just exporter-lock checks the exporter's), merged to main"
+            "a PR with just set-version $PF_VERSION (it updates both locks; just exporter-lock checks the exporter's), merged to main"
         else
           pf_fail "cargo fetch --locked --manifest-path $m failed, so the crates its lockfile names are not in the cargo cache; that is the network or the registry, not the lockfile: $(printf '%s' "$err" | grep -m1 -i 'error' | head -c 200)" - \
             "check the network (cargo fetch --locked --manifest-path $m shows the whole error), then run it again"
@@ -385,7 +473,7 @@ pf_check_lockfiles() {
       pf_ok "the lockfile of $m is current"
     else
       pf_fail "the lockfile of $m is not current, or its crates are not fetched: $(printf '%s' "$err" | grep -m1 -i 'error' | head -c 200)" "stale exporter lock" \
-        "if it says the lock needs updating: a PR on Gitea with just set-version $PF_VERSION (it updates both locks; just exporter-lock checks the exporter's); if it names a missing package: cargo fetch --locked --manifest-path $m"
+        "if it says the lock needs updating: a PR with just set-version $PF_VERSION (it updates both locks; just exporter-lock checks the exporter's); if it names a missing package: cargo fetch --locked --manifest-path $m"
       bad=1
     fi
   done
@@ -394,10 +482,11 @@ pf_check_lockfiles() {
 
 pf_check_github_main() {
   local r g
+  pf_need_github || return 1
   r=$(pf_r)
   g=$(pf_git ls-remote --exit-code "$PF_GITHUB" refs/heads/main 2> /dev/null | awk '{ print $1 }') || g=''
   if [ -z "$g" ]; then
-    pf_fail "cannot read main on remote '$PF_GITHUB' (the GitHub mirror)" - "git remote add $PF_GITHUB git@github.com:$PF_REPO.git (or fix it: git remote -v)"
+    pf_fail "cannot read main on remote '$PF_GITHUB' (GitHub)" - "check the remote: git remote -v; git ls-remote $PF_GITHUB main"
     return 1
   fi
   if ! pf_git cat-file -e "$g^{commit}" 2> /dev/null; then
@@ -406,34 +495,24 @@ pf_check_github_main() {
   fi
   PF_G=$g
   if [ "$g" = "$r" ]; then
-    pf_ok "$PF_GITHUB/main is the release commit ($r): step mirror is done"
+    pf_ok "$PF_GITHUB/main is the release commit ($r): step on-main is done"
     return 0
   fi
   if pf_git merge-base --is-ancestor "$r" "$g"; then
     pf_main_trusted "$r" "$g" || return 1
-    pf_warn "$PF_GITHUB/main ($g) has moved on past the release commit $r: step mirror is done, but the dry run (step dry-run) dispatches on main and needs main at the release commit; hold the pushes of GitHub's main until it is dispatched, or release main's head"
+    pf_warn "$PF_GITHUB/main ($g) has moved on past the release commit $r: step on-main is done, but the dry run (step dry-run) dispatches on main and needs main at the release commit; hold the merges to GitHub's main until it is dispatched, or release main's head"
     return 0
   fi
-  if pf_git merge-base --is-ancestor "$g" "$r"; then
-    pf_note "$PF_GITHUB/main ($g) is behind the release commit (new commits: $(pf_git rev-list --count "$g..$r")): step mirror fast-forwards it"
-    return 0
-  fi
-  pf_fail "$PF_GITHUB/main ($g) is not an ancestor of the release commit $r: it has commits Gitea's main lacks, and step mirror only fast-forwards (it never forces)" "GitHub's main pushed from outside Gitea" \
-    "see what they are (git log $r..$PF_GITHUB/main); they must reach Gitea's main first (a PR there), then release from the new main"
-  return 1
+  # (the tree check fails this: HEAD must be main, or a bound R on it)
+  pf_note "the release commit $r is not on $PF_GITHUB/main ($g): the tree check refuses it (a release commit is a commit of GitHub's main)"
 }
-# pf_main_trusted R G: G (GitHub's main, past R) is on Gitea's main and has R's release-signers, byte for
-# byte: the tag and every verification read the signers from GitHub's main, which any account that
-# may push it can fast-forward. Fails (pf_fail) if not.
+# pf_main_trusted R G: G (GitHub's main, past R) has R's release-signers, byte for byte: the tag and
+# every verification read the signers from GitHub's main, so a commit merged there after R must not
+# change who may sign this release. Fails (pf_fail) if not.
 pf_main_trusted() {
-  if ! pf_git merge-base --is-ancestor "$2" "refs/remotes/$PF_ORIGIN/main" 2> /dev/null; then
-    pf_fail "$PF_GITHUB/main ($2) is past the release commit with commits $PF_ORIGIN/main lacks: the signers on it are not Gitea's" "GitHub's main pushed from outside Gitea" \
-      "see what they are (git fetch $PF_ORIGIN $PF_GITHUB; git log $PF_ORIGIN/main..$PF_GITHUB/main); they must reach Gitea's main first (a PR there)"
-    return 1
-  fi
   if [ "$(pf_git rev-parse -q --verify "$2:.github/release-signers" 2> /dev/null || true)" != "$(pf_git rev-parse -q --verify "$1:.github/release-signers" 2> /dev/null || true)" ]; then
     pf_fail "$PF_GITHUB/main ($2) has a .github/release-signers that differs from the release commit's: the tag and the verifications read it from main" "rotated or lost release key" \
-      "a change of the release signers needs a new release commit (a PR on Gitea, then release that commit)"
+      "a change of the release signers needs a new release commit (release GitHub's new main, before the tag; after it, a PR that puts the release commit's file back)"
     return 1
   fi
 }
@@ -544,12 +623,13 @@ pf_check_tag_free() {
   local gh curl t code out bad=0
   gh=$(pf_tool gh)
   curl=$(pf_tool curl)
+  pf_need_github || return 1
   t=$(pf_git ls-remote "$PF_GITHUB" "refs/tags/$PF_TAG" 2> /dev/null) || {
     pf_fail "cannot list the tags of '$PF_GITHUB'" - "git ls-remote $PF_GITHUB"
     return 1
   }
   if [ -n "$t" ]; then
-    pf_fail "$PF_TAG already exists on GitHub" - "this version is taken: bump to the next patch version (a PR on Gitea: just set-version X.Y.Z+1)"
+    pf_fail "$PF_TAG already exists on GitHub" - "this version is taken: bump to the next patch version (a PR: just set-version X.Y.Z+1)"
     bad=1
   fi
   if out=$("$gh" release view "$PF_TAG" --repo "$PF_REPO" --json isDraft 2>&1); then
@@ -652,12 +732,12 @@ pf_check_release_key() {
   for where in R G; do
     if [ "$where" = G ]; then
       [ -n "$g" ] || { pf_note "github/main not read: the release key is checked on the release commit only"; break; }
-      # verify-tag.sh reads the signers on GitHub's main: R's own once main is R or behind it (the
-      # mirror makes it R), the later commit's once main has moved on past R
+      # verify-tag.sh reads the signers on GitHub's main: R's own while main is R (or not on it: the
+      # tree and github-main checks fail that), the later commit's once main has moved on past R
       if [ "$g" = "$r" ] || ! pf_git merge-base --is-ancestor "$r" "$g" 2> /dev/null; then
         break
       fi
-      # past R: main must be Gitea's and keep R's file (pf_main_trusted), not merely list the key
+      # past R: main must keep R's file (pf_main_trusted), not merely list the key
       pf_main_trusted "$r" "$g" || { bad=1; break; }
     fi
     pf_git show "$([ "$where" = R ] && echo "$r" || echo "$g"):.github/release-signers" > "$s" 2> /dev/null || : > "$s"
@@ -684,7 +764,7 @@ pf_check_package_key() {
   fpr=$(FIL_GPG=$gpg package_key_fingerprint "$k") || fpr=""
   rm -f "$k"
   if [ -z "$fpr" ]; then
-    pf_fail ".github/package-signing-key.asc at the release commit is not exactly one OpenPGP key" - "a PR on Gitea with the package key's public half (docs/m4/release.md section 10.4)"
+    pf_fail ".github/package-signing-key.asc at the release commit is not exactly one OpenPGP key" - "a PR with the package key's public half (docs/m4/release.md section 10.4)"
     return 1
   fi
   line=$("$gpg" --list-secret-keys --with-colons "$fpr" 2> /dev/null | awk -F: '$1 == "sec" { print; exit }') || line=''
@@ -795,14 +875,13 @@ pf_main() {
       --commit) PF_COMMIT=$2; shift 2 ;;
       --repo) PF_REPO=$2; shift 2 ;;
       --vm) PF_VM=$2; shift 2 ;;
-      --origin) PF_ORIGIN=$2; shift 2 ;;
       --github) PF_GITHUB=$2; shift 2 ;;
       --list) pf_list; return 0 ;;
       -*) die "unknown option: $1" ;;
       *) version=$1; shift ;;
     esac
   done
-  [ -n "$version" ] || die "usage: release-preflight.sh VERSION [--from STEP] [--only CHECKS] [--commit SHA] [--repo OWNER/REPO] [--vm NAME] (--list: the checks and steps)"
+  [ -n "$version" ] || die "usage: release-preflight.sh VERSION [--from STEP] [--only CHECKS] [--commit SHA] [--repo OWNER/REPO] [--vm NAME] [--github REMOTE] (--list: the checks and steps)"
   package_version_ok "${version#v}" || die "'$version' is not X.Y.Z or X.Y.Z-PRE"
   if [ -n "$PF_COMMIT" ] && ! [[ $PF_COMMIT =~ ^[0-9a-f]{40}$ ]]; then die "--commit must be a full 40-hex commit SHA"; fi
   pf_init "$version"

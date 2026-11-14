@@ -335,8 +335,11 @@ fn rst_after_a_request_waits_for_it() {
         matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
         "reset before the request arrived: {err}"
     );
-    c.write_all(&seeded(100, 1)).unwrap();
+    // The timeout goes on before the write: the server resets as soon as it has read the
+    // request, and on macOS a setsockopt on a socket that has already taken the RST fails
+    // with EINVAL.
     c.set_read_timeout(Some(WAIT)).unwrap();
+    c.write_all(&seeded(100, 1)).unwrap();
     let err = c.read(&mut buf).expect_err("reset after the request");
     assert_eq!(err.kind(), ErrorKind::ConnectionReset);
     assert_eq!(srv.block()["IN_BYTES"], "100");

@@ -22,7 +22,7 @@ sudo apt install ./fil_<version>_amd64.deb  # Debian, Ubuntu (from a GitHub Rele
 cargo install --locked fil-shell            # from source; the crate is fil-shell, the command is fil
 ```
 
-From the release after 0.3.0 there is also an installer that checks the release's signature before it installs anything (`curl -fsSL https://github.com/anthonytw/fil/releases/download/v1.0.0/fil-install.sh | sh -s -- --version 1.0.0`, no root), and fil's own apt and dnf repositories. Fedora, Arch, Nix, the release archives and how to check them are in the [install guide](docs/user/install.md). fil goes on the host too: `fil install HOST` puts it there over your ssh login, or the first `fil HOST` offers to.
+From 1.0.0 there is also an installer that checks the release's signature before it installs anything (`curl -fsSL https://github.com/anthonytw/fil/releases/download/v1.0.0/fil-install.sh | sh -s -- --version 1.0.0`, no root), and fil's own apt and dnf repositories. Fedora, Arch, Nix, the release archives and how to check them are in the [install guide](docs/user/install.md). fil goes on the host too: `fil install HOST` puts it there over your ssh login, or the first `fil HOST` offers to.
 
 ## Quick start
 
@@ -46,7 +46,7 @@ Check these fingerprints against the copies in the repository before you trust a
 
 ## Status
 
-fil is an ssh/et drop-in: the client, the daemon, sessions that survive a reconnect or a takeover, both transports, port forwards, `fil ports`, the agent relay, server policy, and installing over ssh, as released in 0.1.0. 0.2.0 added predictive local echo (below), and 0.3.0 asks before taking over a session that another client holds. The design and the milestones are in [DESIGN.md](DESIGN.md) (§15); the changes are in [CHANGELOG.md](CHANGELOG.md).
+fil is an ssh/et drop-in: the client, the daemon, sessions that survive a reconnect or a takeover, both transports, port forwards, `fil ports`, the agent relay, server policy, and installing over ssh, as released in 0.1.0. 0.2.0 added predictive local echo (below), and 0.3.0 asks before taking over a session that another client holds. 1.0.0 freezes the 1.x wire, adds tunnels (`fil -N`) and runs each version's daemon side by side, so an upgrade never strands a session. The design and the milestones are in [DESIGN.md](DESIGN.md) (§15); the changes are in [CHANGELOG.md](CHANGELOG.md).
 
 ### Predictive echo (0.2.0)
 

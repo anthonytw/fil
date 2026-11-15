@@ -2044,7 +2044,6 @@ mod tests {
             membership: Membership::Pids(vec![mine.id()]),
             forwards: vec![target("127.0.0.1", 1), target("localhost", 2)],
             agent: None,
-            daemon_version: fil_proto::msg::FilVersion::ours(),
             refused: vec![],
         }];
         let mut q = PortsQuery::new(s, None, ProbeMode::Full);

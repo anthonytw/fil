@@ -1,0 +1,7 @@
+# Old against new (docs/v1/wire.md): the released 1.x tags. linux-check's `compat` job (suites
+# extended and all) runs a bounded set of them against HEAD, in both directions, with the drop-in
+# quick set: v1.0.0 and the newest patch of each of the two newest minors (at most three, so the
+# job's time stays bounded). One tag per line, `vMAJOR.MINOR.PATCH`, optionally followed by extra
+# `dropin` arguments for that tag only (`--skip NAME,..` for a scenario added after it, never to
+# hide a failure). Add each 1.x release when it is tagged.
+# Empty until v1.0.0: the job then skips, and crates/fil-proto/tests/compat.rs stands in.

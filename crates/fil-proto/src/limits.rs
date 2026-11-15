@@ -7,16 +7,28 @@ use std::time::Duration;
 /// layout does: the things a peer must read to say "different version" at all.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The wire revision: **it must change whenever any message's encoding changes** (a field, a
-/// variant, the order of either, a limit that a decoder enforces), before 1.0 as after. Two builds
-/// talk only when their revisions are equal; otherwise they say so at once (the hello, DESIGN.md
-/// section 8.5) instead of failing to decode something later. It is also part of the daemon's
-/// socket path, so daemons of different revisions run side by side.
+/// variant, the order of either, a limit that a decoder enforces), before 1.0 as after. It names
+/// an encoding for the golden and for diagnostics; since the 1.0 wire it is no longer a
+/// compatibility key: any two revisions from [`FIRST_STABLE_REVISION`] on, under one major, work
+/// together, and optional features are negotiated instead (`crate::ext`, DESIGN.md section 8.5,
+/// `docs/v1/wire.md`). Builds of revisions before it refuse each other unless equal.
 ///
 /// `tests/wire_golden.rs` holds a committed encoding of every message and fails if the encoding
 /// changes without this number changing. Regenerate with `just wire-golden`. 0 is reserved for
 /// builds from before revisions existed (their hello said `minor: 0`).
-pub const PROTOCOL_REVISION: u16 = 15;
-const _: () = assert!(PROTOCOL_REVISION >= 1);
+pub const PROTOCOL_REVISION: u16 = 16;
+/// The 1.0 wire: every revision from this one on, under [`PROTOCOL_MAJOR`], interoperates with
+/// every other (the extensible wire, frozen for 1.x). Revisions below it are pre-1.0 development
+/// builds, each of which talks only to its own revision.
+pub const FIRST_STABLE_REVISION: u16 = 16;
+const _: () = assert!(PROTOCOL_REVISION >= FIRST_STABLE_REVISION);
+/// Longest feature set (`crate::ext::FeatureSet`), in bytes: 256 features.
+pub const MAX_FEATURE_BYTES: usize = 32;
+/// Longest extension of a list row (`crate::ext::RowExt`).
+pub const MAX_ROW_EXT: usize = 64;
+/// Most messages of unknown type the daemon skips between a client's hello and its attach or
+/// request (the handshake has only its deadline otherwise). One more is a protocol error.
+pub const MAX_SKIPPED_HANDSHAKE: usize = 16;
 
 /// Most data bytes in one data frame. DESIGN.md section 8.2 caps forward frames at this size so a
 /// large transfer cannot delay keystrokes; terminal frames use the same cap for simplicity.
@@ -41,6 +53,8 @@ pub const MAX_PUBLIC_KEY: usize = 256;
 pub const MAX_FINGERPRINT: usize = 64;
 /// Longest agent string in the hello.
 pub const MAX_AGENT: usize = 64;
+/// Longest fil version string (`crate::msg::FilVersion`, `0.3.0`, `1.2.0-rc.1+abc`).
+pub const MAX_FIL_VERSION: usize = 32;
 
 /// Default size of the daemon's terminal output log (DESIGN.md section 6.1).
 pub const DEFAULT_LOG_CAPACITY: usize = 8 * 1024 * 1024;

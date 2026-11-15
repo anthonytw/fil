@@ -30,17 +30,13 @@ pub use identity::{ClientKey, DaemonIdentity, Fingerprint, PublicKey};
 pub use registry::KeyRegistry;
 pub use verify::{PinnedServerVerifier, RegisteredClientVerifier};
 
-/// The ALPN protocol both sides must agree on: `fil/<major>.<revision>`, the wire this process
-/// speaks. A daemon and a client of different wire revisions fail the TLS handshake itself, before
-/// a single message is decoded (DESIGN.md section 8.5, "Versioning"); the hello then repeats the
-/// check with words for the user.
+/// The ALPN protocol both sides must agree on: `fil/<major>`, frozen for the major. Every 1.x
+/// build connects to every other (their differences are negotiated features, DESIGN.md section
+/// 8.5, "Versioning"); a daemon of another major, or a development build from before 1.0 (which
+/// named its revision too, `fil/1.<rev>`), fails the TLS handshake itself, before a single message
+/// is decoded, and the hello repeats the check with words for the user.
 pub fn alpn() -> Vec<u8> {
-    alpn_for(fil_proto::version::wire_revision())
-}
-
-/// [`alpn`] for wire revision `revision`.
-pub fn alpn_for(revision: u16) -> Vec<u8> {
-    format!("fil/{}.{revision}", fil_proto::limits::PROTOCOL_MAJOR).into_bytes()
+    format!("fil/{}", fil_proto::limits::PROTOCOL_MAJOR).into_bytes()
 }
 
 /// The name the client passes to `Endpoint::connect`. It is sent as SNI and never checked, so the

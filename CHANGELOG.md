@@ -14,6 +14,7 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 ### Changed
 
+- **The wire is now the 1.x wire (`wire 1.16`), and the last one that needs both ends upgraded together.** From `wire 1.16` on, any two fil builds of the same major talk to each other, whichever is newer: a newer build uses a new feature only when the other side has it too, and skips what it does not know. Builds of `wire 1.15` and older still talk only to their own wire, so upgrade both ends to this version once.
 - When fil leaves a session alone because another client holds it, the message says "(disconnected)" when that client's link is down, as the question does.
 - **`fil --version` says how to upgrade.** Its second line names how this copy was installed and the command that upgrades it (Homebrew, cargo, the `.deb` or `.rpm`, the AUR, Nix, a `fil install` copy on a host, `~/.local/bin`, or a copy by hand, with its path). fil works this out from its own path and the package manager's files, with no network and without running anything; it still never updates itself or checks for updates. The first line is unchanged; the legal notices follow.
 

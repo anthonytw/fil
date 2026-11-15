@@ -19,6 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ext;
 use crate::frame::{DataSegment, FrameError};
 use crate::msg::TermSize;
 
@@ -52,11 +53,19 @@ pub enum InputRecord {
     Repaint,
 }
 
+/// How many variants [`InputRecord`] has: an index at or past it is a later build's record. Kept
+/// by hand; `tests/wire_golden.rs` parses every record it pins, so a kind added without raising
+/// it fails there.
+pub const RECORD_KINDS: u32 = 2;
+
 /// What a payload on the terminal channel, client to daemon, holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalInput<'a> {
     Keys(DataSegment<'a>),
     Record(InputRecord),
+    /// A record of a kind from a later 1.x build (its index): skipped. Like every record it takes
+    /// no space in the input stream, so skipping it moves nothing.
+    Unknown(u32),
 }
 
 impl InputRecord {
@@ -71,20 +80,19 @@ impl InputRecord {
 }
 
 impl<'a> TerminalInput<'a> {
-    /// Tells a record from a data segment by the first varint, then validates the rest: a record
-    /// must decode exactly (no trailing bytes, a valid [`TermSize`], a known kind).
+    /// Tells a record from a data segment by the first varint, then validates the rest: a known
+    /// record must decode (a valid [`TermSize`]); bytes after it are fields a later build
+    /// appended and are ignored, and a kind this build does not know is [`Self::Unknown`]
+    /// (DESIGN.md section 8.5).
     pub fn parse(payload: &'a [u8]) -> Result<Self, FrameError> {
         match postcard::take_from_bytes::<u64>(payload) {
-            Ok((RECORD_MARK, rest)) => {
-                let (rec, tail) = postcard::take_from_bytes::<InputRecord>(rest)
-                    .map_err(|_| FrameError::Malformed("input record"))?;
-                if !tail.is_empty() {
-                    return Err(FrameError::Malformed(
-                        "trailing bytes after an input record",
-                    ));
-                }
-                Ok(Self::Record(rec))
-            }
+            Ok((RECORD_MARK, rest)) => match ext::classify(rest, RECORD_KINDS) {
+                ext::Kind::Known => ext::decode_prefix::<InputRecord>(rest)
+                    .map(|(rec, _appended)| Self::Record(rec))
+                    .ok_or(FrameError::Malformed("input record")),
+                ext::Kind::Unknown(kind) => Ok(Self::Unknown(kind)),
+                ext::Kind::Malformed => Err(FrameError::Malformed("input record")),
+            },
             _ => DataSegment::parse(payload).map(Self::Keys),
         }
     }
@@ -160,15 +168,49 @@ mod tests {
     }
 
     #[test]
-    fn a_segment_that_looks_like_the_mark_is_refused() {
-        // Seq u64::MAX with data: not a record (it has no valid record body), not a segment
-        // (seq + len overflows).
+    fn a_segment_at_the_mark_is_never_keys() {
+        // Seq u64::MAX with data: never a segment (seq + len overflows); read as a record, its
+        // first byte is a kind no build has yet, so it is skipped as a later build's.
         let mut wire = postcard::to_allocvec(&u64::MAX).unwrap();
         wire.extend_from_slice(b"abc");
-        assert!(TerminalInput::parse(&wire).is_err());
+        assert_eq!(
+            TerminalInput::parse(&wire),
+            Ok(TerminalInput::Unknown(0x61))
+        );
         assert!(DataSegment::parse(&wire).is_err());
         // The mark alone is a record with no body.
         assert!(TerminalInput::parse(&postcard::to_allocvec(&u64::MAX).unwrap()).is_err());
+    }
+
+    /// The 1.x wire grows: a later build's fields after a record are ignored, and a later
+    /// build's kind is skipped (DESIGN.md section 8.5).
+    #[test]
+    fn appended_fields_and_unknown_kinds_are_skipped() {
+        let rec = InputRecord::Resize {
+            at: 1,
+            size_gen: 1,
+            size: size(80, 24),
+        };
+        let mut v = rec.encode().unwrap();
+        v.extend_from_slice(&[0, 7, 7]);
+        assert_eq!(TerminalInput::parse(&v), Ok(TerminalInput::Record(rec)));
+        let mut v = InputRecord::Repaint.encode().unwrap();
+        v.push(0);
+        assert_eq!(
+            TerminalInput::parse(&v),
+            Ok(TerminalInput::Record(InputRecord::Repaint))
+        );
+        let mut v = rec.encode().unwrap();
+        v[10] = RECORD_KINDS as u8;
+        assert_eq!(
+            TerminalInput::parse(&v),
+            Ok(TerminalInput::Unknown(RECORD_KINDS))
+        );
+        // RECORD_KINDS is the count: the last kind is one below it.
+        assert_eq!(
+            u32::from(InputRecord::Repaint.encode().unwrap()[10]) + 1,
+            RECORD_KINDS
+        );
     }
 
     #[test]
@@ -180,18 +222,6 @@ mod tests {
         }
         .encode()
         .unwrap();
-        // Trailing bytes.
-        let mut v = good.clone();
-        v.push(0);
-        assert!(TerminalInput::parse(&v).is_err());
-        // An unknown kind.
-        let mut v = good.clone();
-        v[10] = 2;
-        assert!(TerminalInput::parse(&v).is_err());
-        // A repaint carries nothing: a byte after it is trailing.
-        let mut v = InputRecord::Repaint.encode().unwrap();
-        v.push(0);
-        assert!(TerminalInput::parse(&v).is_err());
         // A zero dimension, either one.
         let mut v = good.clone();
         *v.last_mut().unwrap() = 0;

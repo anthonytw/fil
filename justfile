@@ -190,6 +190,19 @@ test-wallclock:
 wire-golden:
     FIL_UPDATE_GOLDEN=1 cargo test -p fil-proto --test wire_golden the_wire_matches_the_golden_for_this_revision
 
+# Re-take the 1.0 baseline (crates/fil-proto/tests/golden/wire-1.0.txt) from the wire golden. Only
+# until v1.0.0 is tagged, and only for an in-place change that also moved FIRST_STABLE_REVISION to
+# the new PROTOCOL_REVISION (docs/v1/wire.md); after the tag the baseline never changes.
+wire-golden-1-0:
+    #!/usr/bin/env sh
+    set -eu
+    d="{{source_directory()}}/crates/fil-proto/tests/golden"
+    { echo "# The 1.0 wire: a copy of wire.txt taken by 'just wire-golden-1-0', frozen byte for byte at"
+      echo "# v1.0.0. Every line must stay in wire.txt with its value, decode/ probes included, except"
+      echo "# that a PAST_THE_END probe may go from refused to accepted and a FIRST_UNKNOWN probe may"
+      echo "# change (tests/wire_golden.rs, docs/v1/wire.md)."
+      cat "$d/wire.txt"; } > "$d/wire-1.0.txt"
+
 # Fetches the RustSec advisory database, so it needs network access.
 # License, source and ban policy, RustSec advisories and yanked crates (deny.toml).
 deny:

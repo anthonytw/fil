@@ -104,7 +104,7 @@ fil runs on the host as `fil server --stdio`, which ssh hands to your login shel
    ```
 
    To use `~/.local/bin`, add it to the `PATH` your shell sets for non-interactive logins: in `~/.bashrc` above its "if not interactive, return" line, in `~/.zshenv`, or in `~/.config/fish/config.fish`.
-3. Check: `ssh devbox fil --version` prints the same wire as your local `fil --version`.
+3. Check: `ssh devbox fil --version` prints a wire your local `fil` can talk to (the `wire` in `fil --version`: the same number, or both `1.16` or later).
 
 ### 2. `fil install`
 
@@ -137,7 +137,7 @@ The `remote` setting in the same file chooses the command fil runs on the host: 
 
 fil never updates itself and never checks for a new version. `fil --version` says, on its second line, how this copy was installed and the command that upgrades it: `brew upgrade anthonytw/tap/fil`, `cargo install --locked fil-shell`, the new `.deb` or `.rpm` from the release page, your AUR helper for `fil-shell-bin`, your Nix profile or flake, or, for a copy you put somewhere yourself, the release page and its path. It works that out from where the program is and the package manager's files on your machine, without the network and without running anything. On a host, a copy that `fil install` put there is upgraded by connecting with a newer fil, which installs its own beside it. `fil ls` also says when a host's daemon is newer than your fil.
 
-Install the new version on your machine and on each host. Two builds talk to each other only if their wire numbers are equal (the `wire` in `fil --version`). Daemons of different wires run side by side on a host, so an upgrade breaks no running session: your old sessions stay on the old daemon until they end. A patch release (0.1.0 to 0.1.1) never changes the wire, and 0.2.0 kept 0.1.0's (0.3.0 changes it, to `wire 1.15`: upgrade both ends, and a 0.3.0 client starts a 0.3.0 daemon beside the old one). When the wire is unchanged, a new client reuses the running daemon, and daemon-side fixes take effect only once that daemon has exited. End your sessions on each host (or `fil kill` them) to pick up the fixes.
+Install the new version on your machine and on each host. From `wire 1.16` on (the `wire` in `fil --version`), any two builds of the same major talk to each other, whichever is newer, and a feature only one side has stays off. Builds of `wire 1.15` and older talk only to builds of the same wire number. Daemons of different wires run side by side on a host, so an upgrade breaks no running session: your old sessions stay on the old daemon until they end. A patch release (0.1.0 to 0.1.1) never changes the wire, and 0.2.0 kept 0.1.0's (0.3.0 changes it, to `wire 1.15`: upgrade both ends, and a 0.3.0 client starts a 0.3.0 daemon beside the old one). When the wire is unchanged, a new client reuses the running daemon, and daemon-side fixes take effect only once that daemon has exited. End your sessions on each host (or `fil kill` them) to pick up the fixes.
 
 ## Removing fil
 

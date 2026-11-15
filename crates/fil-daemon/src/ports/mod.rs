@@ -837,6 +837,8 @@ mod tests {
             attached: None,
             forwards: 0,
             agent: false,
+            daemon_version: fil_proto::msg::FilVersion::ours(),
+            ext: fil_proto::ext::RowExt::default(),
         }
     }
 

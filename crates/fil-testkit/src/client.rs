@@ -30,6 +30,8 @@ const GAP_PATIENCE: Duration = Duration::from_secs(5);
 pub struct Client<L: Link> {
     pub link: L,
     pub hello: Option<Hello>,
+    /// The far end's `Features`, which a daemon sends right after its `Hello`.
+    pub features: Option<fil_proto::ext::FeatureSet>,
     /// Whether a `Hello` from the far end is expected: the daemon sends one first, a bare session
     /// does not (a `Hello` there is a bug, and panics like any other unexpected message).
     pub hello_expected: bool,
@@ -110,6 +112,7 @@ impl<L: Link> Client<L> {
         Client {
             link,
             hello: None,
+            features: None,
             hello_expected: false,
             reply: None,
             refused: None,
@@ -508,6 +511,13 @@ impl<L: Link> Client<L> {
             ControlMsg::Hello(h) => {
                 assert!(self.hello_expected, "unexpected Hello {h:?}");
                 self.hello = Some(h);
+            }
+            ControlMsg::Features(f) => {
+                assert!(
+                    self.hello.is_some() && self.features.is_none() && self.reply.is_none(),
+                    "Features out of place: {f:?}"
+                );
+                self.features = Some(f);
             }
             ControlMsg::AttachReply(r) => {
                 match r.start {

@@ -341,20 +341,22 @@ async fn a_version_mismatch_is_reported() {
     }
 }
 
-/// The same major with another wire revision (the case a changed encoding makes): refused at the
-/// `Hello`, at once (no retries, so no waiting), with words that name both revisions.
+/// The same major with an incompatible wire revision (a development build from before the 1.0
+/// wire, whose encoding is its own): refused at the `Hello`, at once (no retries, so no waiting),
+/// with words that name both revisions. (Every 1.x revision talks to every other.)
 #[tokio::test(start_paused = true)]
 async fn another_wire_revision_is_reported_at_once_with_both_numbers() {
     let ours = fil_proto::version::wire_revision();
+    let pre = fil_proto::limits::FIRST_STABLE_REVISION - 1;
     let started = tokio::time::Instant::now();
-    match run_against_hello(fil_proto::limits::PROTOCOL_MAJOR, ours + 5).await {
+    match run_against_hello(fil_proto::limits::PROTOCOL_MAJOR, pre).await {
         Err(e @ fil_client::ClientError::VersionMismatch(_)) => {
             let text = e.to_string();
             assert!(
-                text.contains(&format!("wire rev {}", ours + 5))
+                text.contains(&format!("wire rev {pre}"))
                     && text.contains(&format!("wire rev {ours}"))
-                    && text.contains("newer")
-                    && text.contains("upgrade this fil"),
+                    && text.contains("older")
+                    && text.contains("upgrade the fil on the remote host"),
                 "{text}"
             );
         }

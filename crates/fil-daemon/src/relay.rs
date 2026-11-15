@@ -17,9 +17,14 @@
 //! - **the client's wire is the relay's own:** ensure the daemon (start it if needed), as ever;
 //! - **another wire whose daemon is running** (`fil-<major>-<rev>.sock`; revision 0 is the
 //!   pre-revision `fil-<major>.sock`): connect to it. Nothing is started;
-//! - **another wire with no daemon:** answer with this relay's `Hello` and
-//!   `Error(VersionMismatch)` and end, so the client can say which side is newer. Nothing is
-//!   started: a daemon of a wire nobody asked for would only idle.
+//! - **another 1.x revision with no daemon:** the relay's own daemon, as for its own wire: the
+//!   1.x revisions interoperate (DESIGN.md section 8.5, `docs/v1/wire.md`);
+//! - **an incompatible wire with no daemon** (another major, a pre-1.0 revision): answer with
+//!   this relay's `Hello` and `Error(VersionMismatch)` and end, so the client can say which side
+//!   is newer. Nothing is started: a daemon of a wire nobody asked for would only idle.
+//!
+//! The socket's name is host-local: the wire depends on nothing of it (decision D2 keys it by
+//! version instead).
 //!
 //! # The opening is frozen
 //!
@@ -54,6 +59,7 @@ use fil_proto::frame::{Frame, FrameDecoder};
 use fil_proto::limits::MAX_FRAME_BODY;
 use fil_proto::msg::{Agent, ControlMsg, ErrorCode, Hello};
 use fil_proto::opening;
+use fil_proto::version::WireVersion;
 
 use crate::linger;
 use crate::paths::{Paths, ensure_socket_dir};
@@ -420,22 +426,33 @@ where
     ensure_socket_dir(&opts.paths.dir).map_err(EnsureError::from)?;
     let rx = read_in_background(input);
     let (want, held, ended) = read_opening(&rx, &mut output, opts.hello_wait)?;
-    let own = (opts.paths.major, opts.paths.revision);
-    let sock = match want {
+    let own = WireVersion {
+        major: opts.paths.major,
+        revision: opts.paths.revision,
+    };
+    let other = match want {
         Want::Gone => return Ok(RelayEnd::PipeClosed),
-        Want::Wire { major, revision } if (major, revision) != own => {
+        Want::Wire { major, revision } if (WireVersion { major, revision }) != own => {
             // Another build's client. Its daemon, if it is running; never a new daemon of
             // another wire. (The directory was checked above: a socket in someone else's
-            // directory is not to be trusted.)
+            // directory is not to be trusted.) A 1.x client whose revision has no daemon here
+            // talks to this relay's own (the 1.x wire is one wire, DESIGN.md section 8.5);
+            // any other is refused.
+            let theirs = WireVersion { major, revision };
             match UnixStream::connect(opts.paths.socket_of(major, revision)) {
-                Ok(s) => s,
+                Ok(s) => Some(s),
+                Err(_) if own.compatible(&theirs) => None,
                 Err(_) => {
                     refuse(&mut output, opts.paths.revision)?;
                     return Ok(RelayEnd::Refused);
                 }
             }
         }
-        Want::Own | Want::Wire { .. } => {
+        Want::Own | Want::Wire { .. } => None,
+    };
+    let sock = match other {
+        Some(s) => s,
+        None => {
             let ensured = ensure_daemon(&opts.paths, &opts.launcher)?;
             if ensured.started {
                 if let Some(w) = linger::check_host() {

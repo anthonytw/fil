@@ -233,7 +233,7 @@ pub async fn request_rev<L: Link>(link: &L, req: Request, revision: u16) -> Resp
             .expect("the link stays up until the response");
         assert_eq!(chan, ChannelId::CONTROL);
         match ControlMsg::decode(&payload).unwrap() {
-            ControlMsg::Hello(_) => {}
+            ControlMsg::Hello(_) | ControlMsg::Features(_) => {}
             ControlMsg::Response(r) => return r,
             other => panic!("unexpected {other:?}"),
         }

@@ -43,6 +43,7 @@ use bytes::Bytes;
 use fil_predict::{InputKind, LinkView, WithdrawReason};
 use fil_proto::ChannelId;
 use fil_proto::chan::{RecvChannel, SendChannel};
+use fil_proto::ext::FeatureSet;
 use fil_proto::frame::DataSegment;
 use fil_proto::input::InputRecord;
 use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
@@ -262,11 +263,17 @@ struct Conn {
     /// While a mid-stream snapshot is held: what it last progressed to (its `at`, the terminal
     /// position, its bytes received) and when ([`SNAPSHOT_PATIENCE`]).
     snap_progress: Option<((u64, u64, u64), Instant)>,
+    /// The optional features in use on this link: ours and the daemon's (its `Features`, sent
+    /// right after its hello; none until it arrives). 1.0 defines none, so nothing reads it yet:
+    /// a 1.x feature checks it before sending what the daemon must understand (DESIGN.md
+    /// section 8.5).
+    features: FeatureSet,
 }
 
 impl Conn {
     fn new(kind: LinkKind, resumed: bool) -> Self {
         Self {
+            features: FeatureSet::none(),
             kind,
             awaiting_reply: true,
             resumed,
@@ -591,7 +598,11 @@ fn candidate_step(m: Option<Result<(ChannelId, Bytes), LinkError>>) -> CandStep 
                 }
                 Ok(ControlMsg::AttachReply(r)) => CandStep::Promote(r),
                 Ok(ControlMsg::AttachRefused(r)) => CandStep::Refused(r),
+                // The daemon's features: for the link once it is promoted.
+                Ok(ControlMsg::Features(_)) => CandStep::Hold(chan, payload),
                 Ok(_) => CandStep::Keep,
+                // A later 1.x daemon's message: skipped (DESIGN.md section 8.5).
+                Err(e) if e.is_unknown() => CandStep::Keep,
                 Err(e) => {
                     CandStep::Fail(SwapError::LinkFailed(format!("bad control message: {e}")))
                 }
@@ -1534,6 +1545,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let agent = Agent::new(format!("fil-client {}", env!("CARGO_PKG_VERSION")))
             .expect("agent string is valid");
         send_on(tx, &ControlMsg::Hello(Hello::ours(agent)));
+        // Right after the hello, always (DESIGN.md section 8.5). The attach follows at once, so
+        // it uses only what every 1.x daemon reads.
+        send_on(tx, &ControlMsg::Features(FeatureSet::ours()));
         send_on(
             tx,
             &ControlMsg::Attach(Attach {
@@ -1596,8 +1610,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         payload: Bytes,
     ) -> Result<Flow, ClientError> {
         if chan == ChannelId::CONTROL {
-            let msg = ControlMsg::decode(&payload)
-                .map_err(|e| ClientError::Protocol(format!("bad control message: {e}")))?;
+            let msg = match ControlMsg::decode(&payload) {
+                Ok(msg) => msg,
+                // A later 1.x daemon's message: skipped (DESIGN.md section 8.5).
+                Err(fil_proto::msg::MsgError::Unknown(kind)) => {
+                    tracing::debug!(kind, "skipped a control message of unknown type");
+                    return Ok(Flow::Continue);
+                }
+                Err(e) => return Err(ClientError::Protocol(format!("bad control message: {e}"))),
+            };
             return self.on_control(conn, msg);
         }
         if chan == ChannelId::TERMINAL || chan == ChannelId::SNAPSHOT {
@@ -1712,6 +1733,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     "the daemon sent a management message during an attach".into(),
                 ));
             }
+            ControlMsg::Features(theirs) => conn.features = FeatureSet::ours().common(&theirs),
             ControlMsg::Heartbeat { .. }
             | ControlMsg::Ack { .. }
             | ControlMsg::Resume { .. }

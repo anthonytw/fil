@@ -704,6 +704,11 @@ impl<'a, L: Link> Conn<'a, L> {
                         Some(Err(e)) => return self.forward_violation(e).await,
                         None => tracing::debug!("ignored control message"),
                     },
+                    // A later 1.x build's message: skipped (DESIGN.md section 8.5). Only its
+                    // type number is logged, never its contents.
+                    Err(fil_proto::msg::MsgError::Unknown(kind)) => {
+                        tracing::debug!(kind, "skipped a control message of unknown type");
+                    }
                     Err(e) => return ServeEnd::Protocol(e.to_string()),
                 },
                 ChannelId::TERMINAL => match TerminalInput::parse(&payload) {
@@ -732,6 +737,11 @@ impl<'a, L: Link> Conn<'a, L> {
                     Ok(TerminalInput::Record(InputRecord::Repaint)) => {
                         self.repaint_owed.store(true, Ordering::SeqCst);
                         self.repaint_wake.notify_one();
+                    }
+                    // A later 1.x build's record: skipped. A record takes no space in the input
+                    // stream, so nothing moves.
+                    Ok(TerminalInput::Unknown(kind)) => {
+                        tracing::debug!(kind, "skipped an input record of unknown kind");
                     }
                     Err(e) => return ServeEnd::Protocol(e.to_string()),
                 },

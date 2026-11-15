@@ -9,6 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use fil_client::text::sanitize_inline;
 use fil_proto::ChannelId;
+use fil_proto::ext::FeatureSet;
 use fil_proto::limits::MAX_PORTS_ROWS;
 use fil_proto::msg::{
     Agent, ControlMsg, ErrorCode, ForwardOp, ForwardResult, Hello, OtherDaemon, Request, Response,
@@ -90,6 +91,9 @@ async fn exchange<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, 
     // have an answer, so a `Response` in the queue is not one, and the link was lost.
     let sent = async {
         send(link, &ControlMsg::Hello(ours.clone())).await?;
+        // Right after the hello, always; the request uses only what every 1.x daemon reads
+        // (DESIGN.md section 8.5).
+        send(link, &ControlMsg::Features(FeatureSet::ours())).await?;
         send(link, &ControlMsg::Request(request)).await
     }
     .await;
@@ -105,7 +109,13 @@ async fn exchange<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, 
         if channel != ChannelId::CONTROL {
             continue;
         }
-        match ControlMsg::decode(&payload).map_err(|e| MgmtError::Protocol(e.to_string()))? {
+        let msg = match ControlMsg::decode(&payload) {
+            Ok(msg) => msg,
+            // A later 1.x daemon's message: skipped (DESIGN.md section 8.5).
+            Err(e) if e.is_unknown() => continue,
+            Err(e) => return Err(MgmtError::Protocol(e.to_string())),
+        };
+        match msg {
             ControlMsg::Hello(peer) => {
                 ours.check(&peer).map_err(MgmtError::Version)?;
             }
@@ -510,6 +520,11 @@ mod tests {
         let (_, p) = peer.recv().await.unwrap();
         assert!(matches!(
             ControlMsg::decode(&p).unwrap(),
+            ControlMsg::Features(_)
+        ));
+        let (_, p) = peer.recv().await.unwrap();
+        assert!(matches!(
+            ControlMsg::decode(&p).unwrap(),
             ControlMsg::Request(_)
         ));
         let hello = Hello::ours(Agent::new("test-daemon").unwrap());
@@ -571,8 +586,8 @@ mod tests {
         d.abort();
     }
 
-    /// The same major, another wire revision: the `Hello` alone ends the request, with both
-    /// revisions in the words.
+    /// The same major, an incompatible wire revision (a development build from before the 1.0
+    /// wire): the `Hello` alone ends the request, with both revisions in the words.
     #[tokio::test]
     async fn a_daemon_of_another_wire_revision_is_a_version_error_at_the_hello() {
         let (client, daemon, _ctl) = mem::pair(LinkKind::Pipe, 16);
@@ -581,7 +596,7 @@ mod tests {
             let _ = daemon.recv().await;
             let hello = Hello::with_revision(
                 Agent::new("other").unwrap(),
-                fil_proto::version::wire_revision() + 3,
+                fil_proto::limits::FIRST_STABLE_REVISION - 1,
             );
             let _ = daemon
                 .send(
@@ -597,8 +612,8 @@ mod tests {
         let text = err.to_string();
         assert!(
             text.contains("wire rev")
-                && text.contains("newer")
-                && text.contains("upgrade this fil"),
+                && text.contains("older")
+                && text.contains("upgrade the fil on the remote host"),
             "{text}"
         );
         d.abort();
@@ -646,10 +661,9 @@ mod tests {
     /// pipe link, down with the refusal waiting, before `ask` runs.
     #[tokio::test]
     async fn a_refusal_that_arrived_before_the_link_went_down_is_still_read() {
-        let hello = Hello::with_revision(
-            Agent::new("fil-relay newer").unwrap(),
-            fil_proto::version::wire_revision() + 1,
-        );
+        // Newer and incompatible: another major (every 1.x revision talks to every other).
+        let mut hello = Hello::ours(Agent::new("fil-relay newer").unwrap());
+        hello.major += 1;
         let (client, _far) = down_link_holding(vec![
             ControlMsg::Hello(hello),
             ControlMsg::Error(ErrorCode::VersionMismatch),

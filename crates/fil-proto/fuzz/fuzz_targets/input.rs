@@ -23,6 +23,7 @@ fuzz_target!(|data: &[u8]| {
             assert!(!seg.data.is_empty());
             assert!(seg.seq.checked_add(seg.data.len() as u64).is_some());
         }
+        Ok(TerminalInput::Unknown(_)) => {}
         Err(_) => {}
     }
 

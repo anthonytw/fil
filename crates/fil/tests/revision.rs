@@ -187,6 +187,13 @@ fn ours() -> u16 {
     fil_proto::version::wire_revision()
 }
 
+/// Two development builds from before the 1.0 wire, the older first: each talks only to its own
+/// revision, so they stand for an incompatible pair (every 1.x revision talks to every other).
+fn pre() -> (u16, u16) {
+    let first = fil_proto::limits::FIRST_STABLE_REVISION;
+    (first - 2, first - 1)
+}
+
 /// `fil --version` names the wire: the number a "different version" error compares.
 #[test]
 fn version_prints_the_wire() {
@@ -227,14 +234,15 @@ fn version_prints_the_wire() {
 #[test]
 fn ls_against_a_newer_remote_fails_fast_and_says_to_upgrade_this_fil() {
     let w = World::new("ls");
-    w.host("probe", ours() + 1);
-    let (ok, _out, err, took) = w.ls(ours(), "probe");
+    let (older, newer) = pre();
+    w.host("probe", newer);
+    let (ok, _out, err, took) = w.ls(older, "probe");
     assert!(!ok, "{err}");
     assert!(
         err.contains("fil: probe: ")
             && err.contains("newer")
-            && err.contains(&format!("wire rev {}", ours() + 1))
-            && err.contains(&format!("wire rev {}", ours()))
+            && err.contains(&format!("wire rev {newer}"))
+            && err.contains(&format!("wire rev {older}"))
             && err.contains("upgrade this fil"),
         "{err}"
     );
@@ -252,8 +260,9 @@ fn ls_against_a_newer_remote_fails_fast_and_says_to_upgrade_this_fil() {
 #[test]
 fn ls_against_an_older_remote_says_to_upgrade_the_remote() {
     let w = World::new("older");
-    w.host("probe", ours());
-    let (ok, _out, err, took) = w.ls(ours() + 1, "probe");
+    let (older, newer) = pre();
+    w.host("probe", older);
+    let (ok, _out, err, took) = w.ls(newer, "probe");
     assert!(!ok, "{err}");
     assert!(
         err.contains("older") && err.contains("upgrade the fil on the remote host"),
@@ -281,14 +290,15 @@ fn a_remote_from_before_revisions_is_named_as_older() {
 #[test]
 fn an_attach_against_a_newer_remote_ends_at_once_with_the_message() {
     let w = World::new("attach");
-    w.host("probe", ours() + 1);
-    let mut run = w.attach(ours(), "probe", "main");
+    let (older, newer) = pre();
+    w.host("probe", newer);
+    let mut run = w.attach(older, "probe", "main");
     let (status, out) = run.wait_for_exit(Duration::from_secs(12));
     assert!(!status.success(), "{out}");
     assert!(
         out.contains("fil: probe: ")
             && out.contains("newer")
-            && out.contains(&format!("wire rev {}", ours() + 1))
+            && out.contains(&format!("wire rev {newer}"))
             && out.contains("upgrade this fil"),
         "{out}"
     );
@@ -409,4 +419,52 @@ fn a_session_survives_the_remote_being_upgraded_in_place() {
         lock_names(&w.socks),
         [format!("fil-1-{old}.sock"), format!("fil-1-{new}.sock")]
     );
+}
+
+/// The 1.x wire is one wire (DESIGN.md section 8.5, docs/v1/wire.md): a client and a remote of
+/// two 1.x revisions work together both ways round, where two pre-1.0 revisions refuse each
+/// other. With no daemon of the client's revision on the host, the remote's relay serves it with
+/// its own daemon.
+#[test]
+fn two_1x_revisions_talk_both_ways() {
+    let w = World::new("onex");
+    let (a, b) = (ours(), ours() + 1);
+    w.host("newer", b);
+    w.host("older", a);
+    // An older client, a newer remote: listed, then attached.
+    let (ok, out, err, took) = w.ls(a, "newer");
+    assert!(ok && out.contains("no sessions"), "{out}{err}");
+    assert!(took < Duration::from_secs(10), "took {took:?}");
+    let mut run = w.attach(a, "newer", "mixed");
+    let started = Instant::now();
+    loop {
+        let (ok, out, _, _) = w.ls(b, "newer");
+        if ok && out.contains("mixed") {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the session never appeared on the newer daemon; the client said: {}",
+            run.text()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        run.child.try_wait().unwrap().is_none(),
+        "the attach ended: {}",
+        run.text()
+    );
+    drop(run);
+    assert_eq!(
+        lock_names(&w.socks),
+        [format!("fil-1-{b}.sock")],
+        "one daemon, the remote's: the older client needed none of its own"
+    );
+    // A newer client, an older remote, on a host with no daemon yet: the older relay serves it
+    // with its own daemon.
+    let w2 = World::new("onex2");
+    w2.host("older", a);
+    let (ok, out, err, _) = w2.ls(b, "older");
+    assert!(ok && out.contains("no sessions"), "{out}{err}");
+    assert_eq!(lock_names(&w2.socks), [format!("fil-1-{a}.sock")]);
 }

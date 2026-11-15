@@ -856,14 +856,15 @@ impl Drop for EndOnDrop<'_> {
 /// the alert).
 const CRYPTO_NO_APPLICATION_PROTOCOL: u64 = 0x100 + 120;
 
-/// Why a handshake failed, for the user. The ALPN names the wire revision (`auth::alpn`), so the
-/// daemon refusing every protocol the client offered means it speaks another revision.
+/// Why a handshake failed, for the user. The ALPN names the protocol major (`auth::alpn`), so the
+/// daemon refusing every protocol the client offered means it speaks another major, or is a
+/// development build from before 1.0 (whose ALPN named its revision).
 fn handshake_failure(err: &ConnectionError) -> String {
     // The daemon's alert arrives as a close from the peer (`tests/quic_auth.rs` pins the shape).
     if let ConnectionError::ConnectionClosed(close) = err
         && u64::from(close.error_code) == CRYPTO_NO_APPLICATION_PROTOCOL
     {
-        return "handshake failed: the daemon speaks a different wire revision of fil than this one; upgrade whichever fil is older".to_string();
+        return "handshake failed: the daemon speaks a wire of fil this one cannot talk to (another major, or a build from before 1.0); upgrade whichever fil is older".to_string();
     }
     format!("handshake failed: {err}")
 }

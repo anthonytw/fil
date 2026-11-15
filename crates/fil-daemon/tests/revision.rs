@@ -1,6 +1,8 @@
 //! Daemons of different wire revisions (DESIGN.md sections 5.3 and 8.5): they run side by side,
-//! `fil ls` notes the other, nothing of the old one is touched, and a connection of the wrong
-//! revision is told so at the `Hello`, before its request is read.
+//! `fil ls` notes the other, nothing of the old one is touched, and a connection of an
+//! incompatible wire (another major, or a pre-1.0 revision) is told so at the `Hello`, before its
+//! request is read. Two 1.x revisions talk, and a later 1.x client's unknown messages, feature
+//! bits and appended fields are skipped (`docs/v1/wire.md`).
 
 mod common;
 
@@ -20,8 +22,13 @@ use rustix::fs::{FlockOperation, flock};
 fn rev_old() -> u16 {
     fil_proto::version::wire_revision()
 }
+/// A later 1.x build: compatible with [`rev_old`].
 fn rev_new() -> u16 {
     rev_old() + 1
+}
+/// A development build from before the 1.0 wire: compatible with no other revision.
+fn rev_pre() -> u16 {
+    fil_proto::limits::FIRST_STABLE_REVISION - 1
 }
 
 /// A daemon of wire revision `revision` in the scratch directory, in this process.
@@ -209,7 +216,7 @@ async fn another_revision_is_refused_at_the_hello_before_its_request_is_read() {
     let d = start_rev(&s, rev_new(), CAT).await;
     let link = d.direct_link().await;
     let started = std::time::Instant::now();
-    send_ctl(&link, &hello_rev(rev_new() + 1)).await;
+    send_ctl(&link, &hello_rev(rev_pre())).await;
     // What an Attach of a changed layout looks like to this daemon: bytes that do not decode.
     // (The daemon may have refused and hung up by now: the send is allowed to fail.)
     let _ = link
@@ -261,7 +268,7 @@ async fn a_daemon_never_acts_on_a_request_from_a_client_of_another_revision() {
         ControlMsg::Attach(Connect::new("keep", key(3)).attach()),
     ] {
         let link = d.direct_link().await;
-        send_ctl(&link, &hello_rev(rev_old() + 1)).await;
+        send_ctl(&link, &hello_rev(rev_pre())).await;
         // The daemon refuses at the Hello and hangs up without reading the request, so by the time
         // it is sent the link may be closed. Whether the send succeeds is timing; that nothing
         // was done about it is what is asserted, here and by the state checked after the loop.
@@ -300,7 +307,7 @@ async fn a_daemon_never_acts_on_a_request_from_a_client_of_another_revision() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_relay_in_front_of_a_daemon_of_another_revision_is_refused_at_the_hello() {
     let s = Scratch::new();
-    let d = start_rev(&s, rev_new(), CAT).await;
+    let d = start_rev(&s, rev_pre(), CAT).await;
     let relay_paths = s.paths().with_revision(rev_old());
     std::fs::rename(d.paths.socket(), relay_paths.socket()).unwrap();
 
@@ -309,7 +316,7 @@ async fn a_relay_in_front_of_a_daemon_of_another_revision_is_refused_at_the_hell
     send_ctl(&link, &ControlMsg::Request(Request::ListSessions)).await;
     let seen = drain(&link).await;
     assert!(
-        matches!(seen.first(), Some(ControlMsg::Hello(h)) if h.revision == rev_new()),
+        matches!(seen.first(), Some(ControlMsg::Hello(h)) if h.revision == rev_pre()),
         "{seen:?}"
     );
     assert!(
@@ -378,14 +385,15 @@ async fn a_client_of_the_old_wire_reaches_its_session_through_a_newer_relay() {
     old.stop().await;
 }
 
-/// No daemon of the client's wire is running and the relay is of another: it says so, with its
-/// own `Hello` (so the client can tell which side is newer), starts nothing, and ends.
+/// No daemon of the client's wire is running and the relay's is incompatible with it: it says
+/// so, with its own `Hello` (so the client can tell which side is newer), starts nothing, and
+/// ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_a_wire_with_no_daemon_is_refused_and_nothing_is_started() {
     let s = Scratch::new();
     let newer = s.paths().with_revision(rev_new());
     let link = pipe_through_relay(relay_options(newer.clone())).await;
-    send_ctl(&link, &hello_rev(rev_old())).await;
+    send_ctl(&link, &hello_rev(rev_pre())).await;
     let seen = drain(&link).await;
     assert!(
         matches!(seen.first(), Some(ControlMsg::Hello(h)) if h.revision == rev_new()),
@@ -443,4 +451,109 @@ async fn a_client_from_before_revisions_is_routed_to_the_legacy_socket() {
         ControlMsg::Hello(h) => assert_eq!(h.revision, 0),
         other => panic!("the first thing the legacy daemon got was {other:?}"),
     }
+}
+
+/// The 1.x wire is one wire (DESIGN.md section 8.5): a client of another 1.x revision whose own
+/// daemon is not running is served by the relay's daemon, not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_1x_client_of_another_revision_is_served_by_the_relays_daemon() {
+    let s = Scratch::new();
+    let d = start_rev(&s, rev_new(), CAT).await;
+    let link = pipe_through_relay(relay_options(d.paths.clone())).await;
+    match request_rev(&link, Request::ListSessions, rev_old()).await {
+        Response::Sessions { list, .. } => assert!(list.is_empty()),
+        other => panic!("{other:?}"),
+    }
+    // And an attach of the older revision works against the newer daemon, both ways round.
+    let link = d.pipe().await;
+    let mut c = Client::attach(link, Connect::new("mixed", key(1))).await;
+    assert!(c.refused.is_none() && c.errors.is_empty(), "{:?}", c.errors);
+    c.wait_screen("ready").await;
+    // A later build's input record and control message, mid-session: skipped, and the keys
+    // after them still arrive in order.
+    // A repaint record (the mark, ten bytes, then the kind) turned into a kind no build has.
+    let mut record = fil_proto::input::InputRecord::Repaint.encode().unwrap();
+    record[10] = 0x40;
+    record.extend_from_slice(&[1, 2, 3]);
+    c.link
+        .send(ChannelId::TERMINAL, Bytes::from(record))
+        .await
+        .unwrap();
+    c.link
+        .send(ChannelId::CONTROL, Bytes::from_static(&[0xC8, 0x01, 9]))
+        .await
+        .unwrap();
+    c.type_bytes(b"across revisions\n").await;
+    c.wait_screen("across revisions").await;
+    d.stop().await;
+}
+
+/// A later 1.x client (`docs/v1/wire.md`): after its hello it sends features this daemon does
+/// not know, messages of types it does not know, and an `Attach` with fields appended. The daemon
+/// skips what it does not know and attaches; its own `Features` follows its hello. A client that
+/// sends more unknown messages than the handshake allows is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_1x_client_is_understood_as_far_as_this_daemon_can() {
+    use fil_proto::ext::FeatureSet;
+    use fil_proto::limits::MAX_SKIPPED_HANDSHAKE;
+    let s = Scratch::new();
+    let d = start_rev(&s, rev_old(), CAT).await;
+    let raw = |bytes: Vec<u8>| Bytes::from(bytes);
+    let unknown = || raw(vec![200, 1, 0x7f, 3]);
+
+    let link = d.direct_link().await;
+    send_ctl(&link, &hello_rev(rev_new())).await;
+    let future = FeatureSet::from_bytes(&[0xff, 0x00, 0x81]).unwrap();
+    send_ctl(&link, &ControlMsg::Features(future)).await;
+    for _ in 0..MAX_SKIPPED_HANDSHAKE {
+        link.send(ChannelId::CONTROL, unknown()).await.unwrap();
+    }
+    let mut attach = ControlMsg::Attach(Connect::new("later", key(1)).attach())
+        .encode()
+        .unwrap();
+    attach.extend_from_slice(&[0x05, 0xAA, 0xBB]);
+    link.send(ChannelId::CONTROL, raw(attach)).await.unwrap();
+    // Mid-session, too: an unknown control message changes nothing.
+    link.send(ChannelId::CONTROL, unknown()).await.unwrap();
+    let mut seen = Vec::new();
+    while !seen
+        .iter()
+        .any(|m| matches!(m, ControlMsg::AttachReply(_) | ControlMsg::Error(_)))
+    {
+        let (chan, payload) = tokio::time::timeout(WAIT, link.recv())
+            .await
+            .expect("an answer in time")
+            .expect("the link stays up");
+        if chan == ChannelId::CONTROL {
+            seen.push(ControlMsg::decode(&payload).unwrap());
+        }
+    }
+    assert!(
+        matches!(seen.first(), Some(ControlMsg::Hello(_))),
+        "{seen:?}"
+    );
+    assert_eq!(
+        seen.get(1),
+        Some(&ControlMsg::Features(FeatureSet::ours())),
+        "{seen:?}"
+    );
+    assert!(
+        matches!(seen.last(), Some(ControlMsg::AttachReply(_))),
+        "{seen:?}"
+    );
+    link.close();
+
+    // One unknown message too many before the request: a protocol error, and nothing attached.
+    let link = d.direct_link().await;
+    send_ctl(&link, &hello_rev(rev_new())).await;
+    for _ in 0..=MAX_SKIPPED_HANDSHAKE {
+        let _ = link.send(ChannelId::CONTROL, unknown()).await;
+    }
+    let (seen, ended) = drain_to_end(&link).await;
+    assert!(ended, "{seen:?}");
+    assert!(
+        seen.contains(&ControlMsg::Error(ErrorCode::Protocol)),
+        "{seen:?}"
+    );
+    d.stop().await;
 }

@@ -1618,6 +1618,23 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
             ],
         }),
     );
+    v.push((
+        "features/none".into(),
+        ControlMsg::Features(fil_proto::ext::FeatureSet::none()),
+    ));
+    v.push((
+        "features/0-9".into(),
+        ControlMsg::Features(fil_proto::ext::FeatureSet::of(&[
+            fil_proto::ext::Feature(0),
+            fil_proto::ext::Feature(9),
+        ])),
+    ));
+    v.push((
+        "features/widest".into(),
+        ControlMsg::Features(
+            fil_proto::ext::FeatureSet::from_bytes(&[0xff; MAX_FEATURE_BYTES]).unwrap(),
+        ),
+    ));
     v
 }
 
@@ -1660,7 +1677,7 @@ fn input_records() -> Vec<(String, InputRecord)> {
 }
 
 /// How many `ControlMsg` variants there are. Extend it with the match below.
-const VARIANTS: usize = 17;
+const VARIANTS: usize = 18;
 /// Retired slots (`ControlMsg::Retired`): no instance can exist.
 const RETIRED: [usize; 1] = [10];
 
@@ -1684,6 +1701,7 @@ fn variant_index(m: &ControlMsg) -> usize {
         ControlMsg::SessionExited { .. } => 14,
         ControlMsg::Request(_) => 15,
         ControlMsg::Response(_) => 16,
+        ControlMsg::Features(_) => 17,
     }
 }
 
@@ -1715,6 +1733,7 @@ fn control_outcome(payload: &[u8]) -> String {
         Err(MsgError::TooLarge(_)) => "err too-large".to_string(),
         Err(MsgError::Malformed) => "err malformed".to_string(),
         Err(MsgError::Invalid { .. }) => "err invalid".to_string(),
+        Err(MsgError::Unknown(_)) => "unknown".to_string(),
     }
 }
 
@@ -1960,12 +1979,15 @@ fn limits() -> Entries {
             "quic::MAX_VARINT_LEN",
             fil_transport::quic::pinned::MAX_VARINT_LEN,
         ),
-        // The ALPN names the wire, so a direct connection of another revision fails the
-        // handshake; its format is part of the wire.
+        // The ALPN names the major only: every 1.x revision connects (frozen for 1.x).
         (
-            "alpn/rev7".into(),
-            String::from_utf8(fil_transport::auth::alpn_for(7)).unwrap(),
+            "alpn".into(),
+            String::from_utf8(fil_transport::auth::alpn()).unwrap(),
         ),
+        // The extensible wire (docs/v1/wire.md).
+        num("FIRST_STABLE_REVISION", FIRST_STABLE_REVISION),
+        num("MAX_FEATURE_BYTES", MAX_FEATURE_BYTES),
+        num("MAX_SKIPPED_HANDSHAKE", MAX_SKIPPED_HANDSHAKE),
     ]
 }
 
@@ -2119,6 +2141,7 @@ fn revisioned() -> Entries {
     let parsed = |payload: &[u8]| match TerminalInput::parse(payload) {
         Ok(TerminalInput::Record(_)) => "record".to_string(),
         Ok(TerminalInput::Keys(_)) => "keys".to_string(),
+        Ok(TerminalInput::Unknown(_)) => "unknown".to_string(),
         Err(_) => "err".to_string(),
     };
     let resize_body = postcard::to_allocvec(&InputRecord::Resize {
@@ -2281,6 +2304,42 @@ fn revisioned() -> Entries {
     e.push((
         "decode/control-10-retired".into(),
         control_outcome(&[10, 17, 0]),
+    ));
+    // The extensible wire (docs/v1/wire.md): the first type past the last is a later build's,
+    // skipped; so is one far past it; bytes after a known message are ignored; a hello is not
+    // extensible.
+    e.push((
+        format!("decode/control-{VARIANTS}-unknown"),
+        control_outcome(&[VARIANTS as u8, 1, 2, 3]),
+    ));
+    e.push((
+        "decode/control-16383-unknown".into(),
+        control_outcome(&[0xff, 0x7f, 0x05]),
+    ));
+    e.push((
+        "decode/control-detach-appended".into(),
+        control_outcome(&[5, 0xAA, 0xBB]),
+    ));
+    let mut hello = ControlMsg::Hello(Hello::with_revision(Agent::new("a").unwrap(), 16))
+        .encode()
+        .unwrap();
+    hello.push(0);
+    e.push((
+        "decode/control-hello-appended".into(),
+        control_outcome(&hello),
+    ));
+    // Features: the longest set, and one byte past it.
+    let feature_index = VARIANTS as u8 - 1;
+    e.push((
+        format!("decode/features-{MAX_FEATURE_BYTES}"),
+        control_outcome(&raw_msg(feature_index, &[counted(MAX_FEATURE_BYTES, 0xff)])),
+    ));
+    e.push((
+        format!("decode/features-{}", MAX_FEATURE_BYTES + 1),
+        control_outcome(&raw_msg(
+            feature_index,
+            &[counted(MAX_FEATURE_BYTES + 1, 0)],
+        )),
     ));
     e.extend(forward_probes());
     e
@@ -2624,6 +2683,12 @@ fn forward_probes() -> Entries {
     e.push((
         "decode/mux-record-trailing-byte".into(),
         record_outcome(&[vec![trailing.len() as u8], trailing].concat()),
+    ));
+    // A later build's record kind (the first past `Window`) is skipped whole and the stream goes
+    // on: one record decodes from the pair.
+    e.push((
+        "decode/mux-record-unknown-kind-then-close".into(),
+        record_outcome(&[vec![3, 13, 1, 2], close.clone()].concat()),
     ));
 
     // The `fil ports` strings and rows.
@@ -3079,6 +3144,72 @@ fn the_wire_matches_the_golden_for_this_revision() {
     }
 }
 
+/// The golden as the 1.0 wire (revision [`FIRST_STABLE_REVISION`]) shipped it: a copy of
+/// `wire.txt` made once, never regenerated (docs/v1/wire.md).
+const GOLDEN_1_0: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/wire-1.0.txt");
+
+/// What a 1.x wire `now` broke of the 1.0 wire `base`, if anything: every line a 1.0 peer reads
+/// (`[frozen]`, `[limits]`, and the encodings in `[revisioned]`) must still be there, with the
+/// same value. The `decode/` probes are left out: some (the first variant past the last) change
+/// by design when 1.x adds a variant.
+fn baseline_problem(base: &Parsed, now: &Now) -> Option<String> {
+    if now.major != base.major {
+        return None;
+    }
+    let lines: std::collections::HashSet<&String> = now
+        .frozen
+        .iter()
+        .chain(&now.limits)
+        .chain(&now.revisioned)
+        .collect();
+    base.frozen
+        .iter()
+        .chain(&base.limits)
+        .chain(&base.revisioned)
+        .filter(|l| !l.starts_with("decode/"))
+        .find(|l| !lines.contains(l))
+        .map(|l| {
+            format!(
+                "the 1.x wire is frozen: `{l}` (golden/wire-1.0.txt) is gone or changed. A 1.x \
+                 change may only add (docs/v1/wire.md); this needs a new PROTOCOL_MAJOR"
+            )
+        })
+}
+
+#[test]
+fn the_1x_wire_keeps_everything_a_1_0_peer_reads() {
+    let now = Now::get();
+    let text = std::fs::read_to_string(GOLDEN_1_0)
+        .unwrap_or_else(|e| panic!("cannot read {GOLDEN_1_0}: {e}"));
+    let base = parse(&text);
+    assert_eq!(
+        (base.major, base.revision),
+        (PROTOCOL_MAJOR, FIRST_STABLE_REVISION),
+        "golden/wire-1.0.txt is the 1.0 wire"
+    );
+    if let Some(p) = baseline_problem(&base, &now) {
+        panic!("{p}");
+    }
+    // The rule itself: an added line passes, a changed or removed one does not.
+    let mut grown = Now::get();
+    grown.revisioned.push("control/later = 00".into());
+    assert!(baseline_problem(&base, &grown).is_none());
+    let mut changed = Now::get();
+    let i = changed
+        .revisioned
+        .iter()
+        .position(|l| l.starts_with("control/"))
+        .unwrap();
+    changed.revisioned[i].push('0');
+    assert!(baseline_problem(&base, &changed).is_some());
+    let mut limit = Now::get();
+    limit.limits.pop();
+    assert!(baseline_problem(&base, &limit).is_some());
+    let mut probe = Now::get();
+    probe.revisioned.retain(|l| !l.starts_with("decode/"));
+    assert!(baseline_problem(&base, &probe).is_none());
+}
+
 /// The checker itself: it is what stops a wire change from shipping under an old revision.
 #[test]
 fn the_rule_catches_each_way_to_get_it_wrong() {
@@ -3278,7 +3409,7 @@ fn the_golden_covers_the_whole_wire() {
         "MAX_DATA_PAYLOAD = 16384",
         "MAX_SESSION_NAME = 64",
         "TermSize::MAX_CELLS = 1000000",
-        "alpn/rev7 = fil/1.7",
+        "alpn = fil/1",
         "MAX_MUX_RECORD = 1024",
         "ChannelId::MUX = 3",
     ] {
@@ -3311,6 +3442,9 @@ fn the_golden_covers_the_whole_wire() {
         "decode/spec-local-port-0 = err",
         "decode/mux-record-len-1025 = err bad-length",
         "decode/control-10-retired = err",
+        "decode/control-18-unknown = unknown",
+        "decode/features-33 = err",
+        "control/features/widest ",
     ] {
         assert!(
             g.revisioned.iter().any(|l| l.starts_with(want)),

@@ -632,9 +632,14 @@ impl FakeDaemon {
                             ControlMsg::decode(&hello).unwrap(),
                             ControlMsg::Hello(_)
                         ));
-                        let (_, req) = link.recv().await.unwrap();
-                        let ControlMsg::Request(req) = ControlMsg::decode(&req).unwrap() else {
-                            return;
+                        // Its Features (always sent right after the hello) are skipped.
+                        let req = loop {
+                            let (_, m) = link.recv().await.unwrap();
+                            match ControlMsg::decode(&m).unwrap() {
+                                ControlMsg::Features(_) => continue,
+                                ControlMsg::Request(req) => break req,
+                                _ => return,
+                            }
                         };
                         log.lock().unwrap().push(req);
                         send(ControlMsg::Hello(Hello::ours(Agent::new("fake").unwrap())))

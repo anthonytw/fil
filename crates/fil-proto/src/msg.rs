@@ -1,9 +1,11 @@
 //! Control messages (channel 0) and the validated types they carry.
 //!
-//! Postcard encodes enums by variant index, so prefer additive changes (new variants at the end,
-//! nothing reordered or removed). **Any change to what a message encodes as, additive or not
-//! (here, in `frame.rs` or in the preamble), needs a new `PROTOCOL_REVISION`**:
-//! `tests/wire_golden.rs` fails until it has one. [`Hello`] must stay decodable by every build,
+//! Postcard encodes enums by variant index. Since the 1.0 wire (revision 16) the encoding is
+//! frozen for 1.x and only grows (`docs/v1/wire.md`): a new message at the end (older peers skip
+//! it, [`MsgError::Unknown`]), new fields only at the end of a message (older peers ignore them,
+//! `crate::ext::tail`), anything an older peer would misread behind a negotiated feature.
+//! **Any change to what a message encodes as (here, in `frame.rs` or in the preamble) still needs
+//! a new `PROTOCOL_REVISION`**: `tests/wire_golden.rs` fails until it has one. [`Hello`] must stay decodable by every build,
 //! so its layout and its variant index (0) are frozen within a protocol major, as are the opening
 //! ping and pong of a pipe (`crate::opening`), which are not control messages at all.
 //!
@@ -17,6 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::net::IpAddr;
 use std::num::NonZeroU16;
 
+use crate::ext::{self, FeatureSet};
 use crate::frame::{ChannelId, Frame};
 use crate::limits::*;
 use crate::mux::{
@@ -35,6 +38,18 @@ pub enum MsgError {
     Malformed,
     #[error("control message too large ({0} bytes)")]
     TooLarge(usize),
+    /// A control message of a type this build does not know (variant index past the last known
+    /// one): from a later 1.x build, which sends one only when it may be ignored. The receiver
+    /// skips it (DESIGN.md section 8.5, `docs/v1/wire.md`).
+    #[error("control message of unknown type {0}")]
+    Unknown(u32),
+}
+
+impl MsgError {
+    /// A message to skip, not a fault of the peer.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, MsgError::Unknown(_))
+    }
 }
 
 fn invalid(what: &'static str, why: &'static str) -> MsgError {
@@ -389,10 +404,11 @@ impl Hello {
         }
     }
 
-    /// Major and revision must both match exactly: the encoding of every other message is a
-    /// function of the pair.
+    /// The same major, and the same revision or both of the 1.x wire
+    /// ([`WireVersion::compatible`]): within 1.x the differences are negotiated features, not a
+    /// refusal.
     pub fn check(&self, peer: &Hello) -> Result<(), VersionMismatch> {
-        if self.version() == peer.version() {
+        if self.version().compatible(&peer.version()) {
             Ok(())
         } else {
             Err(VersionMismatch {
@@ -1140,7 +1156,14 @@ pub enum ControlMsg {
     Request(Request),
     /// Daemon to client: the answer to a [`Request`].
     Response(Response),
+    /// Each side's second message, right after its [`Hello`]: the optional features it has
+    /// (`crate::ext`). Those in use are the ones both sides sent. A peer whose next message
+    /// after its hello is anything else has none.
+    Features(FeatureSet),
 }
+
+/// How many variants [`ControlMsg`] has: an index at or past it is a type from a later build.
+const CONTROL_VARIANTS: u32 = 18;
 
 impl ControlMsg {
     /// Encode as the payload of a control frame.
@@ -1152,14 +1175,21 @@ impl ControlMsg {
         Ok(v)
     }
 
-    /// Decode a control payload, rejecting oversize input, invalid contents and trailing bytes.
+    /// Decode a control payload, rejecting oversize input and invalid contents. A type this build
+    /// does not know is [`MsgError::Unknown`], for the caller to skip; bytes after a known
+    /// message are fields a later build appended and are ignored (DESIGN.md section 8.5), except
+    /// after a [`Hello`], whose layout is frozen with no room to grow.
     pub fn decode(payload: &[u8]) -> Result<Self, MsgError> {
         if payload.len() > MAX_CONTROL_PAYLOAD {
             return Err(MsgError::TooLarge(payload.len()));
         }
-        let (msg, rest) =
-            postcard::take_from_bytes::<ControlMsg>(payload).map_err(|_| MsgError::Malformed)?;
-        if !rest.is_empty() {
+        match ext::classify(payload, CONTROL_VARIANTS) {
+            ext::Kind::Known => {}
+            ext::Kind::Unknown(kind) => return Err(MsgError::Unknown(kind)),
+            ext::Kind::Malformed => return Err(MsgError::Malformed),
+        }
+        let (msg, rest) = ext::decode_prefix::<ControlMsg>(payload).ok_or(MsgError::Malformed)?;
+        if matches!(msg, ControlMsg::Hello(_)) && !rest.is_empty() {
             return Err(MsgError::Malformed);
         }
         Ok(msg)
@@ -1177,6 +1207,34 @@ mod tests {
 
     fn name(s: &str) -> SessionName {
         s.parse().unwrap()
+    }
+
+    /// `CONTROL_VARIANTS` is what tells a known type from a later build's: it must be the count.
+    #[test]
+    fn the_variant_count_is_the_last_index_plus_one() {
+        let last = ControlMsg::Features(FeatureSet::none()).encode().unwrap();
+        assert_eq!(u32::from(last[0]) + 1, CONTROL_VARIANTS);
+    }
+
+    /// A later build's type is unknown, not malformed; its appended fields are ignored; a hello
+    /// cannot grow.
+    #[test]
+    fn unknown_types_and_appended_fields() {
+        assert_eq!(
+            ControlMsg::decode(&[CONTROL_VARIANTS as u8, 1, 2, 3]),
+            Err(MsgError::Unknown(CONTROL_VARIANTS))
+        );
+        let detach = ControlMsg::Detach.encode().unwrap();
+        let mut longer = detach.clone();
+        longer.extend_from_slice(&[9, 9, 9]);
+        assert_eq!(ControlMsg::decode(&longer), Ok(ControlMsg::Detach));
+        let mut hello = ControlMsg::Hello(Hello::ours("a".parse().unwrap()))
+            .encode()
+            .unwrap();
+        hello.push(0);
+        assert_eq!(ControlMsg::decode(&hello), Err(MsgError::Malformed));
+        // The retired slot is known and empty: still malformed.
+        assert_eq!(ControlMsg::decode(&[10]), Err(MsgError::Malformed));
     }
 
     #[test]
@@ -1395,13 +1453,19 @@ mod tests {
             },
             ControlMsg::Snapshot(snap),
             ControlMsg::Error(ErrorCode::VersionMismatch),
+            ControlMsg::Features(crate::ext::FeatureSet::from_bytes(&[1, 0, 0x80]).unwrap()),
         ];
         for m in msgs {
             let w = m.encode().unwrap();
             assert_eq!(ControlMsg::decode(&w).unwrap(), m);
+            // A later build's appended fields are ignored; a hello has no room for any.
             let mut extra = w.clone();
             extra.push(0);
-            assert!(ControlMsg::decode(&extra).is_err(), "trailing bytes: {m:?}");
+            if matches!(m, ControlMsg::Hello(_)) {
+                assert!(ControlMsg::decode(&extra).is_err(), "trailing bytes: {m:?}");
+            } else {
+                assert_eq!(ControlMsg::decode(&extra).unwrap(), m, "appended: {m:?}");
+            }
         }
     }
 

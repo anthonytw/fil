@@ -35,7 +35,12 @@ This note is the contract. `DESIGN.md` §8.5 ("Versioning") points here and foll
 9. **The daemon socket name is not a wire question.** It stays keyed by revision until D2 (the
    socket keyed by version) replaces it. The relay changes in one respect: a 1.x client whose
    own revision has no running daemon goes to the relay's own daemon instead of being refused.
-10. **Old-against-new CI**: a `compat` job in `linux-check`'s `extended` and `all` suites. It
+10. **The freeze starts now, and is final at the v1.0.0 tag.** The rest of the 1.0 work (D2's
+    daemon version in `fil ls`, `kill --outdated`, `-N`) follows the 1.x rules: it only adds.
+    Until the tag, an in-place change is still possible if it is really needed: move
+    `FIRST_STABLE_REVISION` to the new revision and run `just wire-golden-1-0` to take the
+    baseline again. After the tag, never.
+11. **Old-against-new CI**: a `compat` job in `linux-check`'s `extended` and `all` suites. It
     builds every tag listed in `tests/compat/tags.txt` and runs the drop-in quick set in both
     directions (old client against the new daemon, then new against old). The list is empty
     until 1.0 is tagged, and while it is empty the job reports that it skipped. Until then a

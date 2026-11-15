@@ -30,9 +30,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fil_proto::ChannelId;
+use fil_proto::ext::FeatureSet;
+use fil_proto::limits::MAX_SKIPPED_HANDSHAKE;
 use fil_proto::msg::{
-    Agent, Attach, AttachRefusal, ControlMsg, ErrorCode, ForwardResult, Hello, Request, Response,
-    SessionSummary, SubscriberSummary,
+    Agent, Attach, AttachRefusal, ControlMsg, ErrorCode, ForwardResult, Hello, MsgError, Request,
+    Response, SessionSummary, SubscriberSummary,
 };
 use fil_session::{ServeEnd, SessionHandle};
 
@@ -87,7 +89,9 @@ async fn send_ctl<L: Link>(link: &L, msg: &ControlMsg) -> Result<(), Fail> {
         .map_err(|_| Fail::Drop("the link went down"))
 }
 
-async fn recv_ctl<L: Link>(link: &L) -> Result<ControlMsg, Fail> {
+/// The next control message, or `None` for one of a type from a later 1.x build (its number is
+/// logged, never its contents), which the caller skips (DESIGN.md section 8.5).
+async fn recv_ctl<L: Link>(link: &L) -> Result<Option<ControlMsg>, Fail> {
     let (chan, payload) = link
         .recv()
         .await
@@ -95,7 +99,14 @@ async fn recv_ctl<L: Link>(link: &L) -> Result<ControlMsg, Fail> {
     if chan != ChannelId::CONTROL {
         return Err(Fail::Tell(ErrorCode::Protocol));
     }
-    ControlMsg::decode(&payload).map_err(|_| Fail::Tell(ErrorCode::Protocol))
+    match ControlMsg::decode(&payload) {
+        Ok(msg) => Ok(Some(msg)),
+        Err(MsgError::Unknown(kind)) => {
+            tracing::debug!(kind, "skipped a control message of unknown type");
+            Ok(None)
+        }
+        Err(_) => Err(Fail::Tell(ErrorCode::Protocol)),
+    }
 }
 
 /// After the last message to a peer: lets it get there, then closes.
@@ -148,7 +159,12 @@ impl Inner {
         )
         .await;
         let next = match negotiated {
-            Ok(Ok(next)) => next,
+            Ok(Ok((next, features))) => {
+                if !features.is_empty() {
+                    tracing::debug!(features = ?features.as_bytes(), "features in use");
+                }
+                next
+            }
             Ok(Err(Fail::Tell(code))) => {
                 tracing::warn!(?code, "refused a connection");
                 tell_and_close(&link, ControlMsg::Error(code)).await;
@@ -501,23 +517,47 @@ async fn summary(h: &SessionHandle) -> Option<SessionSummary> {
     })
 }
 
-/// `Hello` both ways, the version check, and the first request. The check comes before the
-/// request is read: a peer of another wire revision may have encoded its `Attach` in a way this
-/// daemon cannot decode, and the answer then must be "different version", not "protocol error".
-async fn negotiate<L: Link>(link: &L, revision: u16) -> Result<Next, Fail> {
+/// `Hello` and `Features` both ways, the version check, and the first request (DESIGN.md
+/// section 8.5). The check comes before the request is read: a peer of an incompatible wire may
+/// have encoded its `Attach` in a way this daemon cannot decode, and the answer then must be
+/// "different version", not "protocol error".
+///
+/// The client's `Features`, if it sent one, is the message right after its hello; a client that
+/// sent none has none. Messages of a type from a later 1.x build are skipped, at most
+/// [`MAX_SKIPPED_HANDSHAKE`] of them: the handshake has only its deadline otherwise.
+///
+/// Returns the request and the features in use (ours and the client's). 1.0 defines none, so
+/// nothing reads them yet; a 1.x feature passes them on to what it governs.
+async fn negotiate<L: Link>(link: &L, revision: u16) -> Result<(Next, FeatureSet), Fail> {
     let ours = our_hello(revision);
     send_ctl(link, &ControlMsg::Hello(ours.clone())).await?;
-    let ControlMsg::Hello(theirs) = recv_ctl(link).await? else {
+    send_ctl(link, &ControlMsg::Features(FeatureSet::ours())).await?;
+    let Some(ControlMsg::Hello(theirs)) = recv_ctl(link).await? else {
         return Err(Fail::Tell(ErrorCode::Protocol));
     };
     if let Err(e) = ours.check(&theirs) {
         tracing::warn!(peer = %theirs.agent, "{e}");
         return Err(Fail::Tell(ErrorCode::VersionMismatch));
     }
-    match recv_ctl(link).await? {
-        ControlMsg::Attach(a) => Ok(Next::Attach(a)),
-        ControlMsg::Request(r) => Ok(Next::Request(r)),
-        _ => Err(Fail::Tell(ErrorCode::Protocol)),
+    let mut features = FeatureSet::none();
+    let mut right_after_hello = true;
+    let mut skipped = 0;
+    loop {
+        match recv_ctl(link).await? {
+            None => {
+                skipped += 1;
+                if skipped > MAX_SKIPPED_HANDSHAKE {
+                    return Err(Fail::Tell(ErrorCode::Protocol));
+                }
+            }
+            Some(ControlMsg::Features(theirs)) if right_after_hello => {
+                features = FeatureSet::ours().common(&theirs);
+            }
+            Some(ControlMsg::Attach(a)) => return Ok((Next::Attach(a), features)),
+            Some(ControlMsg::Request(r)) => return Ok((Next::Request(r), features)),
+            Some(_) => return Err(Fail::Tell(ErrorCode::Protocol)),
+        }
+        right_after_hello = false;
     }
 }
 

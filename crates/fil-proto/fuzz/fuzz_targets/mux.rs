@@ -26,7 +26,7 @@ fn check(msg: &MuxMsg) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok(msg) = decode_body(data) {
+    if let Ok(Some(msg)) = decode_body(data) {
         check(&msg);
     }
 

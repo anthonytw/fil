@@ -514,6 +514,7 @@ async fn summary(h: &SessionHandle) -> Option<SessionSummary> {
             }),
         forwards: h.forward_count(),
         agent: h.agent_relayed(),
+        daemon_version: fil_proto::msg::FilVersion::ours(),
     })
 }
 

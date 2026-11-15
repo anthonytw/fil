@@ -51,6 +51,8 @@ pub const MAX_PUBLIC_KEY: usize = 256;
 pub const MAX_FINGERPRINT: usize = 64;
 /// Longest agent string in the hello.
 pub const MAX_AGENT: usize = 64;
+/// Longest fil version string (`crate::msg::FilVersion`, `0.3.0`, `1.2.0-rc.1+abc`).
+pub const MAX_FIL_VERSION: usize = 32;
 
 /// Default size of the daemon's terminal output log (DESIGN.md section 6.1).
 pub const DEFAULT_LOG_CAPACITY: usize = 8 * 1024 * 1024;

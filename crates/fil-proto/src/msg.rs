@@ -177,6 +177,35 @@ validated_string!(
     check_agent
 );
 
+fn check_fil_version(s: &str) -> Result<(), &'static str> {
+    if s.is_empty() || s.len() > MAX_FIL_VERSION {
+        return Err("length must be 1 to 32");
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+    {
+        return Err("only A-Z a-z 0-9 . - + allowed");
+    }
+    Ok(())
+}
+
+validated_string!(
+    /// A fil release version (`0.3.0`, `1.2.0-rc.1`): `[A-Za-z0-9.+-]{1,32}`. Which build a
+    /// daemon is, for `fil ls` and `fil kill --outdated` (decision D2); numbers and dots only in
+    /// practice, checked so a hostile daemon cannot put anything else on the user's terminal.
+    FilVersion,
+    "fil version",
+    check_fil_version
+);
+
+impl FilVersion {
+    /// This build's version.
+    pub fn ours() -> Self {
+        Self::new(env!("CARGO_PKG_VERSION")).expect("the crate version is a valid fil version")
+    }
+}
+
 fn check_process_name(s: &str) -> Result<(), &'static str> {
     if s.len() > MAX_PROCESS_NAME {
         return Err("longer than 32 bytes");
@@ -642,6 +671,9 @@ pub struct SessionSummary {
     pub forwards: u16,
     /// The agent is relayed (the subscriber asked for it).
     pub agent: bool,
+    /// The version of the daemon that holds the session (decision D2: daemons of several
+    /// versions on one host; `fil ls` shows it).
+    pub daemon_version: FilVersion,
 }
 
 /// Session management (`fil ls`, `fil kill`, `fil detach`). The remote command is fixed
@@ -695,17 +727,28 @@ pub enum ForwardResult {
 /// A daemon of another wire revision, running next to the one that answers (DESIGN.md section
 /// 5.3). Its sessions cannot be listed or reached from here: only a fil of its own revision can
 /// speak to it. Numbers only: it names no session and no host.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OtherDaemon {
     pub major: u16,
     /// 0 is a daemon from before wire revisions.
     pub revision: u16,
+    /// Its fil version, when the daemon that answers knows it (decision D2 keys daemons by
+    /// version); `None` for one found only by its wire (`fil-<major>-<rev>.lock`).
+    pub version: Option<FilVersion>,
 }
 
 impl OtherDaemon {
     /// Words for it, numbers only: the major is named when it is not ours (`fil-2-3.sock` is not
     /// "wire rev 3" of this fil).
     pub fn describe(&self) -> String {
+        let wire = self.describe_wire();
+        match &self.version {
+            Some(v) => format!("{wire}, fil {v}"),
+            None => wire,
+        }
+    }
+
+    fn describe_wire(&self) -> String {
         match (self.major == PROTOCOL_MAJOR, self.revision) {
             (true, 0) => "a daemon from an older fil (before wire revisions)".to_string(),
             (true, rev) => format!("a daemon of wire rev {rev}"),
@@ -1295,13 +1338,14 @@ mod tests {
         let other = OtherDaemon {
             major: 1,
             revision: 2,
+            version: None,
         };
         let sessions = |n: usize| {
             // Built by hand: `Response::sessions` would cut the list.
             ControlMsg::Response(Response::Sessions {
                 list: vec![],
                 truncated: false,
-                others: vec![other; n],
+                others: vec![other.clone(); n],
             })
         };
         let at_the_cap = sessions(MAX_OTHER_DAEMONS).encode().unwrap();
@@ -1432,10 +1476,12 @@ mod tests {
                     }),
                     forwards: 2,
                     agent: true,
+                    daemon_version: FilVersion::ours(),
                 }],
                 vec![OtherDaemon {
                     major: 1,
                     revision: 0,
+                    version: None,
                 }],
             )),
             ControlMsg::Detach,
@@ -1533,6 +1579,7 @@ mod tests {
             }),
             forwards: u16::MAX,
             agent: true,
+            daemon_version: FilVersion::ours(),
         };
         let r = Response::sessions((0..500).map(one).collect(), Vec::new());
         let Response::Sessions {

@@ -40,7 +40,21 @@ This note is the contract. `DESIGN.md` §8.5 ("Versioning") points here and foll
     Until the tag, an in-place change is still possible if it is really needed: move
     `FIRST_STABLE_REVISION` to the new revision and run `just wire-golden-1-0` to take the
     baseline again. After the tag, never.
-11. **Old-against-new CI**: a `compat` job in `linux-check`'s `extended` and `all` suites. It
+11. **Daemons, sockets and locks stay keyed by revision.** The frozen 1.x wire means every 1.x
+    build speaks one wire, but the revision still changes whenever the encoding changes. Builds
+    with the same revision (a patch release, for example) share one daemon, its socket
+    `fil-1-<rev>.sock` and its lock `fil-1-<rev>.lock`, exactly as today. Builds with different
+    revisions run side by side. `docs/m4/release.md` §6.4.4 (frozen) has every daemon hold its
+    `fil-<major>-<rev>.lock` for its whole life, so as long as sockets are keyed by revision, two
+    daemons of the *same* revision cannot run at once. D2 ("each daemon build on its own socket,
+    keyed by its version") therefore needs the lock key to move from `<rev>` to the version.
+    That is an owner decision about §6.4.4, not a wire change: the wire depends on none of
+    these names.
+12. **D2's wire needs.** One is in the 1.0 encoding now, because it could not be added later:
+    `SessionSummary.daemon_version` and `OtherDaemon.version` (`FilVersion`,
+    `[A-Za-z0-9.+-]{1,32}`), which sit inside lists, where nothing can be appended once the
+    wire is frozen. The other two need no 1.0 support (below, *D2 under the frozen wire*).
+13. **Old-against-new CI**: a `compat` job in `linux-check`'s `extended` and `all` suites. It
     builds every tag listed in `tests/compat/tags.txt` and runs the drop-in quick set in both
     directions (old client against the new daemon, then new against old). The list is empty
     until 1.0 is tagged, and while it is empty the job reports that it skipped. Until then a
@@ -184,6 +198,31 @@ sequenceDiagram
 
 **Not a 1.x change:** anything in the frozen list above, a new required handshake step, or
 making an unknown type fatal. Each of these needs 2.0.
+
+## D2 under the frozen wire
+
+D2 (daemons of several versions on one host, `fil kill --outdated`) needs three things from the
+wire:
+
+- **Each daemon's version.** `SessionSummary.daemon_version` (the daemon that holds the session)
+  and `OtherDaemon.version` (`None` for a daemon known only by its socket's revision) are in the
+  1.0 encoding. `Response::Sessions` sits at the end of its message, so a field appended there
+  later needs no feature. The rows in its lists cannot grow, which is why both fields went in
+  now.
+- **Reaching a particular daemon.** The relay is always the client's own build (the bootstrap
+  runs the client's exact version), so a 1.x client can tell its relay which daemon it wants
+  with a new control message sent right after its `Hello`, a `Route` that the relay reads and
+  does not pass on. A relay that is too old to know `Route` (a `remote = "plain"` host running
+  an older installed fil) passes it to its daemon, which skips it as an unknown type, so the
+  client reaches that relay's default daemon. That degrades cleanly and needs nothing from 1.0
+  beyond "unknown types are skipped". The frozen hello and the fixed remote command stay as
+  they are.
+- **A kill pre-check** (the jobs a session has left behind, reported before killing it). This
+  is a new `Request` variant behind a feature bit. The client waits for the daemon's `Features`
+  before sending it (the one round trip a gated request pays). An older daemon never sees the
+  request. It must not be an appended field on `KillSession` (such as a "check only" flag),
+  because a 1.0 daemon would ignore the flag and kill the session: exactly the kind of field
+  the sender's rule forbids sending without a feature.
 
 ## Limits for skipped data
 

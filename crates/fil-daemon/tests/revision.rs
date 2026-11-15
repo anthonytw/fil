@@ -61,6 +61,7 @@ fn other(revision: u16) -> OtherDaemon {
     OtherDaemon {
         major: PROTOCOL_MAJOR,
         revision,
+        version: None,
     }
 }
 

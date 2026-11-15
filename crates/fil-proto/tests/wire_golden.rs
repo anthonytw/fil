@@ -1164,6 +1164,7 @@ fn summary() -> SessionSummary {
         }),
         forwards: 2,
         agent: true,
+        daemon_version: FilVersion::new("1.0.0").unwrap(),
     }
 }
 
@@ -1176,10 +1177,12 @@ fn responses() -> Vec<Response> {
                 OtherDaemon {
                     major: 1,
                     revision: 0,
+                    version: None,
                 },
                 OtherDaemon {
                     major: 1,
                     revision: 2,
+                    version: None,
                 },
             ],
         },
@@ -1607,12 +1610,14 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
                 }),
                 forwards: u16::MAX,
                 agent: true,
+                daemon_version: FilVersion::new(longest('9', MAX_FIL_VERSION)).unwrap(),
             }],
             truncated: true,
             others: vec![
                 OtherDaemon {
                     major: u16::MAX,
-                    revision: u16::MAX
+                    revision: u16::MAX,
+                    version: Some(FilVersion::new(longest('9', MAX_FIL_VERSION)).unwrap()),
                 };
                 MAX_OTHER_DAEMONS
             ],
@@ -1937,6 +1942,7 @@ fn limits() -> Entries {
         num("MAX_HOST_LABEL", MAX_HOST_LABEL),
         num("MAX_PUBLIC_KEY", MAX_PUBLIC_KEY),
         num("MAX_FINGERPRINT", MAX_FINGERPRINT),
+        num("MAX_FIL_VERSION", MAX_FIL_VERSION),
         num("MAX_PREAMBLE_SKIP", MAX_PREAMBLE_SKIP),
         // The first varint of a record payload; no data segment can start there.
         num("input::RECORD_MARK", RECORD_MARK),
@@ -2046,11 +2052,12 @@ fn revisioned() -> Entries {
 
     // What each decoder accepts, one step either side of every limit: the golden pins the
     // behaviour as well as the constants, so a widened integer or a loosened check shows up.
-    let strings: [(&str, usize); 4] = [
+    let strings: [(&str, usize); 5] = [
         ("session-name", MAX_SESSION_NAME),
         ("term", MAX_TERM),
         ("host-label", MAX_HOST_LABEL),
         ("agent", MAX_AGENT),
+        ("fil-version", MAX_FIL_VERSION),
     ];
     for (what, max) in strings {
         for n in [max, max + 1] {
@@ -2059,11 +2066,16 @@ fn revisioned() -> Entries {
                 "session-name" => outcome::<SessionName>(&wire),
                 "term" => outcome::<TermName>(&wire),
                 "host-label" => outcome::<HostLabel>(&wire),
+                "fil-version" => outcome::<FilVersion>(&wire),
                 _ => outcome::<Agent>(&wire),
             };
             e.push((format!("decode/{what}-{n}"), r));
         }
     }
+    e.push((
+        "decode/fil-version-escape".into(),
+        outcome::<FilVersion>(&counted_str("1.0\u{1b}")),
+    ));
     for (what, max) in [
         ("public-key", MAX_PUBLIC_KEY),
         ("fingerprint", MAX_FINGERPRINT),
@@ -2238,26 +2250,27 @@ fn revisioned() -> Entries {
         ));
     }
     for v in [u64::from(u16::MAX), u64::from(u16::MAX) + 1] {
-        // Response::Sessions { list: [], truncated, others: [OtherDaemon { major, revision }] }.
+        // Response::Sessions { list: [], truncated, others: [OtherDaemon { major, revision,
+        // version: None }] }.
         e.push((
             format!("decode/other-daemon-major-{v}"),
             control_outcome(&raw_msg(
                 response_index(),
-                &[vec![0, 0, 0], vec![1], varint(v), varint(1)],
+                &[vec![0, 0, 0], vec![1], varint(v), varint(1), vec![0]],
             )),
         ));
         e.push((
             format!("decode/other-daemon-revision-{v}"),
             control_outcome(&raw_msg(
                 response_index(),
-                &[vec![0, 0, 0], vec![1], varint(1), varint(v)],
+                &[vec![0, 0, 0], vec![1], varint(1), varint(v), vec![0]],
             )),
         ));
     }
     // The list of other daemons is capped by the receiver as well as the sender.
     for n in [MAX_OTHER_DAEMONS, MAX_OTHER_DAEMONS + 1] {
         let mut fields = vec![vec![0, 0, 0], varint(n as u64)];
-        fields.extend((0..n).map(|_| vec![1, 1]));
+        fields.extend((0..n).map(|_| vec![1, 1, 0]));
         e.push((
             format!("decode/others-{n}"),
             control_outcome(&raw_msg(response_index(), &fields)),
@@ -2718,7 +2731,8 @@ fn forward_probes() -> Entries {
         e.push((format!("decode/ports-rows-{n}"), outcome::<PortsPart>(&v)));
     }
     for v in [u64::from(u16::MAX), u64::from(u16::MAX) + 1] {
-        // SessionSummary { name, term, created, last, attached: None, forwards, agent }.
+        // SessionSummary { name, term, created, last, attached: None, forwards, agent,
+        // daemon_version }.
         let summary = [
             counted_str("main"),
             counted_str("xterm"),
@@ -2727,6 +2741,7 @@ fn forward_probes() -> Entries {
             vec![0],
             varint(v),
             vec![1],
+            counted_str("1.0.0"),
         ]
         .concat();
         e.push((

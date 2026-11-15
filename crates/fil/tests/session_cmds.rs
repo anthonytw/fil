@@ -687,6 +687,7 @@ fn session_row(n: &str, host: &str, since_ms: u64) -> PortsRow {
         }),
         forwards: 0,
         agent: false,
+        daemon_version: fil_proto::msg::FilVersion::ours(),
     })
 }
 

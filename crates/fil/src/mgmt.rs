@@ -381,6 +381,7 @@ mod tests {
             }),
             forwards: 0,
             agent: false,
+            daemon_version: fil_proto::msg::FilVersion::ours(),
         }
     }
 
@@ -705,10 +706,12 @@ mod tests {
             OtherDaemon {
                 major: 1,
                 revision: 0,
+                version: None,
             },
             OtherDaemon {
                 major: 1,
                 revision: 4,
+                version: None,
             },
         ];
         let reply = Response::Sessions {
@@ -731,10 +734,12 @@ mod tests {
                 OtherDaemon {
                     major: 2,
                     revision: 3,
+                    version: None,
                 },
                 OtherDaemon {
                     major: 2,
                     revision: 0,
+                    version: None,
                 },
             ],
         };
@@ -762,6 +767,7 @@ mod tests {
             others: vec![OtherDaemon {
                 major: 1,
                 revision: 2,
+                version: None,
             }],
         };
         let out = render(&Request::ListSessions, &only, "devbox", NOW).unwrap();

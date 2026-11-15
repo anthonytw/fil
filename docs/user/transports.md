@@ -43,12 +43,12 @@ fil devbox --transport pipe
 
 ## UDP and firewalls
 
-Direct mode uses **one UDP port per user on the host**, not one per session. The daemon picks it from `60000` to `61000` inclusive, starting at a random point; that is the range mosh uses, so a host already open for mosh works unchanged. In `daemon.toml` you can change the range (`port_range`) and the address it binds (`bind`); see [`daemon.toml`](daemon.md).
+Direct mode uses **one UDP port per running daemon on the host**, not one per session: normally one per user, and one per fil version while an older version's daemon still holds sessions after an upgrade. The daemon picks it from `60000` to `61000` inclusive, starting at a random point; that is the range mosh uses, so a host already open for mosh works unchanged. In `daemon.toml` you can change the range (`port_range`) and the address it binds (`bind`); see [`daemon.toml`](daemon.md).
 
 - **Open UDP 60000-61000 to the host** (or the range you set) for direct mode. Without it, fil stays on the pipe and works, with ssh's behavior on a bad network instead of QUIC's.
 - **The client dials the name or address ssh would use:** for the default pipe, the host name that `ssh -G HOST` reports, so an alias from `~/.ssh/config` works. For a host behind `ProxyJump` or `ProxyCommand`, and for any custom `pipe`, fil does **not** dial unless you set `direct.address` for that host: the name belongs to the jump host, and a lookup would tell your network's resolver where you are going.
 - **No UDP at all on the host:** an admin can switch direct mode off (`direct = false` in [`policy.toml`](policy.md), or `direct = false` in your own `daemon.toml`). Then no UDP port is opened and every client stays on the pipe.
-- **Nothing is trusted on first use.** The daemon's certificate fingerprint arrives over the ssh login and is pinned; the client authenticates with a key made in memory for this attach and registered over the same login. Anything else that reaches the port is dropped. See [security and privacy](security-privacy.md).
+- **Nothing is trusted on first use.** The daemon's certificate fingerprint arrives over the ssh login and is pinned; the client authenticates with a key made in memory for this attach and registered over the same login. Before that, the port answers like any QUIC server (a Retry, and to a peer that offers fil's protocol, the daemon's certificate, before an unregistered key is refused), so a scanner can tell a fil daemon is there; the certificate names no host or user, and nothing else is reachable without the registered key. See [security and privacy](security-privacy.md).
 
 ## A custom pipe
 

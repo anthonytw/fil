@@ -6,10 +6,10 @@ This page is for the person who runs a host that users connect to with fil. You 
 
 ## What fil does on your host
 
-- Each user who runs it gets one daemon, as themselves, started by their first login. There is no system-wide service and nothing setuid.
+- Each user who runs it gets a daemon (one per fil version for a while after an upgrade), as themselves, started by their first login. There is no system-wide service and nothing setuid.
 - The daemon holds the user's sessions (a shell each), in memory. Its socket is in `/tmp/fil-$UID/` (mode 0700), and every connection's peer user is checked.
 - It uses ssh for authentication. An attach is an ordinary ssh login that runs `fil server --stdio`. fil adds no accounts and no keys of its own.
-- **Direct mode** adds one UDP port per user, in 60000-61000 by default (the range mosh uses). The port accepts only a client holding a key registered over the user's ssh login.
+- **Direct mode** adds one UDP port per running fil daemon (normally one per user; one per fil version for a while after an upgrade), in 60000-61000 by default (the range mosh uses). The port accepts only a client holding a key registered over the user's ssh login.
 - A user may install fil into `~/.local/share/fil` through their own ssh login. Nothing is installed anywhere else.
 
 ## Layer 1: the sshd mirror

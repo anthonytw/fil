@@ -40,7 +40,7 @@ fil -N devbox -L 5432 &       # in the background
 ```
 
 - It needs something to hold: a forward (a flag, or your config's `forward`) or `-A`. With neither it exits with status 2 and connects nowhere.
-- The session is `tunnel` unless you name one, not `main`, so it never asks to take over the session your shell is attached to. It is an ordinary session with an idle shell on the host: `fil ls` lists it, `fil kill devbox tunnel` ends it, and attaching to it with a terminal takes it over.
+- The session is `tunnel` unless you name one, not `main`, so it never asks to take over the session your shell is attached to. It is an ordinary session with an idle shell on the host: `fil ls` lists it, `fil kill devbox tunnel` ends it, and attaching to it with a terminal takes it over. Attaching `-N` to a session sets its terminal to 80x24, since a tunnel has none: a session you name, whether detached or taken over, has its full-screen programs redraw at that size until you attach again with a terminal. A later 1.x release is planned to keep the size.
 - It cannot ask you anything, so it says no: a forward the host asks for (`fil forward`, below) is refused, and a signature `agent = "confirm"` would ask about is refused.
 - A session another client holds: if that client is disconnected (an earlier tunnel that was killed, slept or lost its network without detaching), `-N` takes the session over and says so; if it is connected, `-N` leaves it alone and exits 1. `--take-over` takes it either way: give it to a tunnel that runs unattended (a service, a script) and must win.
 - A signal it was started with ignored stays ignored, so `nohup fil -N devbox -L 5432 &` survives closing the terminal.

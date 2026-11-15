@@ -1,6 +1,8 @@
 # M3 T1 part 1: the full-stack prediction harness, and resize in the true order
 
-> **Status: built; the result below gates W1 (`docs/m3/plan.md` §2.8).** Written against `origin/main` at `0c1413e` (wire revision 11), with the M0 predictor and trait as they are on that commit. Part 2 of T1 (the prediction suites and the independent classifier) builds on this: its first part is in §9, written on `60ab0ee`.
+> **Historical: M3's harness work, as built.** Its result gated W1 (`docs/m3/plan.md` §2.8), and M3 shipped in 0.2.0. `DESIGN.md` and the code win where they differ; the harness itself is still run (`docs/dev/timing-tests.md`).
+>
+> Written against `origin/main` at `0c1413e` (wire revision 11), with the M0 predictor and trait as they are on that commit. Part 2 of T1 (the prediction suites and the independent classifier) builds on this: its first part is in §9, written on `60ab0ee`.
 
 ## 1. What it is
 

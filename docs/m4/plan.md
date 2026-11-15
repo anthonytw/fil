@@ -1,6 +1,6 @@
 # M4 plan: release
 
-> **Status: built; the §6.4 sweep is in progress. This becomes a historical work order when the sweep closes: `DESIGN.md` and `docs/m4/release.md` win where they differ. It was proposed by the coordinator on 2026-11-04 and revised after its review.** The owner asked (2026-11-04) for M4 to start now, in parallel with M3 (prediction, planned separately in `docs/m3/plan.md`) and with M2's last sweep PRs. `DESIGN.md` stays the source of truth; when a package changes a decision, it updates `DESIGN.md` in the same PR. Items marked **proposed** are the coordinator's calls, which review and the owner may change. Items marked **OWNER** wait for the owner (§7). **The owner answered OQ-1 (yes), OQ-2, OQ-3 and OQ-4 on 2026-11-04** (§7; OQ-3 and OQ-4 differ from the recommendations), and in a second round the same day the first version, the crates.io names, the v1 channels and macOS notarization (§7, `docs/m4/release.md` §10); OQ-5 is not recorded as answered. Written on `origin/main` at `12f974d`.
+> **Historical work order. `DESIGN.md` and `docs/m4/release.md` are the source of truth and win where they differ.** M4 is done: the §6.4 sweep closed and 0.1.0, the first release, shipped on 2026-11-07. This file was proposed by the coordinator on 2026-11-04 and revised after its review. The owner asked (2026-11-04) for M4 to start now, in parallel with M3 (prediction, planned separately in `docs/m3/plan.md`) and with M2's last sweep PRs. `DESIGN.md` stays the source of truth; when a package changes a decision, it updates `DESIGN.md` in the same PR. Items marked **proposed** are the coordinator's calls, which review and the owner may change. Items marked **OWNER** wait for the owner (§7). **The owner answered OQ-1 (yes), OQ-2, OQ-3 and OQ-4 on 2026-11-04** (§7; OQ-3 and OQ-4 differ from the recommendations), and in a second round the same day the first version, the crates.io names, the v1 channels and macOS notarization (§7, `docs/m4/release.md` §10); OQ-5 is not recorded as answered. Written on `origin/main` at `12f974d`.
 
 M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the deeper pre-release sweep; the project site at fil.anthonywertz.com; macOS target tests on GitHub's macOS runners. It is done when **the pre-release sweep is closed before the first release**. **v0.1.0 ships without prediction (decided, owner 2026-11-04, 10:28 ET: N9)**: it is an ssh/et drop-in (sessions that survive reconnects, roaming and sleep, forwarding, server policy). M3 continues in parallel and is 0.2.0's headline, so M3 no longer gates M4; M3's K1 (terminal-channel pacing) still does, because it affects every user. 0.1.0 exposes no `predict` key and no `--predict` flag.
 
@@ -487,7 +487,7 @@ Every package keeps M2's rules:
   - the client's `config.toml` parser (`crates/fil/fuzz`).
 
   Each target has a seed corpus taken from the wire golden or the doc examples. `just fuzz TARGET SECONDS` runs one target.
-- **Done when:** every target runs. A campaign (each target for an hour, in the VM or on a runner) finds no crash, or each crash becomes a fix PR. The campaign is part of SWEEP's security audit.
+- **Done when:** every target runs. A campaign (each target for an hour, in the VM or on a runner) finds no crash, or each crash becomes a fix PR. The campaign is part of SWEEP's security audit. (Superseded for later releases, owner 2026-11-15: 5 minutes per peer or remote-host target, all in parallel, and the local config-file targets only when their parser changes; `DESIGN.md` §12.)
 
 **LOG: a non-blocking log writer** (M1-A2)
 - **In flight:** PR #92 (`m4-log`).
@@ -732,7 +732,7 @@ Each PR runs `just ci` and the package's tests with its mutation table, and gets
 | `macos-check` `remote` | GitHub, Apple silicon | macOS as the remote, with the upgrade in place and TMP's `clean-tmps` case |
 | `release.yml` dry run | GitHub | the archives, the layout, reproducibility of binaries and archives, `release-check` |
 | `tests/release/just.sh release-verify` | the VM (amd64 emulation) | the independent rebuild |
-| `just fuzz` campaign | the VM or a runner | FUZZ's targets, one hour each, during SWEEP |
+| `just fuzz` campaign | the VM or a runner | FUZZ's targets, one hour each, during SWEEP (now 5 minutes per peer or remote-host target before a release: `DESIGN.md` §12) |
 | `log_blocking`, `tmp_clean` | `just ci` | LOG's blocked writer; TMP's mechanism |
 | Arm64 remote drop-in with the release bits | `linux-check` `arm64-remote` (GitHub's arm64 runner; the Pis optional since 2026-11-11) | `pi_e2e` and the M1, M2 and M3 drop-in suites on the RC's own aarch64 binary, behind the Pis' gate verbs |
 

@@ -36,6 +36,7 @@ use crate::install::attach::Offer;
 use crate::install::fallback::Run;
 use crate::link::AnyLink;
 use crate::ports_view::{PortsAnswer, ViewOptions, render_json, render_text};
+use crate::upgrade::Version;
 use crate::{localtime, mgmt};
 
 /// Exit status of a normal end.
@@ -383,11 +384,17 @@ async fn single(place: &Place<'_>, request: Request, config: &Config) -> u8 {
         Ok(c) => c,
         Err(code) => return code,
     };
-    let answer = mgmt::ask_one(&conn.link, request.clone()).await;
+    let answer = mgmt::ask_one_peer(&conn.link, request.clone()).await;
     let code = match &answer {
-        Ok(response) => match mgmt::render(&request, response, conn.label(), now_unix_ms()) {
+        Ok((response, peer)) => match mgmt::render(&request, response, conn.label(), now_unix_ms())
+        {
             Ok(text) => {
                 write_stdout(&text);
+                if let Some(note) = after_answer(&request, peer.as_ref(), &Version::ours(), || {
+                    crate::upgrade::detect(&crate::upgrade::System)
+                }) {
+                    eprintln!("fil: {note}");
+                }
                 OK
             }
             Err(mut e) => {
@@ -405,6 +412,36 @@ async fn single(place: &Place<'_>, request: Request, config: &Config) -> u8 {
     };
     conn.finish().await;
     code
+}
+
+/// What is said on stderr after an answer was printed: for `fil ls`, the note about a newer
+/// daemon ([`newer_daemon_note`]); nothing for the other requests.
+fn after_answer(
+    request: &Request,
+    peer: Option<&fil_proto::msg::Agent>,
+    ours: &Version,
+    install: impl FnOnce() -> crate::upgrade::Install,
+) -> Option<String> {
+    match request {
+        Request::ListSessions => newer_daemon_note(peer?.as_str(), ours, install),
+        _ => None,
+    }
+}
+
+/// The note `fil ls` adds when the daemon that answered is a newer fil than this one (its
+/// `Hello` says so; nothing more is asked of the host). Its wire is ours (a daemon of another wire
+/// fails at the hello), so it serves this client; the note says how to catch up, without the path
+/// of a copy made by hand (the note is often pasted elsewhere).
+fn newer_daemon_note(
+    agent: &str,
+    ours: &Version,
+    install: impl FnOnce() -> crate::upgrade::Install,
+) -> Option<String> {
+    let theirs = crate::upgrade::newer_daemon(agent, ours)?;
+    let how = crate::upgrade::upgrade_line_without_path(&install());
+    Some(format!(
+        "the daemon there is fil {theirs}, newer than this fil {ours}. {how}"
+    ))
 }
 
 /// For a session that is not in the daemon of this build's revision: it may live in one of
@@ -492,4 +529,44 @@ pub async fn ports(target: Target, json: bool, probe_other: bool, config: &Confi
     };
     conn.finish().await;
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::upgrade::Install;
+    use fil_proto::msg::Agent;
+
+    #[test]
+    fn fil_ls_notes_a_newer_daemon_and_nothing_else_does() {
+        let ours = Version::parse("0.4.0").unwrap();
+        let newer = Agent::new("fil-daemon 0.4.1").unwrap();
+        let hand = || Install::Manual("/home/someone/bin/fil".into());
+        let note = after_answer(&Request::ListSessions, Some(&newer), &ours, hand)
+            .expect("a note for a newer daemon");
+        assert!(
+            note.contains("fil 0.4.1, newer than this fil 0.4.0"),
+            "{note}"
+        );
+        assert!(note.contains("Upgrade: "), "{note}");
+        // The note is often pasted: no path of the user's home in it.
+        assert!(!note.contains("/home/someone"), "{note}");
+        // Not for the same or an older daemon, an unknown greeting, or no greeting.
+        for agent in ["fil-daemon 0.4.0", "fil-daemon 0.3.9", "test-daemon"] {
+            let a = Agent::new(agent).unwrap();
+            assert_eq!(
+                after_answer(&Request::ListSessions, Some(&a), &ours, hand),
+                None
+            );
+        }
+        assert_eq!(
+            after_answer(&Request::ListSessions, None, &ours, hand),
+            None
+        );
+        // Only `fil ls` says it.
+        let kill = Request::KillSession {
+            name: SessionName::new("main").unwrap(),
+        };
+        assert_eq!(after_answer(&kill, Some(&newer), &ours, hand), None);
+    }
 }

@@ -4,11 +4,18 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+### Added
+
+- **`fil -N HOST`: forwards only, with no terminal**, as `ssh -N`. It holds the session's `-L`, `-R` and `-D` forwards (and the agent relay with `-A`) until you stop it with Ctrl-C, reconnecting like any fil, and works in the background or from a script. The session is `tunnel` unless you name one, so it never asks to take your shell's `main`. It needs a forward (a flag or the config's `forward`) or `-A`, or it exits with status 2. It asks nothing: a forward the host asks for, or a signature `agent = "confirm"` would ask about, is refused. A session held by a disconnected client (an earlier tunnel that died without detaching) is taken over, and said so; one held by a connected client is left alone (status 1) unless `--take-over` is given, which unattended tunnels should pass. Ctrl-C detaches it and exits 0 (255 before it is attached, as `ssh -N`), and the host hears the detach over the pipe too. A signal it was started with ignored stays ignored, so `nohup fil -N ... &` survives closing the terminal.
+- `fil ls` says when the host's daemon is a newer fil than yours, with the command that upgrades yours (read from the daemon's greeting, which fil already gets; nothing more is asked of the host).
+
 ### Changed
 
 - **Each version of fil runs its own daemon on a host** (the host side of the 1.0 decision D2). A daemon's socket is now named for its build as well as its wire (`/tmp/fil-$UID/fil-<major>-<rev>-v<version>.sock`), so a new version's first connection starts its daemon beside the old one even when the wire is unchanged. New sessions go to the newest daemon of the client's wire (an older `fil` on the host connects to it too), and an older daemon exits as soon as its last session ends, so daemon-side fixes reach every new session at once. Until fil can address an older daemon of the same wire (with the 1.0 wire), that daemon's sessions are not listed or reachable once a newer one runs: end them before upgrading a host. A daemon from an earlier version keeps its wire: a new daemon of the same wire does not start beside it, and connections go to it as before.
 - The daemons of one wire share its lock file (`fil-<major>-<rev>.lock`): the first takes it and each later one is handed the first one's open file over a local socket, so `fil install --remove` and the install's cleanup see it held from the first daemon's start to the last one's exit and never remove a copy a running daemon needs. Each daemon has a lending socket (`…-v<version>.lend`, mode 0600) for this, in the socket directory.
 - A session's `SSH_AUTH_SOCK` directory is named for its daemon's build (`/tmp/fil-$UID/a-<hash>/`), so same-named sessions of two daemons never share an agent socket.
+- When fil leaves a session alone because another client holds it, the message says "(disconnected)" when that client's link is down, as the question does.
+- **`fil --version` says how to upgrade.** Its second line names how this copy was installed and the command that upgrades it (Homebrew, cargo, the `.deb` or `.rpm`, the AUR, Nix, a `fil install` copy on a host, `~/.local/bin`, or a copy by hand, with its path). fil works this out from its own path and the package manager's files, with no network and without running anything; it still never updates itself or checks for updates. The first line is unchanged; the legal notices follow.
 
 ### Fixed
 

@@ -123,6 +123,64 @@ pub struct PipeConfig {
     /// Leave it off for the first, interactive run, whose prompts the user answers, and for
     /// anything that must receive the terminal's `^C`: a command in another group no longer does.
     pub own_process_group: bool,
+    /// Start the command with SIGHUP, SIGINT and SIGQUIT ignored ([`PipeLink::spawn`] only), so
+    /// that the terminal's `^C`, `^\\` and hangup, which go to the whole foreground group, reach
+    /// only this process. Default `false`.
+    ///
+    /// For a client that keeps the terminal cooked and in the foreground group with the command
+    /// (a tunnel, `fil -N`): it must tell the daemon it is going (`Detach`) over the link the
+    /// command carries, which the signal would otherwise have killed first. ssh keeps an ignored
+    /// disposition (`client_loop` installs its handlers only where the signal was not ignored, as
+    /// for `nohup`), so its prompts still work, and a `^C` at one still ends the run: this process
+    /// gets the signal, gives up and kills the command. Done without `unsafe`: the command is run
+    /// as `/bin/sh -c 'trap "" HUP INT QUIT; exec "$@"' fil-pipe COMMAND...`, and an ignored
+    /// disposition survives `exec`. The program is looked up on `$PATH` first, so a missing one
+    /// fails with the same spawn error as without the shell.
+    pub ignore_job_signals: bool,
+}
+
+/// The shell that starts a command with SIGHUP, SIGINT and SIGQUIT ignored
+/// ([`PipeConfig::ignore_job_signals`]); the argument after the script is the shell's `$0`.
+const IGNORING_SHELL: [&str; 4] = [
+    "/bin/sh",
+    "-c",
+    "trap '' HUP INT QUIT; exec \"$@\"",
+    "fil-pipe",
+];
+
+/// Whether `program` names a file the shell's `exec` would run: a path with a `/` as it is,
+/// otherwise the first match in `$PATH` (an empty entry is the current directory). A regular file
+/// with an execute bit. Without a `$PATH` the shell decides (nothing is refused here).
+fn runnable(program: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let ok = |p: &std::path::Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if program.as_bytes().contains(&b'/') {
+        return ok(std::path::Path::new(program));
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return true;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let dir = if dir.as_os_str().is_empty() {
+            std::path::PathBuf::from(".")
+        } else {
+            dir
+        };
+        ok(&dir.join(program))
+    })
+}
+
+/// `argv` started through [`IGNORING_SHELL`]: the words are passed as the shell's positional
+/// parameters, never parsed by it.
+fn ignoring_job_signals(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    IGNORING_SHELL
+        .iter()
+        .map(std::ffi::OsString::from)
+        .chain(argv)
+        .collect()
 }
 
 /// Where a pipe command's stderr goes.
@@ -171,6 +229,7 @@ impl PipeConfig {
             close_grace: Duration::from_secs(1),
             stderr: PipeStderr::Inherit,
             own_process_group: false,
+            ignore_job_signals: false,
         }
     }
 }
@@ -780,7 +839,18 @@ impl PipeLink {
     /// `cfg.preamble_timeout` bounds the wait for the answer as it bounds the wait for a
     /// preamble.
     pub async fn start(command: &PipeCommand, cfg: PipeConfig) -> Result<Spawned, PipeError> {
-        let argv = command.effective_argv(&cfg.params);
+        let mut argv = command.effective_argv(&cfg.params);
+        if cfg.ignore_job_signals && !argv.is_empty() {
+            // The shell would report a missing program as its exit status 127, which reads as
+            // "no fil on the remote host" (a login shell's own 127). Looked up here instead, it
+            // fails as the spawn of the program itself would.
+            if !runnable(&argv[0]) {
+                return Err(PipeError::new(PipeErrorKind::Spawn(
+                    io::Error::from_raw_os_error(rustix::io::Errno::NOENT.raw_os_error()),
+                )));
+            }
+            argv = ignoring_job_signals(argv);
+        }
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| PipeError::new(PipeErrorKind::InvalidCommand("empty command".into())))?;

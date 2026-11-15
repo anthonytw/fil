@@ -19,18 +19,9 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 list=${1:-$root/tests/compat/tags.txt}
 target=${CARGO_TARGET_DIR:-$root/target}
 work=$target/compat
-baseline=crates/fil-proto/tests/golden/wire-1.0.txt
 
 cd "$root"
-if git rev-parse -q --verify 'refs/tags/v1.0.0^{commit}' > /dev/null; then
-  if ! git show "v1.0.0:$baseline" | cmp -s - "$baseline"; then
-    echo "compat: $baseline differs from v1.0.0's: the 1.0 wire baseline never changes after the tag" >&2
-    exit 1
-  fi
-  echo "compat: $baseline is v1.0.0's"
-else
-  echo "compat: no v1.0.0 tag yet: the baseline is not anchored to it yet"
-fi
+tests/compat/anchor.sh
 
 tags=()
 lines=()

@@ -97,6 +97,12 @@ jobs:
       # step; the job is red if any of them is.
       - name: just lint (deny, notices, workflow test, exporter lock, fmt, clippy, default features, release-deps)
         run: just lint
+      - name: The 1.0 wire baseline is v1.0.0's (skips while the tag does not exist)
+        if: ${{ !cancelled() }}
+        run: |
+          # The tag alone, not the history: the checkout is shallow and has no tags.
+          git fetch --quiet --no-tags --depth=1 origin +refs/tags/v1.0.0:refs/tags/v1.0.0 2> /dev/null || true
+          tests/compat/anchor.sh
       - name: Drop-in quick set, local (a private daemon on Linux, real PTYs, no ssh)
         if: ${{ !cancelled() }}
         run: just dropin --local --set quick

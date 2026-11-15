@@ -197,8 +197,10 @@ wire-golden-1-0:
     #!/usr/bin/env sh
     set -eu
     d="{{source_directory()}}/crates/fil-proto/tests/golden"
-    { echo "# The 1.0 wire: a copy of wire.txt taken by 'just wire-golden-1-0', never regenerated after"
-      echo "# v1.0.0. Every line but the decode/ probes must stay in wire.txt (docs/v1/wire.md)."
+    { echo "# The 1.0 wire: a copy of wire.txt taken by 'just wire-golden-1-0', frozen byte for byte at"
+      echo "# v1.0.0. Every line must stay in wire.txt with its value, decode/ probes included, except"
+      echo "# that a PAST_THE_END probe may go from refused to accepted and a FIRST_UNKNOWN probe may"
+      echo "# change (tests/wire_golden.rs, docs/v1/wire.md)."
       cat "$d/wire.txt"; } > "$d/wire-1.0.txt"
 
 # Fetches the RustSec advisory database, so it needs network access.

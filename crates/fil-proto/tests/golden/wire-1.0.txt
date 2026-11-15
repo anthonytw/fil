@@ -1,5 +1,7 @@
-# The 1.0 wire: a copy of wire.txt taken by 'just wire-golden-1-0', never regenerated after
-# v1.0.0. Every line but the decode/ probes must stay in wire.txt (docs/v1/wire.md).
+# The 1.0 wire: a copy of wire.txt taken by 'just wire-golden-1-0', frozen byte for byte at
+# v1.0.0. Every line must stay in wire.txt with its value, decode/ probes included, except
+# that a PAST_THE_END probe may go from refused to accepted and a FIRST_UNKNOWN probe may
+# change (tests/wire_golden.rs, docs/v1/wire.md).
 # The wire golden (crates/fil-proto/tests/wire_golden.rs). Do not edit by hand:
 # regenerate with `just wire-golden`, after bumping PROTOCOL_REVISION in limits.rs
 # if any encoding or limit changed (or PROTOCOL_MAJOR if a [frozen] one did).

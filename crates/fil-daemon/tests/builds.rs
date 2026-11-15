@@ -425,5 +425,92 @@ async fn a_borrowed_descriptor_is_checked() {
     flock(&holder, FlockOperation::NonBlockingLockExclusive).unwrap();
     let mine = std::fs::File::open(&held).unwrap();
     assert!(fil_daemon::lend::verify(&mine, &held).is_err());
+    // Not a regular file (a directory at the path): refused before any `flock`.
+    let dir = std::fs::File::open(&s.dir).unwrap();
+    assert!(fil_daemon::lend::verify(&dir, &s.dir).is_err());
     d.stop().await;
+}
+
+/// A build whose build lock file was removed (a cleaner, or by hand) is still alive: when
+/// another build of the wire exits, it leaves the wire's lock and start files, which the live
+/// one still holds, instead of removing them under it until its next check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_whose_lock_file_went_still_keeps_the_wire_files() {
+    let s = Scratch::new();
+    let a = start_build(&s, "0.0.1", CAT).await;
+    let b = start_build(&s, "0.0.2", CAT).await;
+    let lock = a.paths.lock();
+    std::fs::File::create(a.paths.start_lock()).unwrap();
+    std::fs::remove_file(b.paths.build_lock()).unwrap();
+    a.stop().await;
+    assert_eq!(
+        probe(&lock),
+        Seen::Held,
+        "the wire lock stays for the live build"
+    );
+    assert!(s.paths().start_lock().exists(), "and its start file");
+    // B makes its build lock again at its check, and is the last one out.
+    let b_lock = b.paths.build_lock();
+    fil_testkit::wait_until("B makes its build lock again", WAIT, || {
+        b.handle.check_files_now();
+        b_lock.exists()
+    });
+    b.stop().await;
+    assert_eq!(probe(&lock), Seen::Missing);
+}
+
+/// The wire lock file removed under two builds: each repairs at its check, the first taking the
+/// lock on a new file and the second borrowing it, so the survivor of the two still holds the new
+/// file when the other exits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_wire_lock_file_is_rejoined_by_every_build() {
+    let s = Scratch::new();
+    let a = start_build(&s, "0.0.1", CAT).await;
+    let b = start_build(&s, "0.0.2", CAT).await;
+    let lock = a.paths.lock();
+    let before = inode(&lock).unwrap();
+    std::fs::remove_file(&lock).unwrap();
+    assert_eq!(probe(&lock), Seen::Missing);
+    fil_testkit::wait_until("A holds a new wire lock file", WAIT, || {
+        a.handle.check_files_now();
+        probe(&lock) == Seen::Held
+    });
+    let after = inode(&lock).unwrap();
+    assert_ne!(after, before, "a new file");
+    // B rejoins it (borrowing from A, which holds it now).
+    b.handle.check_files_now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    a.stop().await;
+    assert_eq!(probe(&lock), Seen::Held, "B holds the new file without A");
+    assert_eq!(inode(&lock), Some(after));
+    b.stop().await;
+    assert_eq!(probe(&lock), Seen::Missing);
+}
+
+/// A daemon that is exiting still holds the wire lock while its sessions hang up, and goes on
+/// lending it until it is gone: a build that starts meanwhile borrows it and runs on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exiting_daemon_lends_until_it_lets_go() {
+    let s = Scratch::new();
+    // A session that ignores the hang-up, so the shutdown waits on it for a while.
+    let a = start_build(
+        &s,
+        "0.0.1",
+        "trap '' HUP TERM; echo ready; while :; do sleep 1; done",
+    )
+    .await;
+    let mut c = Client::attach(a.pipe().await, Connect::new("slow", key(1))).await;
+    c.wait_screen("ready").await;
+    c.detach().await;
+    c.hang_up();
+    let lock = a.paths.lock();
+    a.handle.shutdown(true);
+    // A new build starts while A's session is still being killed.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!a.task.is_finished(), "A is still exiting");
+    let b = start_build(&s, "0.0.2", CAT).await;
+    let _ = tokio::time::timeout(Duration::from_secs(20), a.task).await;
+    assert_eq!(probe(&lock), Seen::Held, "B borrowed it and holds it");
+    b.stop().await;
+    assert_eq!(probe(&lock), Seen::Missing);
 }

@@ -947,13 +947,29 @@ pub fn superseded(paths: &Paths) -> bool {
     })
 }
 
-/// Whether a daemon of another build of this wire holds its build lock: the wire lock and its
-/// start file are then still that daemon's, and an exiting daemon leaves them.
+/// Whether a daemon of another build of this wire is alive: it holds its build lock, or
+/// something answers on its lending socket or its socket (its build lock file was removed, by a
+/// cleaner or by hand, and it makes it again at its next check). The wire lock and its start file
+/// are then still that daemon's too, and an exiting daemon leaves them: removing them would leave
+/// that daemon's lock on a file the install's garbage collection cannot see until its next check.
+/// The answers are non-blocking connects ([`something_answers`]), tried only for a build whose
+/// lock is not held.
 pub(crate) fn other_build_of_wire_alive(paths: &Paths) -> bool {
-    list_builds(&paths.dir, "lock").into_iter().any(|b| {
-        (b.major, b.revision) == (paths.major, paths.revision)
-            && b.version != paths.version
-            && lock_is_held(&b.path)
+    let mut others: Vec<String> = ["lock", "lend", "sock"]
+        .into_iter()
+        .flat_map(|ext| list_builds(&paths.dir, ext))
+        .filter(|b| {
+            (b.major, b.revision) == (paths.major, paths.revision) && b.version != paths.version
+        })
+        .map(|b| b.version)
+        .collect();
+    others.sort();
+    others.dedup();
+    others.into_iter().any(|v| {
+        let p = paths.clone().with_version(v);
+        lock_is_held(&p.build_lock())
+            || something_answers(&p.lend())
+            || something_answers(&p.socket())
     })
 }
 

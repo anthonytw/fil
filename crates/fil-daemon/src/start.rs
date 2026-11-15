@@ -537,8 +537,10 @@ pub(crate) fn is_current_at(file: &std::fs::File, dir: &std::fs::File, name: &Pa
 /// that had already opened the files notices (the lock it got is on a file that is no longer at
 /// the path and it opens the new one: see [`is_current`]). `own_lock` is the daemon's build lock
 /// and `own_wire` its descriptor of the wire lock; each path is removed only if it still names
-/// that file. The wire's two files stay while a daemon of another build of the wire holds its
-/// build lock: it shares the wire lock ([`crate::lend`]), and removing the file under it would
+/// that file. The wire's two files stay while a daemon of another build of the wire is alive (its
+/// build lock held, or its lending socket or socket answering:
+/// [`crate::paths::other_build_of_wire_alive`]): it shares the wire lock ([`crate::lend`]), and
+/// removing the file under it would
 /// leave its lock on a file the install's garbage collection cannot see. (A daemon takes its build
 /// lock before it borrows the wire lock, so one that is borrowing it now counts.) The directory
 /// stays, as with tmux.

@@ -744,7 +744,7 @@ pub struct Daemon {
     bound: Option<(u64, u64)>,
     /// The lending socket ([`crate::lend`]): a daemon of another build of the wire that starts
     /// is handed this daemon's descriptor of the wire lock on it.
-    lend: UnixListener,
+    lend: Option<UnixListener>,
     /// `(device, inode)` of the lending socket this daemon bound.
     lend_bound: Option<(u64, u64)>,
     /// This daemon's descriptor of the wire lock (`fil-<major>-<rev>.lock`), held for its whole
@@ -931,7 +931,7 @@ impl Daemon {
             paths,
             unix,
             bound,
-            lend,
+            lend: Some(lend),
             lend_bound,
             wire: Arc::new(Mutex::new(wire)),
             held: Arc::new(Mutex::new(Held {
@@ -1089,7 +1089,7 @@ impl Daemon {
             .and_then(|dir| bind_in(&dir, &self.paths, &sock))
         {
             Ok((l, id)) if lend => {
-                self.lend = l;
+                self.lend = Some(l);
                 self.lend_bound = Some(id);
                 tracing::warn!("the lending socket was removed; bound it again");
             }
@@ -1136,28 +1136,7 @@ impl Daemon {
     /// own, if the descriptor is the file at the path; otherwise hangs up (the borrower asks
     /// another daemon, or takes the new file's lock).
     fn lend_one(&self, stream: UnixStream) {
-        let lent = {
-            let wire = self.wire.lock().unwrap_or_else(|e| e.into_inner());
-            if !crate::start::is_current(&wire, &self.paths.lock()) {
-                tracing::debug!("not lending the wire lock: its file was replaced");
-                return;
-            }
-            // A second descriptor of the same open file description: it shares the lock.
-            match wire.try_clone() {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot lend the wire lock");
-                    return;
-                }
-            }
-        };
-        let uid = self.inner.cfg.allowed_uid;
-        tokio::spawn(async move {
-            match crate::lend::lend(stream, &lent, uid).await {
-                Ok(()) => tracing::debug!("lent the wire lock"),
-                Err(e) => tracing::debug!(error = %e, "did not lend the wire lock"),
-            }
-        });
+        lend_one(&self.wire, &self.paths, self.inner.cfg.allowed_uid, stream);
     }
 
     /// The socket directory a repair or a retiring daemon binds in: the one this daemon checked
@@ -1328,7 +1307,7 @@ impl Daemon {
                         *self.wire.lock().unwrap_or_else(|e| e.into_inner()) = f;
                     }
                 }
-                accepted = self.lend.accept() => match accepted {
+                accepted = async { self.lend.as_ref().expect("bound while serving").accept().await } => match accepted {
                     Ok((stream, _)) => self.lend_one(stream),
                     Err(e) => {
                         tracing::warn!(error = %e, "accept failed on the lending socket");
@@ -1367,10 +1346,25 @@ impl Daemon {
         };
         self.stopped.store(true, Ordering::Release);
         remove_socket_if_ours(&self.paths.socket(), self.bound);
-        remove_socket_if_ours(&self.paths.lend(), self.lend_bound);
         if let Some(t) = wire_fix.take() {
             t.abort();
         }
+        // This daemon holds the wire lock until it is gone, through the sessions' hang-up and
+        // the drain below (seconds on a shutdown): it goes on lending it until then, so a daemon
+        // of another build that starts meanwhile borrows it instead of finding it held and
+        // nobody to lend it.
+        let lending = self.lend.take().map(|listener| {
+            let (wire, paths, uid) = (
+                self.wire.clone(),
+                self.paths.clone(),
+                self.inner.cfg.allowed_uid,
+            );
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    lend_one(&wire, &paths, uid, stream);
+                }
+            })
+        });
         if exit == Exit::Shutdown && *self.stop.borrow() == Some(true) {
             self.kill_sessions().await;
             // Each attached client's connection is still telling it how its session ended
@@ -1383,6 +1377,13 @@ impl Daemon {
         *self.inner.quic_slot() = None;
         // Still holding the lock, the sessions gone: an empty agent directory goes too.
         self.paths.remove_agent_dir();
+        // Lending ends just before the files are judged: a daemon that borrowed until now holds
+        // its build lock, so the wire's files stay for it.
+        if let Some(t) = lending {
+            t.abort();
+            let _ = t.await;
+        }
+        remove_socket_if_ours(&self.paths.lend(), self.lend_bound);
         {
             let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
             let wire = self.wire.lock().unwrap_or_else(|e| e.into_inner());
@@ -1969,6 +1970,33 @@ fn release_claim(held: &mut Held, paths: &Paths, dir: Option<&File>) {
         let _ = unlinkat(dir, name, AtFlags::empty());
     }
     drop(claim);
+}
+
+/// Lends `wire` (a daemon's descriptor of the wire lock) to the daemon on `stream`, on a task of
+/// its own, if the descriptor is the file at the path; otherwise hangs up (the borrower asks
+/// another daemon, or takes the new file's lock).
+fn lend_one(wire: &Mutex<File>, paths: &Paths, uid: u32, stream: UnixStream) {
+    let lent = {
+        let wire = wire.lock().unwrap_or_else(|e| e.into_inner());
+        if !crate::start::is_current(&wire, &paths.lock()) {
+            tracing::debug!("not lending the wire lock: its file was replaced");
+            return;
+        }
+        // A second descriptor of the same open file description: it shares the lock.
+        match wire.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot lend the wire lock");
+                return;
+            }
+        }
+    };
+    tokio::spawn(async move {
+        match crate::lend::lend(stream, &lent, uid).await {
+            Ok(()) => tracing::debug!("lent the wire lock"),
+            Err(e) => tracing::debug!(error = %e, "did not lend the wire lock"),
+        }
+    });
 }
 
 /// Whether a Unix peer with `peer_uid` may use the socket. The daemon serves one user.

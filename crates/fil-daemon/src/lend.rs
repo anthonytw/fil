@@ -33,7 +33,9 @@
 //!   lock, which also leaves this daemon holding the lock on the file at the path.
 //! - **Only a holder lends.** A daemon lends only while its own descriptor is the file at the
 //!   path; otherwise (the file was removed: its repair is under way) it hangs up, and the borrower
-//!   asks another, or takes the new file's lock itself.
+//!   asks another, or takes the new file's lock itself. An exiting daemon goes on lending until
+//!   just before it gives the lock up (`Daemon::run`), so a build that starts while it hangs up
+//!   its sessions borrows the lock instead of finding it held with nobody to lend it.
 
 use std::fs::File;
 use std::io;
@@ -220,7 +222,22 @@ pub async fn lend(stream: UnixStream, lock: &File, allowed_uid: u32) -> io::Resu
             }
         }
     };
-    tokio::time::timeout(LEND_WAIT, send)
+    // Then hold the connection until the borrower hangs up (it has its descriptor by then): macOS
+    // answers the borrower's peer-credential check with ENOTCONN once this end has closed.
+    let hold = async {
+        send.await?;
+        let mut buf = [0u8; 1];
+        loop {
+            stream.readable().await?;
+            match stream.try_read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    tokio::time::timeout(LEND_WAIT, hold)
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
 }

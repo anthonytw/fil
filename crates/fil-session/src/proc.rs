@@ -627,6 +627,7 @@ mod kinfo {
     /// `SZOMB` in `<sys/proc.h>`.
     const SZOMB: u8 = 5;
     /// `kp_proc.p_sigignore`, a `sigset_t` (`u32`, bit `n - 1` for signal `n`).
+    #[cfg(target_os = "macos")]
     const SIGIGNORE: usize = 232;
 
     /// `p_sigignore` of `pid`'s entry in the buffer, if it is there.

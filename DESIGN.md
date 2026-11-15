@@ -77,7 +77,7 @@ flowchart LR
     subgraph remote["Remote host: runs as you, no root, no system service"]
         sshd["sshd"]
         relay["fil server --stdio<br/><i>relay: lives and dies with the pipe</i>"]
-        subgraph daemon["fil daemon: one per user per host, outlives every connection"]
+        subgraph daemon["fil daemon: one per user per host (per version after an upgrade), outlives every connection"]
             main["session #quot;main#quot;<br/>PTY → zsh, vim, …<br/>output log, seq-numbered <i>(resume)</i><br/>emulator: screen + history <i>(reattach)</i><br/>forwards + their connections <i>(stay open)</i><br/>stable SSH_AUTH_SOCK<br/>epoch: who the subscriber is"]
             build["session #quot;build#quot; …"]
         end
@@ -85,14 +85,14 @@ flowchart LR
         relay -- "unix socket<br/>/tmp/fil-$UID/" --> daemon
     end
 
-    client == "<b>direct</b>: QUIC over UDP (default)<br/>one port per user" ==> daemon
+    client == "<b>direct</b>: QUIC over UDP (default)<br/>one port per daemon" ==> daemon
     client -. "<b>pipe</b>: ssh<br/>every bootstrap; fallback" .-> sshd
 ```
 
 fil is one static binary, used on both ends. The remote side runs as `fil server …`.
 
 - **Client** (`fil HOST [SESSION]`) owns the local terminal (in raw mode), the shadow screen that prediction uses, the local `-L` listeners and the agent relay. It holds its per-attach key in memory only.
-- **Daemon** runs once per user per host and holds the sessions. The first attach starts it, detached from the login session. It listens on a Unix socket and, when direct mode is enabled, on one UDP port.
+- **Daemon** runs once per user per host and holds the sessions (after an upgrade, one per fil version until the older one's sessions end, §5.3). The first attach starts it, detached from the login session. It listens on a Unix socket and, when direct mode is enabled, on one UDP port.
 - **Relay** (`fil server --stdio`) is what the pipe runs. It connects its stdin and stdout to the daemon's socket. It keeps no state and dies with the pipe. Its first exchange is the **bootstrap**: start the daemon if needed, check versions, register the client's key and hand back the direct-mode details.
 
 ### 4.1 Attach

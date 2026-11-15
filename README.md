@@ -46,7 +46,7 @@ Check these fingerprints against the copies in the repository before you trust a
 
 ## Status
 
-fil is an ssh/et drop-in: the client, the daemon, sessions that survive a reconnect or a takeover, both transports, port forwards, `fil ports`, the agent relay, server policy, and installing over ssh, as released in 0.1.0. 0.2.0 added predictive local echo (below), and 0.3.0 asks before taking over a session that another client holds. 1.0.0 freezes the 1.x wire, adds tunnels (`fil -N`) and runs each version's daemon side by side, so an upgrade never strands a session. The design and the milestones are in [DESIGN.md](DESIGN.md) (§15); the changes are in [CHANGELOG.md](CHANGELOG.md).
+fil is an ssh/et drop-in: the client, the daemon, sessions that survive a reconnect or a takeover, both transports, port forwards, `fil ports`, the agent relay, server policy, and installing over ssh, as released in 0.1.0. 0.2.0 added predictive local echo (below), and 0.3.0 asks before taking over a session that another client holds. 1.0.0 freezes the 1.x wire, adds tunnels (`fil -N`), and runs each version's daemon side by side: from 1.0 on, an upgrade keeps every session reachable. Sessions of a 0.x daemon keep running after the upgrade to 1.0.0, but only the old fil reaches them. The design and the milestones are in [DESIGN.md](DESIGN.md) (§15); the changes are in [CHANGELOG.md](CHANGELOG.md).
 
 ### Predictive echo (0.2.0)
 

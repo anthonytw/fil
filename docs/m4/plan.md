@@ -487,7 +487,7 @@ Every package keeps M2's rules:
   - the client's `config.toml` parser (`crates/fil/fuzz`).
 
   Each target has a seed corpus taken from the wire golden or the doc examples. `just fuzz TARGET SECONDS` runs one target.
-- **Done when:** every target runs. A campaign (each target for an hour, in the VM or on a runner) finds no crash, or each crash becomes a fix PR. The campaign is part of SWEEP's security audit.
+- **Done when:** every target runs. A campaign (each target for an hour, in the VM or on a runner) finds no crash, or each crash becomes a fix PR. The campaign is part of SWEEP's security audit. (Superseded for later releases, owner 2026-11-15: 5 minutes per peer or remote-host target, all in parallel, and the local config-file targets only when their parser changes; `DESIGN.md` §12.)
 
 **LOG: a non-blocking log writer** (M1-A2)
 - **In flight:** PR #92 (`m4-log`).
@@ -732,7 +732,7 @@ Each PR runs `just ci` and the package's tests with its mutation table, and gets
 | `macos-check` `remote` | GitHub, Apple silicon | macOS as the remote, with the upgrade in place and TMP's `clean-tmps` case |
 | `release.yml` dry run | GitHub | the archives, the layout, reproducibility of binaries and archives, `release-check` |
 | `tests/release/just.sh release-verify` | the VM (amd64 emulation) | the independent rebuild |
-| `just fuzz` campaign | the VM or a runner | FUZZ's targets, one hour each, during SWEEP |
+| `just fuzz` campaign | the VM or a runner | FUZZ's targets, one hour each, during SWEEP (now 5 minutes per peer or remote-host target before a release: `DESIGN.md` §12) |
 | `log_blocking`, `tmp_clean` | `just ci` | LOG's blocked writer; TMP's mechanism |
 | Arm64 remote drop-in with the release bits | `linux-check` `arm64-remote` (GitHub's arm64 runner; the Pis optional since 2026-11-11) | `pi_e2e` and the M1, M2 and M3 drop-in suites on the RC's own aarch64 binary, behind the Pis' gate verbs |
 

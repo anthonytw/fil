@@ -22,3 +22,4 @@ pub mod mgmt;
 pub mod netwatch;
 pub mod ports_view;
 pub mod server;
+pub mod upgrade;

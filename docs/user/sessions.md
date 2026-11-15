@@ -11,7 +11,7 @@ flowchart LR
 
 ## Names and lifetime
 
-- A session name is `[A-Za-z0-9._-]`, 1 to 64 characters. `fil HOST` with no name is the session `main`.
+- A session name is `[A-Za-z0-9._-]`, 1 to 64 characters. `fil HOST` with no name is the session `main`; `fil -N HOST` (forwards only, no terminal: see [forwards](forwards.md)) is the session `tunnel`.
 - Attaching to a name that does not exist creates it.
 - A session lives until its shell exits or you end it with `fil kill`. Detached sessions stay as long as the daemon does. The daemon exits by itself when it has no sessions and no connections for five minutes (`idle_exit_secs` in [`daemon.toml`](daemon.md)); it does not exit while a session exists.
 - The daemon keeps each session's recent output (1,000 lines by default; `history_lines` in `daemon.toml`) in memory, so you can resume or reattach. It is never written to disk.
@@ -78,5 +78,7 @@ When a link drops and comes back, the client says where it stopped and the daemo
 - `1` on an error, if the session was taken over, replaced or detached elsewhere, or if it is attached elsewhere and you did not take it over;
 - `2` on a usage error;
 - `255` if a forward failed and `forward_failure = "exit"`.
+
+`fil -N HOST` exits the same way, except that Ctrl-C (or SIGTERM, SIGHUP, SIGQUIT) is how a tunnel is stopped: it detaches, and the status is `0`.
 
 A host or session named like a subcommand (`ls`, `kill`, `detach`, `forward`, `ports`, `server`, `install`, `config`) is attached with `--`: `fil -- ls`, `fil devbox -- ls`.

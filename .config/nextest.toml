@@ -63,6 +63,7 @@ default-filter = """
     or binary_id(fil-forward::agent_constraints)
     or binary_id(fil-client::tty_pty) or binary_id(fil-client::agent)
     or binary_id(fil-client::forward) or binary_id(fil-client::forward_hostile)
+    or binary_id(fil-client::tunnel)
     or binary_id(fil-client::predict_e2e) or binary_id(fil-client::predict_stack)
     or binary_id(fil-client::predict_suites)
     or binary_id(fil-shell::binary) or binary_id(fil-shell::install)

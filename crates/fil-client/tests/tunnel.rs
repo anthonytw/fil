@@ -29,12 +29,23 @@ fn said(lines: &Mutex<Vec<String>>, needle: &str) -> bool {
 async fn a_tunnel_holds_the_session_without_the_terminal_and_a_signal_detaches_it() {
     let (cfg, lines) = tunnel();
     let rig = start(cfg);
-    until("the tunnel is up", 5, || said(&lines, "holding the forwards")).await;
+    until("the tunnel is up", 5, || {
+        said(&lines, "holding the forwards")
+    })
+    .await;
     // The session's output goes nowhere, and the terminal is never raw.
     rig.daemon.output(b"secret prompt $ ").await;
     settle().await;
-    assert!(!rig.term.text().contains("secret prompt"), "{}", rig.term.text());
-    assert!(rig.term.raw_changes().is_empty(), "{:?}", rig.term.raw_changes());
+    assert!(
+        !rig.term.text().contains("secret prompt"),
+        "{}",
+        rig.term.text()
+    );
+    assert!(
+        rig.term.raw_changes().is_empty(),
+        "{:?}",
+        rig.term.raw_changes()
+    );
     // A reconnect is said, and resumes like any other.
     rig.daemon.kill_link(DownReason::Closed).await;
     until("the loss is said", 5, || said(&lines, "connection lost")).await;
@@ -53,7 +64,10 @@ async fn a_tunnel_holds_the_session_without_the_terminal_and_a_signal_detaches_i
 async fn a_tunnel_never_asks_to_take_a_session_back() {
     let (cfg, lines) = tunnel();
     let rig = start(cfg);
-    until("the tunnel is up", 5, || said(&lines, "holding the forwards")).await;
+    until("the tunnel is up", 5, || {
+        said(&lines, "holding the forwards")
+    })
+    .await;
     rig.daemon.take_over("desktop").await;
     let result = rig.finish().await;
     // No question (nobody could answer it): it ends as a "no" would, with status 1.
@@ -68,7 +82,10 @@ async fn a_tunnel_never_asks_to_take_a_session_back() {
 async fn a_tunnel_ends_with_the_session() {
     let (cfg, lines) = tunnel();
     let rig = start(cfg);
-    until("the tunnel is up", 5, || said(&lines, "holding the forwards")).await;
+    until("the tunnel is up", 5, || {
+        said(&lines, "holding the forwards")
+    })
+    .await;
     rig.daemon.end_session_with_status(Some(3), None).await;
     let result = rig.finish().await;
     assert!(
@@ -82,4 +99,32 @@ async fn a_tunnel_ends_with_the_session() {
         "{result:?}"
     );
     assert!(said(&lines, "exited 3"), "{lines:?}");
+}
+
+/// A forward the host asks for (`fil forward`) is refused at once, not left waiting for an answer
+/// nobody can give, and nothing listens for it here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tunnel_refuses_what_the_host_asks_for_without_asking() {
+    use common::fwd::{connect, echo_server, eventually, free_port, local};
+    use fil_proto::mux::{ForwardId, Origin};
+    let server = echo_server().await;
+    let (cfg, lines) = tunnel();
+    let rig = start(cfg);
+    until("the tunnel is up", 5, || {
+        said(&lines, "holding the forwards")
+    })
+    .await;
+    let fwd = rig.daemon.fwd.clone();
+    let port = free_port();
+    fwd.announce(ForwardId(9001), local(port, server.port), Origin::Request);
+    eventually("the refusal", 5, || {
+        fwd.consents().contains(&(ForwardId(9001), false))
+    })
+    .await;
+    assert!(
+        said(&lines, "refused a forward the host asked for"),
+        "{lines:?}"
+    );
+    assert!(connect(port).await.is_none(), "something listens on {port}");
+    assert_eq!(server.accepts(), 0);
 }

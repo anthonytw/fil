@@ -37,7 +37,7 @@ Unpack the archive for your machine (`fil-<version>-x86_64-linux-musl.tar.gz`, `
 The archive's `share/man` and `share/*completion*` directories hold the man pages and completions. Put them where your system looks, or let a package do it. Check the install with:
 
 ```sh
-fil --version        # fil <version> (wire <major>.<revision>)
+fil --version        # fil <version> (wire <major>.<revision>), then how to upgrade this copy
 ```
 
 ## On a host
@@ -87,6 +87,8 @@ Answer `y` and the install login becomes your session. The `install` setting in 
 The `remote` setting in the same file chooses the command fil runs on the host: `auto` (the default) runs the install command first, which starts the copy fil installed, `~/.local/bin/fil` or the `fil` on the host's `PATH` (each only if it speaks your fil's wire), or asks to install, all on one ssh login; `plain` runs only `fil server --stdio`, for hosts behind a forced-command gate; `installed` is like `auto` but never falls back to `fil server --stdio`. fil writes nothing about the host on your machine.
 
 ## Upgrading
+
+fil never updates itself and never checks for a new version. `fil --version` says, on its second line, how this copy was installed and the command that upgrades it: `brew upgrade anthonytw/tap/fil`, `cargo install --locked fil-shell`, the new `.deb` or `.rpm` from the release page, your AUR helper for `fil-shell-bin`, your Nix profile or flake, or, for a copy you put somewhere yourself, the release page and its path. It works that out from where the program is and the package manager's files on your machine, without the network and without running anything. On a host, a copy that `fil install` put there is upgraded by connecting with a newer fil, which installs its own beside it. `fil ls` also says when a host's daemon is newer than your fil.
 
 Install the new version on your machine and on each host. Two builds talk to each other only if their wire numbers are equal (the `wire` in `fil --version`). Daemons of different wires run side by side on a host, so an upgrade breaks no running session: your old sessions stay on the old daemon until they end. A patch release (0.1.0 to 0.1.1) never changes the wire, and 0.2.0 kept 0.1.0's (0.3.0 changes it, to `wire 1.15`: upgrade both ends, and a 0.3.0 client starts a 0.3.0 daemon beside the old one). When the wire is unchanged, a new client reuses the running daemon, and daemon-side fixes take effect only once that daemon has exited. End your sessions on each host (or `fil kill` them) to pick up the fixes.
 

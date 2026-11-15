@@ -4,7 +4,7 @@
 .SH NAME
 fil \- A remote shell that keeps your place: reconnect, detach and reattach
 .SH SYNOPSIS
-\fBfil\fR [\fB\-L\fR \fISPEC\fR]... [\fB\-R\fR \fISPEC\fR]... [\fB\-D\fR \fISPEC\fR]... [\fB\-A\fR|\fB\-a\fR] [\fB\-\-transport\fR \fIMODE\fR] [\fB\-\-config\fR \fIFILE\fR] \fIHOST\fR [\fISESSION\fR]
+\fBfil\fR [\fB\-L\fR \fISPEC\fR]... [\fB\-R\fR \fISPEC\fR]... [\fB\-D\fR \fISPEC\fR]... [\fB\-A\fR|\fB\-a\fR] [\fB\-N\fR] [\fB\-\-transport\fR \fIMODE\fR] [\fB\-\-config\fR \fIFILE\fR] \fIHOST\fR [\fISESSION\fR]
 .br
 \fBfil\fR \fICOMMAND\fR ...
 .SH DESCRIPTION
@@ -58,6 +58,9 @@ always
 .TP
 \fB\-\-take\-over\fR
 Take the session over without asking when another client is attached to it (the config\*(Aqs takeover = "always" for this run). By default fil asks first
+.TP
+\fB\-N\fR
+Tunnel only, as ssh \-N: hold the forwards (and the agent relay, with \-A) with no terminal, until interrupted. Needs a forward (\-L, \-R, \-D, the config\*(Aqs) or \-A. The session defaults to "tunnel", not "main", so it never asks to take your shell\*(Aqs session
 .TP
 \fB\-\-config\fR \fI<FILE>\fR
 Read this config file instead of ~/.config/fil/config.toml ($FIL_CONFIG also works)
@@ -160,12 +163,15 @@ Examples:
   fil ls devbox              list the sessions on devbox
   fil kill devbox build      end session "build"
   fil detach devbox build    detach whoever is attached to "build"
+  fil \-N devbox \-L 5432      forward localhost:5432 to devbox, no terminal, until Ctrl\-C
 .fi
 .PP
 Inside a session, type ~. after a newline to detach; ~? lists the escapes.
 .PP
 Configuration: ~/.config/fil/config.toml (see fil\-config(5), or fil config show HOST).
 Logs: ~/.local/state/fil/client.log (set FIL_LOG=debug for more).
+Upgrading: fil \-\-version names the command for the way this copy was installed (fil never
+updates itself or checks for updates).
 .PP
 Exit status: 0 on a normal end (detached, or the session ended with nothing to report);
 the shell\*(Aqs own status if it exited with one; 128+N if the shell was killed by signal N or
@@ -174,6 +180,7 @@ fil was stopped by signal N;
 attached elsewhere and you did not take it over;
 2 on a usage error;
 255 if a forward failed and forward_failure = "exit".
+With \-N, a stop signal (Ctrl\-C) detaches and exits 0.
 .PP
 Source: every release publishes fil\-<version>\-source.tar.gz beside the binaries (GPL\-3.0 Corresponding Source).
 .SH "SEE ALSO"

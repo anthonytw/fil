@@ -107,7 +107,7 @@ fn subcommand(sub: &clap::Command, parent: &str, out: &mut String) {
 }
 
 const SYNOPSIS: &str = ".SH SYNOPSIS
-\\fBfil\\fR [\\fB\\-L\\fR \\fISPEC\\fR]... [\\fB\\-R\\fR \\fISPEC\\fR]... [\\fB\\-D\\fR \\fISPEC\\fR]... [\\fB\\-A\\fR|\\fB\\-a\\fR] [\\fB\\-\\-transport\\fR \\fIMODE\\fR] [\\fB\\-\\-config\\fR \\fIFILE\\fR] \\fIHOST\\fR [\\fISESSION\\fR]
+\\fBfil\\fR [\\fB\\-L\\fR \\fISPEC\\fR]... [\\fB\\-R\\fR \\fISPEC\\fR]... [\\fB\\-D\\fR \\fISPEC\\fR]... [\\fB\\-A\\fR|\\fB\\-a\\fR] [\\fB\\-N\\fR] [\\fB\\-\\-transport\\fR \\fIMODE\\fR] [\\fB\\-\\-config\\fR \\fIFILE\\fR] \\fIHOST\\fR [\\fISESSION\\fR]
 .br
 \\fBfil\\fR \\fICOMMAND\\fR ...
 ";

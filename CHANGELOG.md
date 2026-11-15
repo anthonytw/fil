@@ -4,6 +4,15 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+### Added
+
+- **`fil -N HOST`: forwards only, with no terminal**, as `ssh -N`. It holds the session's `-L`, `-R` and `-D` forwards (and the agent relay with `-A`) until you stop it with Ctrl-C, reconnecting like any fil, and works in the background or from a script. The session is `tunnel` unless you name one, so it never asks to take your shell's `main`. It needs a forward (a flag or the config's `forward`) or `-A`, or it exits with status 2. It asks nothing: a forward the host asks for is refused, and a session held elsewhere is left alone unless `--take-over` is given. Ctrl-C detaches it and exits 0.
+- `fil ls` says when the host's daemon is a newer fil than yours, with the command that upgrades yours (read from the daemon's greeting, which fil already gets; nothing more is asked of the host).
+
+### Changed
+
+- **`fil --version` says how to upgrade.** Its second line names how this copy was installed and the command that upgrades it (Homebrew, cargo, the `.deb` or `.rpm`, the AUR, Nix, a `fil install` copy on a host, `~/.local/bin`, or a copy by hand, with its path). fil works this out from its own path and the package manager's files, with no network and without running anything; it still never updates itself or checks for updates. The first line is unchanged; the legal notices follow.
+
 ## [0.3.0] - 2026-11-14
 
 Ask before taking over a session, and predictive echo that recovers after an interruption.

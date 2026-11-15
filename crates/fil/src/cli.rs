@@ -72,6 +72,19 @@ pub fn full_version_string() -> &'static str {
     FULL.as_str()
 }
 
+/// What `fil --version` prints (`app::main` prints it in place of clap's): `fil` and the first
+/// line of [`full_version_string`], as clap writes it, then how this copy was installed and the command that upgrades it
+/// (1.0 decision 6, [`crate::upgrade`]: from this machine's files only, never the network), then
+/// the legal notices. The first line is unchanged, for the scripts that read it.
+pub fn version_text(install: &crate::upgrade::Install) -> String {
+    let full = full_version_string();
+    let (first, rest) = full.split_once('\n').unwrap_or((full, ""));
+    format!(
+        "fil {first}\n{}\n{rest}\n",
+        crate::upgrade::upgrade_line(install)
+    )
+}
+
 const AFTER_HELP: &str = "\
 Examples:
   fil devbox                 attach to (or create) session \"main\" on devbox
@@ -79,11 +92,14 @@ Examples:
   fil ls devbox              list the sessions on devbox
   fil kill devbox build      end session \"build\"
   fil detach devbox build    detach whoever is attached to \"build\"
+  fil -N devbox -L 5432      forward localhost:5432 to devbox, no terminal, until Ctrl-C
 
 Inside a session, type ~. after a newline to detach; ~? lists the escapes.
 
 Configuration: ~/.config/fil/config.toml (see fil-config(5), or `fil config show HOST`).
 Logs: ~/.local/state/fil/client.log (set FIL_LOG=debug for more).
+Upgrading: `fil --version` names the command for the way this copy was installed (fil never
+updates itself or checks for updates).
 
 Exit status: 0 on a normal end (detached, or the session ended with nothing to report);
 the shell's own status if it exited with one; 128+N if the shell was killed by signal N or
@@ -92,6 +108,7 @@ fil was stopped by signal N;
 attached elsewhere and you did not take it over;
 2 on a usage error;
 255 if a forward failed and forward_failure = \"exit\".
+With -N, a stop signal (Ctrl-C) detaches and exits 0.
 
 Source: every release publishes fil-<version>-source.tar.gz beside the binaries (GPL-3.0 Corresponding Source).";
 
@@ -1522,6 +1539,25 @@ mod tests {
             cli.config.as_deref(),
             Some(std::path::Path::new("/tmp/y.toml"))
         );
+    }
+
+    #[test]
+    fn the_version_text_keeps_its_first_line_and_says_how_to_upgrade() {
+        let text = version_text(&crate::upgrade::Install::Homebrew);
+        let lines: Vec<&str> = text.lines().collect();
+        // The first line is exactly what clap printed before (scripts and the bootstrap read it).
+        assert_eq!(
+            lines[0],
+            Cli::command().render_version().lines().next().unwrap()
+        );
+        assert_eq!(lines[0], format!("fil {}", version_string()));
+        assert_eq!(
+            lines[1],
+            crate::upgrade::upgrade_line(&crate::upgrade::Install::Homebrew)
+        );
+        // Then the legal notices, as before.
+        assert_eq!(lines[2], "Copyright (C) 2026 Anthony Wertz");
+        assert!(text.ends_with("permitted by law.\n"), "{text}");
     }
 
     #[test]

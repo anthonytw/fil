@@ -44,7 +44,14 @@ const USAGE: u8 = 2;
 pub fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(e) => e.exit(), // 0 for --help and --version, 2 for a usage error
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayVersion => {
+            // clap's text with the upgrade line after the first (1.0 decision 6).
+            let text = crate::cli::version_text(&crate::upgrade::detect(&crate::upgrade::System));
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            return ExitCode::from(OK);
+        }
+        Err(e) => e.exit(), // 0 for --help, 2 for a usage error
     };
     if let Err(e) = cli.validate() {
         e.exit(); // 2, like any usage error

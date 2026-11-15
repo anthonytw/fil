@@ -359,11 +359,17 @@ async fn single(place: &Place<'_>, request: Request, config: &Config) -> u8 {
         Ok(c) => c,
         Err(code) => return code,
     };
-    let answer = mgmt::ask_one(&conn.link, request.clone()).await;
+    let answer = mgmt::ask_one_peer(&conn.link, request.clone()).await;
     let code = match &answer {
-        Ok(response) => match mgmt::render(&request, response, conn.label(), now_unix_ms()) {
+        Ok((response, peer)) => match mgmt::render(&request, response, conn.label(), now_unix_ms())
+        {
             Ok(text) => {
                 write_stdout(&text);
+                if matches!(request, Request::ListSessions)
+                    && let Some(note) = peer.as_ref().and_then(|a| newer_daemon_note(a.as_str()))
+                {
+                    eprintln!("fil: {note}");
+                }
                 OK
             }
             Err(mut e) => {
@@ -381,6 +387,18 @@ async fn single(place: &Place<'_>, request: Request, config: &Config) -> u8 {
     };
     conn.finish().await;
     code
+}
+
+/// The note `fil ls` adds when the daemon that answered is a newer fil than this one (its
+/// `Hello` says so; nothing more is asked of the host). Its wire is ours (a daemon of another wire
+/// fails at the hello), so it serves this client; the note says how to catch up.
+fn newer_daemon_note(agent: &str) -> Option<String> {
+    let ours = crate::upgrade::Version::ours();
+    let theirs = crate::upgrade::newer_daemon(agent, &ours)?;
+    let how = crate::upgrade::upgrade_line(&crate::upgrade::detect(&crate::upgrade::System));
+    Some(format!(
+        "the daemon there is fil {theirs}, newer than this fil {ours}. {how}"
+    ))
 }
 
 /// For a session that is not in the daemon of this build's revision: it may live in one of

@@ -135,12 +135,32 @@ fn every_message_takes_a_tail_but_the_hello() {
     );
 }
 
+/// A `Route` is told by its index alone, so a receiver that only skips it (a daemon) skips one
+/// of a later release that it cannot decode, a `RouteTo` variant past the last.
+#[test]
+fn a_later_route_is_still_a_route_to_skip() {
+    use fil_proto::msg::{Route, RouteTo, is_route};
+    let later = [18u8, 3, 0xAA, 0xBB];
+    assert_eq!(ControlMsg::decode(&later), Err(MsgError::Malformed));
+    assert!(is_route(&later));
+    let now = ControlMsg::Route(Route {
+        to: RouteTo::Newest,
+    })
+    .encode()
+    .unwrap();
+    assert!(is_route(&now));
+    let features = ControlMsg::Features(FeatureSet::none()).encode().unwrap();
+    assert!(!is_route(&features));
+    assert!(!is_route(&[19, 0]));
+    assert!(!is_route(&[]));
+}
+
 /// A later build's new message, MUX record and input record are skipped; the stream around them
 /// is read as ever.
 #[test]
 fn a_later_builds_new_types_are_skipped() {
     // A control message of a type past the last: unknown, for the caller to skip.
-    for index in [18u32, 100, 16_000] {
+    for index in [fil_proto::msg::CONTROL_VARIANTS, 100, 16_000] {
         let mut v = postcard::to_allocvec(&index).unwrap();
         v.extend_from_slice(b"anything at all");
         assert_eq!(ControlMsg::decode(&v), Err(MsgError::Unknown(index)));
@@ -200,7 +220,7 @@ fn unknown_variants_inside_a_message_are_still_errors() {
 fn features_in_use_are_the_ones_both_sides_have() {
     let a_1_1 = FeatureSet::of(&[Feature(0), Feature(3)]);
     let b_1_2 = FeatureSet::of(&[Feature(0), Feature(3), Feature(7), Feature(250)]);
-    let c_1_0 = FeatureSet::ours();
+    let c_1_0 = FeatureSet::none();
     assert_eq!(a_1_1.common(&b_1_2), a_1_1);
     assert_eq!(b_1_2.common(&a_1_1), a_1_1);
     assert!(c_1_0.common(&b_1_2).is_empty());

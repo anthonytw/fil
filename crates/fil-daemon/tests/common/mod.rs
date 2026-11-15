@@ -240,6 +240,37 @@ pub async fn request_rev<L: Link>(link: &L, req: Request, revision: u16) -> Resp
     }
 }
 
+/// [`request`] with a `Route` after the `Hello` (decision D2), and the daemon's `Hello` (whose
+/// agent says which build answered).
+pub async fn request_routed<L: Link>(
+    link: &L,
+    req: Request,
+    to: fil_proto::msg::RouteTo,
+) -> (Response, Hello) {
+    send_ctl(link, &hello()).await;
+    send_ctl(link, &ControlMsg::Route(fil_proto::msg::Route { to })).await;
+    send_ctl(
+        link,
+        &ControlMsg::Features(fil_proto::ext::FeatureSet::ours()),
+    )
+    .await;
+    send_ctl(link, &ControlMsg::Request(req)).await;
+    let mut peer = None;
+    loop {
+        let (chan, payload) = tokio::time::timeout(WAIT, link.recv())
+            .await
+            .expect("a response in time")
+            .expect("the link stays up until the response");
+        assert_eq!(chan, ChannelId::CONTROL);
+        match ControlMsg::decode(&payload).unwrap() {
+            ControlMsg::Hello(h) => peer = Some(h),
+            ControlMsg::Features(_) => {}
+            ControlMsg::Response(r) => return (r, peer.expect("a hello first")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
 pub async fn ask(d: &Running, req: Request) -> Response {
     let link = d.pipe().await;
     let r = request_rev(&link, req, d.paths.revision).await;
@@ -258,6 +289,9 @@ pub struct Connect {
     pub take_over: fil_proto::msg::TakeOver,
     /// The wire revision the `Hello` states; the build's own when unset.
     pub revision: Option<u16>,
+    /// A `Route` sent after the `Hello`, for the relay (decision D2): its payload, which may be
+    /// one this build cannot decode (a later release's).
+    pub route: Option<Vec<u8>>,
 }
 
 impl Connect {
@@ -270,7 +304,19 @@ impl Connect {
             resume: None,
             take_over: fil_proto::msg::TakeOver::Any,
             revision: None,
+            route: None,
         }
+    }
+    /// A client that names the daemon it wants (`Route`, right after its `Hello`).
+    pub fn route(mut self, to: fil_proto::msg::RouteTo) -> Self {
+        let msg = ControlMsg::Route(fil_proto::msg::Route { to });
+        self.route = Some(msg.encode().unwrap());
+        self
+    }
+    /// A client that sends `payload` where its `Route` goes (a later release's, say).
+    pub fn route_raw(mut self, payload: &[u8]) -> Self {
+        self.route = Some(payload.to_vec());
+        self
     }
     /// A client whose `Hello` states wire revision `revision` (another build's client).
     pub fn revision(mut self, revision: u16) -> Self {
@@ -342,6 +388,12 @@ impl<L: Link> Client<L> {
                 .await
             }
             None => send_ctl(&cl.link, &hello()).await,
+        }
+        if let Some(route) = &c.route {
+            cl.link
+                .send(ChannelId::CONTROL, Bytes::from(route.clone()))
+                .await
+                .unwrap();
         }
         send_ctl(&cl.link, &ControlMsg::Attach(c.attach())).await;
         cl.wait("the attach reply", |c| {

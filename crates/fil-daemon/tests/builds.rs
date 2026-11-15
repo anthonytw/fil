@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use common::*;
 use fil_daemon::{Daemon, DaemonLauncher, Paths, RelayOptions, StartError, ensure_daemon};
+use fil_transport::Link;
 use rustix::fs::{FlockOperation, flock};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fil-daemon-dev");
@@ -587,4 +588,223 @@ async fn an_exiting_daemon_lends_until_it_lets_go() {
     assert_eq!(probe(&lock), Seen::Held, "B borrowed it and holds it");
     b.stop().await;
     assert_eq!(probe(&lock), Seen::Missing);
+}
+
+/// The sessions a daemon lists, by name: asked on its own socket (a relay would route to the
+/// newest build).
+async fn names_on(d: &Running) -> Vec<String> {
+    let link = d.direct_link().await;
+    let r = request_rev(
+        &link,
+        fil_proto::msg::Request::ListSessions,
+        d.paths.revision,
+    )
+    .await;
+    link.close();
+    match r {
+        fil_proto::msg::Response::Sessions { list, .. } => {
+            list.iter().map(|s| s.name.to_string()).collect()
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A relay of `version`'s build in the scratch directory, whose launcher would fail if it were
+/// used (so a test sees that it starts nothing).
+fn relay_of(s: &Scratch, version: &str) -> RelayOptions {
+    RelayOptions::with_paths(
+        s.paths().with_version(version),
+        DaemonLauncher::new("/nonexistent/fil", Vec::<String>::new()),
+    )
+}
+
+/// `Route` (decision D2, wire revision 17): the relay reads it after the client's hello and
+/// connects the client to the daemon it names: the build it names, or the daemon that holds the
+/// session it names, of whichever build; without one, or for a build or a session that is not
+/// there, the client goes where it would have gone anyway (the newest). Nothing is started for a
+/// route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_route_reaches_the_build_or_the_session_it_names() {
+    use fil_proto::msg::{FilVersion, Request, Response, RouteTo};
+    let s = Scratch::new();
+    let old = start_build(&s, "0.0.1", CAT).await;
+    let mut a = Client::attach(
+        fil_daemon_pipe(&old.paths).await,
+        Connect::new("old", key(1)),
+    )
+    .await;
+    a.wait_screen("ready").await;
+    a.detach().await;
+
+    // Only the old build runs, and the relay is a newer one: without a route it would start its
+    // own build's daemon (and fail, with this launcher); routed to the session, it reaches the
+    // old daemon, and starts nothing.
+    let mut b = Client::attach(
+        pipe_through_relay(relay_of(&s, "0.0.2")).await,
+        Connect::new("old", key(2)).route(RouteTo::Session("old".parse().unwrap())),
+    )
+    .await;
+    assert!(b.reply.is_some(), "attached: {:?}", b.refused);
+    b.detach().await;
+    assert_eq!(names_on(&old).await, ["old"]);
+    assert!(!s.paths().with_version("0.0.2").socket().exists());
+
+    let new = start_build(&s, "0.0.2", CAT).await;
+    // The session's route goes to the old build; a session nobody has goes to the newest, which
+    // creates it there.
+    let mut c = Client::attach(
+        pipe_through_relay(relay_of(&s, "0.0.2")).await,
+        Connect::new("old", key(3)).route(RouteTo::Session("old".parse().unwrap())),
+    )
+    .await;
+    assert!(c.reply.is_some(), "attached: {:?}", c.refused);
+    c.detach().await;
+    let mut d = Client::attach(
+        pipe_through_relay(relay_of(&s, "0.0.2")).await,
+        Connect::new("fresh", key(4)).route(RouteTo::Session("fresh".parse().unwrap())),
+    )
+    .await;
+    d.wait_screen("ready").await;
+    d.detach().await;
+    assert_eq!(names_on(&old).await, ["old"]);
+    assert_eq!(names_on(&new).await, ["fresh"]);
+
+    // A build's route: that build answers (its hello says which); the newest, or a build that is
+    // not running, gets the default (the newest). An old relay routes too.
+    let rev = fil_proto::version::wire_revision();
+    let build = |v: &str| RouteTo::Build {
+        version: FilVersion::new(v).unwrap(),
+        revision: rev,
+    };
+    for (relay, to, want, sessions) in [
+        ("0.0.2", build("0.0.1"), "fil-daemon 0.0.1", vec!["old"]),
+        ("0.0.1", build("0.0.1"), "fil-daemon 0.0.1", vec!["old"]),
+        ("0.0.1", build("0.0.2"), "fil-daemon 0.0.2", vec!["fresh"]),
+        ("0.0.2", build("9.9.9"), "fil-daemon 0.0.2", vec!["fresh"]),
+        ("0.0.2", RouteTo::Newest, "fil-daemon 0.0.2", vec!["fresh"]),
+        (
+            "0.0.2",
+            RouteTo::Session("nobody".parse().unwrap()),
+            "fil-daemon 0.0.2",
+            vec!["fresh"],
+        ),
+    ] {
+        let link = pipe_through_relay(relay_of(&s, relay)).await;
+        let (r, hello) = request_routed(&link, Request::ListSessions, to.clone()).await;
+        link.close();
+        assert_eq!(hello.agent.as_str(), want, "{relay} {to:?}");
+        match r {
+            Response::Sessions { list, .. } => {
+                let names: Vec<String> = list.iter().map(|s| s.name.to_string()).collect();
+                assert_eq!(names, sessions, "{relay} {to:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    // A kill routed to the session's daemon ends it there.
+    let link = pipe_through_relay(relay_of(&s, "0.0.2")).await;
+    let (r, _) = request_routed(
+        &link,
+        Request::KillSession {
+            name: "old".parse().unwrap(),
+        },
+        RouteTo::Session("old".parse().unwrap()),
+    )
+    .await;
+    link.close();
+    assert_eq!(r, Response::Killed { unchecked: false });
+    // A `Route` that reaches a daemon (no relay in between, or one too old to read it) is
+    // skipped there.
+    let link = old.direct_link().await;
+    let (r, _) = request_routed(&link, Request::ListSessions, build("0.0.2")).await;
+    link.close();
+    assert!(matches!(r, Response::Sessions { list, .. } if list.is_empty()));
+    new.stop().await;
+    old.stop().await;
+}
+
+/// `Request::Jobs` (wire revision 17, behind `Feature::JOBS`): what still runs in each session,
+/// its shell not counted, killing nothing; one session, or a session that is not there (no row).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_jobs_pre_check_counts_what_runs_and_kills_nothing() {
+    use fil_proto::msg::{Request, Response};
+    let s = Scratch::new();
+    let busy = start_build(&s, "0.0.3", "sleep 300 & sleep 301 & echo ready; exec cat").await;
+    let mut a = Client::attach(busy.pipe().await, Connect::new("busy", key(1))).await;
+    a.wait_screen("ready").await;
+    a.detach().await;
+    let rows = |r: Response| match r {
+        Response::Jobs { list, truncated } => {
+            assert!(!truncated);
+            list.into_iter()
+                .map(|r| (r.name.to_string(), r.jobs))
+                .collect::<Vec<_>>()
+        }
+        other => panic!("{other:?}"),
+    };
+    let all = rows(ask(&busy, Request::Jobs { session: None }).await);
+    assert_eq!(all, [("busy".to_string(), Some(2))]);
+    let one = rows(
+        ask(
+            &busy,
+            Request::Jobs {
+                session: Some("busy".parse().unwrap()),
+            },
+        )
+        .await,
+    );
+    assert_eq!(one, [("busy".to_string(), Some(2))]);
+    let none = rows(
+        ask(
+            &busy,
+            Request::Jobs {
+                session: Some("nobody".parse().unwrap()),
+            },
+        )
+        .await,
+    );
+    assert!(none.is_empty());
+    // Nothing was killed.
+    assert_eq!(names_on(&busy).await, ["busy"]);
+    busy.stop().await;
+
+    // A shell with nothing running in it has no jobs.
+    let quiet = start_build(&s, "0.0.4", CAT).await;
+    let mut b = Client::attach(quiet.pipe().await, Connect::new("quiet", key(2))).await;
+    b.wait_screen("ready").await;
+    b.detach().await;
+    let all = rows(ask(&quiet, Request::Jobs { session: None }).await);
+    assert_eq!(all, [("quiet".to_string(), Some(0))]);
+    quiet.stop().await;
+}
+
+/// A `Route` of a later release (a `RouteTo` variant past the last, which this build cannot
+/// decode) is dropped harmlessly wherever it goes: a daemon reached on its socket skips it by its
+/// index and attaches; a relay takes it out and routes as if there were none. (Over QUIC:
+/// `direct.rs`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_releases_route_is_dropped_harmlessly() {
+    let later: &[u8] = &[18, 3, 0xAA, 0xBB];
+    let s = Scratch::new();
+    let d = start_build(&s, "0.0.5", CAT).await;
+    let mut a = Client::attach(
+        d.direct_link().await,
+        Connect::new("direct", key(1)).route_raw(later),
+    )
+    .await;
+    assert!(a.reply.is_some(), "{:?} {:?}", a.refused, a.errors);
+    a.wait_screen("ready").await;
+    a.detach().await;
+    let mut b = Client::attach(
+        pipe_through_relay(relay_of(&s, "0.0.5")).await,
+        Connect::new("relayed", key(2)).route_raw(later),
+    )
+    .await;
+    assert!(b.reply.is_some(), "{:?} {:?}", b.refused, b.errors);
+    b.wait_screen("ready").await;
+    b.detach().await;
+    let mut names = names_on(&d).await;
+    names.sort();
+    assert_eq!(names, ["direct", "relayed"]);
+    d.stop().await;
 }

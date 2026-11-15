@@ -79,9 +79,15 @@ List the sessions on HOST
 .PP
 Usage: \fBfil ls [OPTIONS] <HOST>\fR
 .SS "fil kill"
-End a session: its shell and everything it started are killed
+End a session: its shell and everything it started are killed. With \-\-outdated: every session on a daemon older than this fil, after showing them with their jobs and asking
 .PP
-Usage: \fBfil kill [OPTIONS] <HOST> <SESSION>\fR
+Usage: \fBfil kill [OPTIONS] <HOST> [SESSION]\fR
+.TP
+\fB\-\-outdated\fR
+End every session on HOST whose daemon is an older fil than this one (after an upgrade, say a security fix), after listing them with the jobs left in them and asking
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+With \-\-outdated: do not ask (needed when stdin is not a terminal)
 .SS "fil detach"
 Detach whoever is attached to a session; it keeps running (inside a session, with no arguments: this one)
 .PP
@@ -181,6 +187,13 @@ attached elsewhere and you did not take it over;
 2 on a usage error;
 255 if a forward failed and forward_failure = "exit".
 With \-N, a stop signal (Ctrl\-C) detaches and exits 0, or 255 before the session is attached.
+fil kill \-\-outdated exits 0 only when every session on an older daemon was ended (or there was
+none) and every daemon could be checked; 1 when it asked nothing (no terminal, no \-\-yes) or you
+declined, a kill failed, a daemon could not be checked (each is named), or the host\*(Aqs own fil is
+older than this one.
+After an upgrade, fil ls HOST and fil kill \-\-outdated make one ssh connection per daemon (kill
+\-\-outdated also one per older daemon for its jobs and one per session it ends): with a password
+login, set ControlMaster auto and ControlPersist in ~/.ssh/config to be asked once.
 .PP
 Source: every release publishes fil\-<version>\-source.tar.gz beside the binaries (GPL\-3.0 Corresponding Source).
 .SH "SEE ALSO"

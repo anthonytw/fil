@@ -146,6 +146,7 @@ async fn run(action: Action, config: &Config) -> u8 {
         Action::Kill { host, session } => {
             cmds::manage(&host, Request::KillSession { name: session }, config).await
         }
+        Action::KillOutdated { host, yes } => cmds::kill_outdated(&host, yes, config).await,
         Action::Detach { host, session } => {
             cmds::manage(&host, Request::DetachSession { name: session }, config).await
         }

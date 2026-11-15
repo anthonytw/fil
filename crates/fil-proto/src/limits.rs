@@ -16,7 +16,7 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// `tests/wire_golden.rs` holds a committed encoding of every message and fails if the encoding
 /// changes without this number changing. Regenerate with `just wire-golden`. 0 is reserved for
 /// builds from before revisions existed (their hello said `minor: 0`).
-pub const PROTOCOL_REVISION: u16 = 16;
+pub const PROTOCOL_REVISION: u16 = 17;
 /// The 1.0 wire: every revision from this one on, under [`PROTOCOL_MAJOR`], interoperates with
 /// every other (the extensible wire, frozen for 1.x). Revisions below it are pre-1.0 development
 /// builds, each of which talks only to its own revision.

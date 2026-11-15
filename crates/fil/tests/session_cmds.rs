@@ -491,10 +491,11 @@ fn in_session_commands_reach_a_daemon_of_another_1x_revision() {
     assert_eq!(sock_names(&w.socks), before, "it started no daemon");
 }
 
-/// The daemon of this revision runs, but the session is in a daemon of another: "no such
-/// session" says so instead of leaving the user to wonder.
+/// The daemon of this revision runs, but the session is in a daemon of an older 1.x revision:
+/// the in-session command reaches it there (it picks the daemon that holds the session, as a
+/// relay does for a `Route`, decision D2) instead of saying "no such session".
 #[test]
-fn a_session_in_another_revisions_daemon_is_explained() {
+fn an_in_session_command_reaches_its_session_on_an_older_daemon() {
     let w = World::new("rev3");
     let (old, new) = (ours(), ours() + 1);
     w.host("older", old);
@@ -505,13 +506,19 @@ fn a_session_in_another_revisions_daemon_is_explained() {
     assert!(ls.ok, "{}", ls.stderr);
 
     let out = w.inside_as(new, "work", &["forward", "-L", "80"]);
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("to session \"work\""), "{}", out.stdout);
+    // A session that is in neither is still "no such session" (the other daemon is of this fil's
+    // family and was looked in, so the note names no daemon).
+    let out = w.inside_as(new, "nowhere", &["forward", "-L", "81"]);
     assert_eq!(out.code, Some(1));
     assert!(
-        out.stderr.contains("no session \"work\" on this machine")
-            && out.stderr.contains(&format!("a daemon of wire rev {old}")),
+        out.stderr
+            .contains("no session \"nowhere\" on this machine"),
         "{}",
         out.stderr
     );
+    assert!(!out.stderr.contains("also running"), "{}", out.stderr);
 }
 
 /// No daemon at all: the message says what these commands are for.
@@ -1067,7 +1074,7 @@ async fn a_daemon_of_another_uid_is_refused() {
     let (w, fake) = fake_world("uidcheck", Response::ports(Vec::new()));
     let paths = fil_daemon::Paths::in_dir(&w.socks);
     let me = fil_daemon::current_uid();
-    let err = fil::cmds::connect_local_as(&paths, me.wrapping_add(1))
+    let err = fil::cmds::connect_local_as(&paths, me.wrapping_add(1), None)
         .await
         .err()
         .expect("a daemon of another uid is refused");
@@ -1076,6 +1083,6 @@ async fn a_daemon_of_another_uid_is_refused() {
         "{err}"
     );
     assert!(fake.asked.lock().unwrap().is_empty(), "no request was sent");
-    let link = fil::cmds::connect_local_as(&paths, me).await.unwrap();
+    let link = fil::cmds::connect_local_as(&paths, me, None).await.unwrap();
     link.close();
 }

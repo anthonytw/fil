@@ -759,6 +759,23 @@ pub fn descendants(root: u32, rows: &[ProcRow]) -> Vec<ProcRow> {
     out
 }
 
+/// How many processes are still running in a session whose child is `root`: its descendants in
+/// `rows`, and the processes recorded for it (`recorded`, which may have left the tree since) that
+/// `rows` still lists, neither counting `root` nor a zombie. What `fil kill --outdated` reports
+/// before it asks (the `Jobs` request). A recorded pid that was reused for another process counts
+/// too: this is for a person deciding, never for signalling.
+pub fn jobs_in(root: u32, recorded: &[u32], rows: &[ProcRow]) -> usize {
+    let live: HashSet<u32> = rows.iter().filter(|r| !r.zombie).map(|r| r.pid).collect();
+    let mut jobs: HashSet<u32> = descendants(root, rows)
+        .into_iter()
+        .filter(|r| !r.zombie)
+        .map(|r| r.pid)
+        .collect();
+    jobs.extend(recorded.iter().copied().filter(|p| live.contains(p)));
+    jobs.remove(&root);
+    jobs.len()
+}
+
 /// The processes recorded under a session's child over its life.
 #[derive(Clone, Debug, Default)]
 pub struct Tracker {
@@ -1783,6 +1800,26 @@ mod tests {
         // A table with a cycle (a pid reused mid-scan) must not loop.
         let cyc = [row(1, 2, "a"), row(2, 1, "a")];
         assert_eq!(descendants(1, &cyc).len(), 1);
+    }
+
+    /// The jobs pre-check counts what still runs below the shell and what was recorded and left
+    /// the tree, never the shell itself, a zombie or a process that is gone.
+    #[test]
+    fn jobs_count_the_tree_and_the_recorded_but_not_the_shell() {
+        let mut zombie = row(14, 10, "z");
+        zombie.zombie = true;
+        let rows = [
+            row(10, 1, "a"),
+            row(11, 10, "a"),
+            row(12, 11, "a"),
+            zombie,
+            row(30, 1, "escaped"),
+            row(40, 1, "unrelated"),
+        ];
+        assert_eq!(jobs_in(10, &[], &rows), 2);
+        // Recorded: the shell, an escaped job, one already counted, one that is gone.
+        assert_eq!(jobs_in(10, &[10, 30, 11, 99], &rows), 3);
+        assert_eq!(jobs_in(10, &[], &[row(10, 1, "a")]), 0);
     }
 
     #[test]

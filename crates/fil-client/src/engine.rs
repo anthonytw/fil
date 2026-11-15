@@ -1580,6 +1580,16 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let agent = Agent::new(format!("fil-client {}", env!("CARGO_PKG_VERSION")))
             .expect("agent string is valid");
         send_on(tx, &ControlMsg::Hello(Hello::ours(agent)));
+        // For the relay (DESIGN.md section 5.3, decision D2): the daemon that holds this session,
+        // whichever build it is, so a session on an older daemon is reached after an upgrade. The
+        // relay reads it and keeps it; a relay too old to know it passes it on, and every daemon
+        // skips it (a QUIC link has no relay: the daemon there skips it too).
+        send_on(
+            tx,
+            &ControlMsg::Route(fil_proto::msg::Route {
+                to: fil_proto::msg::RouteTo::Session(self.cfg.session.clone()),
+            }),
+        );
         // Right after the hello, always (DESIGN.md section 8.5). The attach follows at once, so
         // it uses only what every 1.x daemon reads.
         send_on(tx, &ControlMsg::Features(FeatureSet::ours()));
@@ -1780,7 +1790,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             ControlMsg::Heartbeat { .. }
             | ControlMsg::Ack { .. }
             | ControlMsg::Resume { .. }
-            | ControlMsg::Attach(_) => {}
+            | ControlMsg::Attach(_)
+            // The client's message to its relay; a daemon never sends one.
+            | ControlMsg::Route(_) => {}
         }
         Ok(Flow::Continue)
     }

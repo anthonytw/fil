@@ -46,7 +46,7 @@ fn release_upload(remote: Remote) -> Result<Upload, String> {
 
 /// Asks on stderr, answered on stdin, only if stdin is a terminal (else no). Called before the
 /// terminal goes raw, when the client does not read stdin yet.
-fn ask_on_terminal(question: &str) -> bool {
+pub(crate) fn ask_on_terminal(question: &str) -> bool {
     use std::io::{IsTerminal, Read, Write};
     if !std::io::stdin().is_terminal() {
         return false;

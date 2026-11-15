@@ -56,9 +56,14 @@ async fn quic_attach_with_the_registered_key() {
 
     // Upgrade: dial QUIC, resume on it. The pipe is dropped by the session.
     let q = dial(&d, &ck).await.expect("the registered key connects");
+    // The client sends a `Route` on every link, QUIC too, where no relay takes it out: the
+    // daemon skips it by its index, even one of a later release it cannot decode (a `RouteTo`
+    // variant past the last).
     let mut b = Client::attach(
         q,
-        Connect::new("main", pk.clone()).resume(a.resume_request()),
+        Connect::new("main", pk.clone())
+            .resume(a.resume_request())
+            .route_raw(&[18, 3, 0xAA]),
     )
     .await;
     assert!(

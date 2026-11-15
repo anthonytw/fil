@@ -23,6 +23,10 @@
 //!   or one of the client's revision from before daemons were keyed by build
 //!   (`fil-<major>-<rev>.sock`, which holds the wire lock alone), and otherwise the relay's own
 //!   build's daemon, started if needed (so a 1.x relay never refuses a 1.x client);
+//! - **a 1.x client of the relay's family that names a daemon** (a `Route`, wire revision 17,
+//!   right after its hello: decision D2): the running daemon it names, by build or by the session
+//!   it holds ([`crate::route`]). The relay takes the `Route` out of the stream (the daemon never
+//!   sees it) and starts nothing for it; when it names nothing that runs, the rules below apply;
 //! - **another family whose daemon is running** (the newest of `fil-<major>-<rev>-v<ver>.sock`,
 //!   then `fil-<major>-<rev>.sock`; revision 0 is the pre-revision `fil-<major>.sock`): connect
 //!   to it. Nothing is started;
@@ -387,6 +391,55 @@ fn read_opening<W: Write>(
     }
 }
 
+/// Takes the client's [`fil_proto::msg::Route`] out of `held`, if the frame after its hello (the
+/// first frame of `held`) is one, waiting for that frame up to `wait`: every 1.x client sends its
+/// `Route` or its `Features` right after its hello without waiting for an answer, so this costs
+/// nothing for them. `Some(to)` for a `Route` this relay can read; a `Route` it cannot read is
+/// taken out all the same (the daemon would only skip it) and gives `None`, as does any other
+/// frame, which stays in `held`.
+fn take_route(
+    rx: &mpsc::Receiver<Chunk>,
+    held: &mut Vec<u8>,
+    ended: &mut bool,
+    wait: Duration,
+) -> Option<fil_proto::msg::RouteTo> {
+    let deadline = Instant::now() + wait;
+    let Ok(Some((_, hello_len))) = frame_at(held) else {
+        return None;
+    };
+    loop {
+        match frame_at(&held[hello_len..]) {
+            Ok(Some((frame, used))) => {
+                if frame.channel != fil_proto::ChannelId::CONTROL {
+                    return None;
+                }
+                let route = crate::route::read_route(&frame.payload)?;
+                held.drain(hello_len..hello_len + used);
+                return route;
+            }
+            Err(()) => return None,
+            Ok(None) if *ended => return None,
+            Ok(None) => {}
+        }
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Chunk::Data(d)) => held.extend_from_slice(&d),
+            Ok(Chunk::End) | Err(mpsc::RecvTimeoutError::Disconnected) => *ended = true,
+            Err(mpsc::RecvTimeoutError::Timeout) => return None,
+        }
+    }
+}
+
+/// Whether this relay ignores `Route`s, as one from before them does: never, but **test only**
+/// (`test-hooks`) `FIL_TEST_RELAY_NO_ROUTE` makes it pass them on, so a real-binary test can show
+/// what a client does on a host whose fil cannot route.
+fn route_off() -> bool {
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("FIL_TEST_RELAY_NO_ROUTE").is_some() {
+        return true;
+    }
+    false
+}
+
 /// A control frame holding `payload`, written to the client.
 fn write_payload<W: Write>(output: &mut W, payload: &[u8]) -> Result<(), RelayError> {
     let frame = opening::frame_of(payload)
@@ -457,12 +510,34 @@ where
     opts.paths.check_socket_len().map_err(EnsureError::from)?;
     ensure_socket_dir(&opts.paths.dir).map_err(EnsureError::from)?;
     let rx = read_in_background(input);
-    let (want, held, ended) = read_opening(&rx, &mut output, opts.hello_wait)?;
+    let (want, mut held, mut ended) = read_opening(&rx, &mut output, opts.hello_wait)?;
     let own = (opts.paths.major, opts.paths.revision);
     let theirs = match want {
         Want::Wire { major, revision } => (major, revision),
         Want::Own | Want::Gone => own,
     };
+    // A 1.x client of this relay's family may name the daemon it wants (`Route`, wire revision
+    // 17, right after its hello). Only a 1.x client: index 18 means nothing to a pre-1.x one.
+    let route = match want {
+        Want::Wire { major, revision }
+            if revision >= fil_proto::limits::FIRST_STABLE_REVISION
+                && crate::paths::same_family((major, revision), own)
+                && !route_off() =>
+        {
+            take_route(&rx, &mut held, &mut ended, opts.hello_wait)
+        }
+        _ => None,
+    };
+    let routed = route.as_ref().and_then(|to| {
+        crate::route::pick(
+            &opts.paths.dir,
+            theirs.0,
+            theirs.1,
+            (&opts.paths.version, own.1),
+            to,
+        )
+        .and_then(|d| UnixStream::connect(d.socket).ok())
+    });
     let newer_than_ours = |d: &crate::paths::RunningDaemon| match &d.version {
         // A daemon of the client's revision from before daemons were keyed by build holds that
         // revision's wire lock alone: none can start beside it, so it takes the connection.
@@ -474,6 +549,9 @@ where
     };
     let sock = match want {
         Want::Gone => return Ok(RelayEnd::PipeClosed),
+        // The daemon the client's `Route` names, running and answering. Otherwise the client goes
+        // where it would have gone without one.
+        Want::Wire { .. } if let Some(s) = routed => s,
         Want::Wire { major, revision } if !crate::paths::same_family((major, revision), own) => {
             // Another family's client (another major, or a revision from before 1.x that is not
             // ours). The newest of its daemons that is running; never a new daemon of another

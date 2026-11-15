@@ -1422,6 +1422,32 @@ async fn ignore_job_signals_starts_the_command_with_the_terminal_signals_ignored
     }
 }
 
+/// A pipe program that does not exist fails as a spawn error with or without the shell that
+/// ignores the terminal's signals: the shell's own 127 must not read as "no fil on the host".
+#[tokio::test]
+async fn a_missing_program_is_a_spawn_error_with_ignore_job_signals_too() {
+    for ignore in [false, true] {
+        for program in ["fil-test-no-such-program", "/nonexistent/fil-test-pipe"] {
+            let cmd = PipeCommand::custom([program, "arg"]).unwrap();
+            let mut c = cfg();
+            c.stderr = PipeStderr::Capture;
+            c.ignore_job_signals = ignore;
+            let e = match PipeLink::spawn(&cmd, c).await {
+                Ok(_) => panic!("{program} started"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(&e.kind, PipeErrorKind::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound),
+                "{program}, ignore {ignore}: {e:?}"
+            );
+            assert!(
+                e.to_string().contains("could not start the pipe command"),
+                "{e}"
+            );
+        }
+    }
+}
+
 /// Efficiency sweep #7: the round-trip time differs a little on every heartbeat, and each change
 /// used to be published, waking the engine and the link watchers once a second for nothing. Only
 /// a change of 10 % or 2 ms is published now.

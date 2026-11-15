@@ -1670,9 +1670,8 @@ mod tests {
         );
     }
 
-    /// The offsets in `kinfo` against the real kernel: this process, a running child and a
-    /// zombie child are found with the right parents and states, and the table is the one `ps`
-    /// shows.
+    /// The signals a live process ignores, from `/proc` on Linux and the process table on macOS
+    /// (`p_sigignore`, whose offset this checks against the real kernel).
     #[test]
     fn ignored_signals_are_read_for_a_live_process() {
         // `sh` keeps a disposition it was started with ignored, and `exec` keeps it too: the
@@ -1712,6 +1711,9 @@ mod tests {
         assert_eq!(parse_sig_ign("Name:\tx\n"), None);
     }
 
+    /// The offsets in `kinfo` against the real kernel: this process, a running child and a
+    /// zombie child are found with the right parents and states, and the table is the one `ps`
+    /// shows.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_macos_table_matches_ps() {

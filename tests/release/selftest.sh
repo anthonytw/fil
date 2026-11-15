@@ -108,6 +108,33 @@ mutate_cw "a job gets a single-quoted write permission" "s/(\\n  lint:\\n)/\${1}
 mutate_cw "the workflow gets contents: write" 's/(permissions:\n  contents: )read/${1}write/'
 mutate_cw "a matrix value reaches a run: line" 's/run: just realnet "\$PART"/run: just realnet \${{ matrix.part }}/'
 mutate_cw "a secret is used" 's/(PART: )/SECRET_X: \${{ secrets.X }}\n          $1/'
+# the scheduled profile: the weekly advisory scan (schedule and dispatch only)
+sw=$REPO_ROOT/.github/workflows/audit.yml
+expect_pass "the audit workflow passes the scheduled-profile lint" "$RELEASE_DIR/lint-workflow.sh" --scheduled "$sw"
+expect_fail "the audit workflow fails the check profile (a schedule is not a check trigger)" "$RELEASE_DIR/lint-workflow.sh" --check "$sw"
+expect_fail "a check workflow fails the scheduled profile" "$RELEASE_DIR/lint-workflow.sh" --scheduled "$REPO_ROOT/.github/workflows/linux-check.yml"
+mutate_sw() {
+  local name=$1 expr=$2
+  perl -0pe "$expr" "$sw" > "$tmp/sw.yml"
+  if cmp -s "$sw" "$tmp/sw.yml"; then
+    flunk "scheduled-profile mutation '$name' did not change the workflow (the test is stale)"
+  else
+    expect_fail "scheduled-profile mutation: $name" "$RELEASE_DIR/lint-workflow.sh" --scheduled "$tmp/sw.yml"
+  fi
+}
+mutate_sw "a push trigger" 's/(\n  workflow_dispatch:\n)/${1}  push:\n    branches: [main]\n/'
+mutate_sw "a pull_request trigger" 's/(\n  workflow_dispatch:\n)/${1}  pull_request:\n/'
+mutate_sw "the dispatch takes inputs" 's/(\n  workflow_dispatch:\n)/${1}    inputs:\n      ref:\n        default: main\n/'
+mutate_sw "no schedule" 's/\n  schedule:\n(?:    .*\n)+/\n/'
+mutate_sw "no workflow_dispatch" 's/\n  workflow_dispatch:\n/\n/'
+mutate_sw "the schedule holds something else" 's/(\n    - cron: [^\n]*\n)/${1}    branches: [main]\n/'
+mutate_sw "an inline schedule" 's/\n  schedule:\n(?:    .*\n)+/\n  schedule: [{cron: "0 0 * * 1"}]\n/'
+mutate_sw "the job gets contents: write" 's/(\n    permissions:\n      contents: )read/${1}write/'
+mutate_sw "the workflow gets contents: write" 's/(\npermissions:\n  contents: )read/${1}write/'
+mutate_sw "an action is pinned by a tag" 's/(taiki-e\/install-action)\@[0-9a-f]{40}/$1\@v2/'
+mutate_sw "a checkout keeps credentials" 's/persist-credentials: false/persist-credentials: true/'
+mutate_sw "a secret is used" 's/(        run: cargo deny --locked check advisories\n)/        env:\n          T: \$\{\{ secrets.X \}\}\n$1/'
+mutate_sw "an expression in a run: line" 's/run: cargo deny --locked check advisories/run: cargo deny \$\{\{ github.ref \}\} check advisories/'
 mutate_wf "the dry-run build job gets id-token: write" 's/(  build-linux:.*?    permissions:\n      contents: read\n)/$1      id-token: write\n/s'
 mutate_wf "the package job gets attestations: write" 's/(  package:.*?    permissions:\n      contents: read\n)/$1      attestations: write\n/s'
 mutate_wf "a non-publish job gets contents: write" 's/(  smoke-macos:.*?    permissions:\n      contents: )read/${1}write/s'
@@ -443,10 +470,16 @@ mk_tree() { # DIR VER
   cp "$REPO_ROOT/crates/fil-proto/src/limits.rs" "$d/crates/fil-proto/src/"
   cp "$REPO_ROOT/crates/fil-proto/tests/golden/wire.txt" "$d/crates/fil-proto/tests/golden/"
   cp "$REPO_ROOT/crates/fil-transport/src/pipe/remote-commands.txt" "$d/crates/fil-transport/src/pipe/"
+  mkdir -p "$d/packaging" "$d/.github"
+  cp "$REPO_ROOT/$INSTALLER_SRC" "$d/$INSTALLER_SRC"
   git init -q -b main "$d"
   set_version "$d" "$2"
   git -C "$d" add -A
   git -C "$d" commit -q -m tree
+  # The signers the installer must pin (release-check reads the work tree's), left out of the commit
+  # and of git status: prepare.sh would check the scratch tags' signatures against a committed key.
+  cp "$REPO_ROOT/.github/release-signers" "$d/.github/release-signers"
+  echo /.github/release-signers >> "$d/.git/info/exclude"
 }
 set_version() { # DIR VER: Cargo.toml and a changelog section
   perl -pi -e 'if (!$d && s/^version = "[^"]*"/version = "'"$2"'"/) { $d = 1 }' "$1/Cargo.toml"
@@ -532,6 +565,9 @@ pack_release() { # uses $tree $stage $rel $VER
     (cd "$stage" && tar $tar_flags -czf "$rel/fil-$VER-$lbl.tar.gz" "fil-$VER-$lbl" $extra)
   done
   cp "$rel/fil-$VER-universal-apple-darwin.tar.gz" "$rel/$(ci_archive_name "$VER")"
+  cp "$tree/$INSTALLER_SRC" "$rel/$INSTALLER_NAME"
+  [ ! -f "$stage/.installer" ] || cp "$stage/.installer" "$rel/$INSTALLER_NAME"
+  [ ! -e "$stage/.no-installer" ] || rm "$rel/$INSTALLER_NAME"
   pack_packages
   write_sums
 }
@@ -573,7 +609,7 @@ pack_packages() {
     done
   done
 }
-write_sums() { (cd "$rel" && for f in $({ printf '%s\n' fil-"$VER"-*.tar.gz; package_names "$VER"; } | LC_ALL=C sort); do if [ -f "$f" ]; then printf '%s  %s\n' "$(sha256 "$f")" "$f"; fi; done > SHA256SUMS); }
+write_sums() { (cd "$rel" && for f in $({ printf '%s\n' fil-"$VER"-*.tar.gz "$INSTALLER_NAME"; package_names "$VER"; } | LC_ALL=C sort); do if [ -f "$f" ]; then printf '%s  %s\n' "$(sha256 "$f")" "$f"; fi; done > SHA256SUMS); }
 
 case_n=0
 new_case() { # VER: a tree, a stage and the packed release; sets $tree $stage $rel $VER
@@ -610,6 +646,18 @@ mutated_msg() {
 
 new_case 0.9.0
 expect_pass "a clean dry run passes" check --dry-run --no-tree "$rel"
+check --dry-run --no-tree "$rel" > "$tmp/inst-check.log" 2>&1 || true
+expect_pass "...and checked the installer's pinned key" grep -q "pins exactly the fil-release keys" "$tmp/inst-check.log"
+mutated_msg "the installer is missing" "no fil-install.sh" "touch .no-installer"
+mutated_msg "the installer pins another key" "pins other keys" "sed 's|AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]*|AAAAC3NzaC1lZDI1NTE5AAAAIOTHERKEY|' \"\$tree/$INSTALLER_SRC\" > .installer"
+mutated_msg "the installer is not a #!/bin/sh script" "does not start with #!/bin/sh" "printf '#!/bin/bash\\necho\\n' > .installer"
+mutated_msg "the installer does not parse" "does not parse" "printf '#!/bin/sh\\nif then\\n' > .installer"
+mutated_msg "the installer assigns its key twice" "FIL_RELEASE_SIGNERS= appears 2 times" "{ cat \"\$tree/$INSTALLER_SRC\"; echo 'FIL_RELEASE_SIGNERS=\$FIL_RELEASE_SIGNERS'; } > .installer"
+mutated_msg "the installer's pinned line names another principal" "does not name the principal" "sed 's/^FIL_RELEASE_PRINCIPAL=release\$/FIL_RELEASE_PRINCIPAL=owner/' \"\$tree/$INSTALLER_SRC\" > .installer"
+mutated_msg "the installer verifies against another file" "the verify call is not exactly once" "sed 's|-Y verify -f \"\$tmp/signers\"|-Y verify -f \"\$tmp/other\"|' \"\$tree/$INSTALLER_SRC\" > .installer"
+mutated_msg "the installer's namespace is not fil-release" "FIL_RELEASE_NAMESPACE is not set once" "sed 's/^FIL_RELEASE_NAMESPACE=fil-release\$/FIL_RELEASE_NAMESPACE=git/' \"\$tree/$INSTALLER_SRC\" > .installer"
+expect_pass "installer: the tree's script pins its key correctly (installer_pin_problems)" test -z "$(installer_pin_problems "$REPO_ROOT/$INSTALLER_SRC")"
+new_case 0.9.0 # the cases below start from a clean release
 expect_pass "a clean tag run passes (changelog, tag, wire)" check --tag v0.9.0 --no-tree "$rel"
 expect_pass "a clean complete run passes" check --tag v0.9.0 --complete --no-tree "$rel"
 cp "$rel/$(ci_archive_name 0.9.0)" "$tmp/ci.keep"
@@ -1236,6 +1284,10 @@ expect_pass "render: the PKGBUILD and .SRCINFO" "$render" aur 0.9.0-rc.1 "$tmp/r
 expect_pass "render: ...pkgver has no '-' (0.9.0rc.1), _ver is the release's" sh -c 'grep -qx "pkgver=0.9.0rc.1" "$1/PKGBUILD" && grep -qx "_ver=0.9.0-rc.1" "$1/PKGBUILD" && grep -q "pkgver = 0.9.0rc.1" "$1/.SRCINFO"' sh "$tmp/render/out"
 expect_pass "render: ...the x86_64 and aarch64 checksums in both files" sh -c 'grep -q "sha256sums_x86_64=(.$2.)" "$1/PKGBUILD" && grep -q "sha256sums_aarch64=(.$3.)" "$1/PKGBUILD" && grep -q "sha256sums_x86_64 = $2" "$1/.SRCINFO"' sh "$tmp/render/out" "$(h 4)" "$(h 1)"
 expect_pass "render: the PKGBUILD is valid bash" bash -n "$tmp/render/out/PKGBUILD"
+{ cat "$tmp/render/SUMS"; printf '%s  %s\n' "$(h 5)" fil-install.sh; } | LC_ALL=C sort -k2 > "$tmp/render/SUMS.inst"
+expect_pass "render: the formula from a SHA256SUMS that also lists the installer" "$render" brew 0.9.0-rc.1 "$tmp/render/SUMS.inst" "$tmp/render/oi"
+expect_pass "render: ...and the PKGBUILD" "$render" aur 0.9.0-rc.1 "$tmp/render/SUMS.inst" "$tmp/render/oi"
+expect_pass "render: ...with the same checksums as without it" sh -c 'grep -q "sha256sums_x86_64=(.$2.)" "$1/PKGBUILD" && grep -q "sha256 \"$3\"" "$1/fil.rb"' sh "$tmp/render/oi" "$(h 4)" "$(h 3)"
 grep -v x86_64 "$tmp/render/SUMS" > "$tmp/render/SUMS.short"
 expect_fail "render: a release without one of the archives is refused" "$render" brew 0.9.0-rc.1 "$tmp/render/SUMS.short" "$tmp/render/o2"
 expect_fail "render: a version that is not a release version is refused" "$render" brew '0.9.0+x' "$tmp/render/SUMS" "$tmp/render/o3"
@@ -1405,7 +1457,7 @@ macsign_fixture() {
   SOURCE_DATE_EPOCH=1700000000 "$ms/bin/pack" "$ms/stage" "$ms/packed"
   cp "$ms/packed/$MAC.tar.gz" "$w/files/"
   cp "$ms/packed/$MAC.tar.gz" "$w/files/$MACCI"
-  for f in fil-$MV-aarch64-linux-musl.tar.gz fil-$MV-source.tar.gz fil-$MV-x86_64-linux-musl.tar.gz $(package_names "$MV"); do echo "$f" > "$w/files/$f"; done
+  for f in fil-$MV-aarch64-linux-musl.tar.gz fil-$MV-source.tar.gz fil-$MV-x86_64-linux-musl.tar.gz $INSTALLER_NAME $(package_names "$MV"); do echo "$f" > "$w/files/$f"; done
   rewrite_sums "$w/files" "$MV"
   cp "$ms/signers" "$w/signers"
   printf 'sums=%s\nrebuild=1\npresign=1\ndry=0\n' "$(sha256 "$w/files/SHA256SUMS")" > "$w/verified"
@@ -1651,6 +1703,282 @@ fi
 rm -f "$MACSIGN_SCRIPT"
 unset MACSIGN_SCRIPT
 
+
+# ============================================================== the installer (packaging/install.sh)
+# A fake release directory laid out like GitHub's (file://), signed with a throwaway key, and a copy of
+# the real script that differs from it only in the pinned key. HOME is a scratch directory each time.
+echo "== the installer (packaging/install.sh)"
+it=$tmp/installer
+mkdir -p "$it/keys"
+ssh-keygen -q -t ed25519 -N '' -C it-release -f "$it/keys/release"
+ssh-keygen -q -t ed25519 -N '' -C it-other -f "$it/keys/other"
+INST=$REPO_ROOT/$INSTALLER_SRC
+expect_pass "installer: the tree's script pins exactly the fil-release keys of .github/release-signers" test "$(installer_signers "$INST")" = "$(signers_release_lines "$REPO_ROOT/.github/release-signers")"
+expect_pass "installer: ...and pins at least one key" test -n "$(installer_signers "$INST")"
+expect_pass "installer: it starts with #!/bin/sh" test "$(head -n 1 "$INST")" = "#!/bin/sh"
+expect_pass "installer: it parses as sh (sh -n)" sh -n "$INST"
+if command -v dash > /dev/null; then expect_pass "installer: it parses in dash" dash -n "$INST"; fi
+expect_pass "installer: it is executable" test -x "$INST"
+it_key=$(cut -d' ' -f1,2 "$it/keys/release.pub")
+awk -v k="release namespaces=\"fil-release\" $it_key" '/^FIL_RELEASE_SIGNERS=\047/ { print "FIL_RELEASE_SIGNERS=\047" k "\047"; next } { print }' "$INST" > "$it/install.sh"
+expect_pass "installer: the copy under test differs from the real script in the pinned key only" test "$(diff "$INST" "$it/install.sh" | grep -c '^[<>]')" = 2
+case $(uname -s)-$(uname -m) in
+  Linux-x86_64 | Linux-amd64) IL=x86_64-linux-musl ;;
+  Linux-aarch64 | Linux-arm64) IL=aarch64-linux-musl ;;
+  Darwin-*) IL=universal-apple-darwin ;;
+  *) IL='' ;;
+esac
+# it_release DIR VERSION KEY [LABEL...]: DIR/download/vVERSION/ (and DIR/latest/download/ as a copy)
+# with an archive per LABEL (default this machine's and another), a .ci copy of this machine's,
+# and SHA256SUMS signed by KEY.
+it_release() {
+  local r=$1 v=$2 key=$3 d st l
+  shift 3
+  [ $# -gt 0 ] || set -- "$IL" other-label
+  d=$r/download/v$v st=$it/stage
+  rm -rf "$d" "$st" "$r/latest"
+  mkdir -p "$d" "$r/latest"
+  for l in "$@"; do
+    mkdir -p "$st/fil-$v-$l/bin" "$st/fil-$v-$l/libexec/fil/remote/x86_64-linux"
+    printf '#!/bin/sh\necho "fil %s (wire 1.99)"\n' "$v" > "$st/fil-$v-$l/bin/fil"
+    chmod 755 "$st/fil-$v-$l/bin/fil"
+    echo remote > "$st/fil-$v-$l/libexec/fil/remote/x86_64-linux/fil"
+    (cd "$st/fil-$v-$l/libexec/fil/remote" && printf '%s  %s\n' "$(sha256 x86_64-linux/fil)" x86_64-linux/fil > SHA256SUMS)
+    (cd "$st" && tar -czf "$d/fil-$v-$l.tar.gz" "fil-$v-$l")
+  done
+  cp "$d/fil-$v-$1.tar.gz" "$d/fil-$v-$1.ci.tar.gz"
+  (cd "$d" && for f in $(ls | LC_ALL=C sort); do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done > SHA256SUMS)
+  ssh-keygen -q -Y sign -f "$key" -n fil-release "$d/SHA256SUMS" 2> /dev/null
+  cp -R "$d" "$r/latest/download"
+}
+# itr HOME URL ARGS...: the installer under test with that HOME and release URL (and nothing inherited)
+itr() {
+  local h=$1 u=$2
+  shift 2
+  env -u FIL_VERSION -u FIL_INSTALL_DIR HOME="$h" FIL_RELEASE_URL="$u" sh "$it/install.sh" "$@"
+}
+it_n=0
+# it_refused NAME PATTERN URL ARGS...: refused, saying PATTERN, with nothing installed in a fresh HOME
+it_refused() {
+  local name=$1 pat=$2 u=$3 h
+  shift 3
+  it_n=$((it_n + 1))
+  h=$it/h$it_n
+  mkdir -p "$h"
+  if itr "$h" "$u" "$@" > "$tmp/out.log" 2>&1; then flunk "installer: $name (it should have failed)"; sed 's/^/       | /' "$tmp/out.log"
+  elif ! grep -qF -- "$pat" "$tmp/out.log"; then flunk "installer: $name (failed, but not with '$pat')"; sed 's/^/       | /' "$tmp/out.log" | tail -5
+  elif [ -e "$h/.local/bin/fil" ] || [ -e "$h/.local/libexec" ]; then flunk "installer: $name (refused, but installed something)"
+  else pass "installer: $name"; fi
+}
+if [ -z "$IL" ]; then
+  echo "  skip the installer's runs: no fil release for $(uname -s) $(uname -m)"
+else
+  it_release "$it/rel" 9.9.9 "$it/keys/release"
+  mkdir -p "$it/home"
+  if itr "$it/home" "file://$it/rel" > "$it/first.log" 2>&1; then pass "installer: installs the latest release"; else
+    flunk "installer: installs the latest release (it should have passed)"
+    sed 's/^/       | /' "$it/first.log"
+  fi
+  expect_pass "installer: ...fil is in ~/.local/bin, a file, executable" sh -c 'test -f "$1" && test ! -h "$1" && test -x "$1"' sh "$it/home/.local/bin/fil"
+  expect_pass "installer: ...it is the release's" test "$("$it/home/.local/bin/fil" --version)" = "fil 9.9.9 (wire 1.99)"
+  expect_pass "installer: ...the remote bundle is at ../libexec/fil/remote" test -f "$it/home/.local/libexec/fil/remote/SHA256SUMS"
+  expect_pass "installer: ...it said the directory is not on PATH" grep -q 'is not on your PATH' "$it/first.log"
+  expect_pass "installer: ...and named the signature check" grep -q "signed by fil's release key" "$it/first.log"
+  it_release "$it/rel" 9.9.10 "$it/keys/release"
+  expect_pass "installer: a newer release replaces it" itr "$it/home" "file://$it/rel"
+  expect_pass "installer: ...fil is the newer one" test "$("$it/home/.local/bin/fil" --version)" = "fil 9.9.10 (wire 1.99)"
+  expect_pass "installer: --version picks an older release" itr "$it/home" "file://$it/rel" --version 9.9.9
+  expect_pass "installer: ...fil is that one" test "$("$it/home/.local/bin/fil" --version)" = "fil 9.9.9 (wire 1.99)"
+  expect_pass "installer: FIL_INSTALL_DIR installs elsewhere, the bundle beside it" sh -c 'env HOME="$1/hx" FIL_INSTALL_DIR="$1/opt/bin" FIL_RELEASE_URL="file://$1/rel" sh "$1/install.sh" > /dev/null 2>&1 && test -x "$1/opt/bin/fil" && test -f "$1/opt/libexec/fil/remote/SHA256SUMS"' sh "$it"
+  it_refused "a version that is not there" "could not download" "file://$it/rel" --version 9.9.8
+  cp -R "$it/rel/download/v9.9.10" "$it/rel/download/v9.9.11"
+  it_refused "a signed SHA256SUMS of another version" "is for fil 9.9.10, not 9.9.11" "file://$it/rel" --version 9.9.11
+  it_refused "not a version" "not a version" "file://$it/rel" --version '../x'
+  it_release "$it/other" 9.9.9 "$it/keys/other"
+  it_refused "a signature by another key" "not a valid signature by fil's release key" "file://$it/other"
+  it_release "$it/r2" 9.9.9 "$it/keys/release"
+  echo "0000000000000000000000000000000000000000000000000000000000000000  extra" >> "$it/r2/latest/download/SHA256SUMS"
+  it_refused "SHA256SUMS changed after signing" "not a valid signature" "file://$it/r2"
+  it_release "$it/r3" 9.9.9 "$it/keys/release"
+  printf 'x' >> "$it/r3/download/v9.9.9/fil-9.9.9-$IL.tar.gz"
+  it_refused "a changed archive" "but the signed SHA256SUMS says" "file://$it/r3"
+  # once SHA256SUMS is verified, the archive comes from download/vVERSION, not "latest" again
+  it_release "$it/r7" 9.9.9 "$it/keys/release"
+  printf 'x' >> "$it/r7/latest/download/fil-9.9.9-$IL.tar.gz"
+  mkdir -p "$it/hr7"
+  expect_pass "installer: the archive comes from the verified release's own directory" itr "$it/hr7" "file://$it/r7"
+  it_release "$it/r4" 9.9.9 "$it/keys/release"
+  rm "$it/r4/latest/download/SHA256SUMS.sig"
+  it_refused "no signature" "could not download" "file://$it/r4"
+  it_release "$it/r5" 9.9.9 "$it/keys/release" other-label
+  it_refused "no archive for this machine" "lists no archive for $IL" "file://$it/r5"
+  it_release "$it/r6" 9.9.9 "$it/keys/release"
+  (cd "$it/r6/latest/download" && cp "fil-9.9.9-$IL.tar.gz" "fil-9.9.8-$IL.tar.gz" && for f in $(ls fil-* | LC_ALL=C sort); do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done > SHA256SUMS && rm SHA256SUMS.sig && ssh-keygen -q -Y sign -f "$it/keys/release" -n fil-release SHA256SUMS 2> /dev/null)
+  it_refused "two archives for this machine" "more than one archive" "file://$it/r6"
+  it_refused "a plain-HTTP URL" "not an https:// or file:// URL" "http://example.invalid/releases"
+  mkdir -p "$it/hl/.local/bin"
+  ln -s "$it/elsewhere" "$it/hl/.local/bin/fil"
+  expect_fail "installer: a symbolic link at the target is refused" itr "$it/hl" "file://$it/rel"
+  expect_pass "installer: ...and left alone" test -h "$it/hl/.local/bin/fil"
+  mkdir -p "$it/hd/.local/bin/fil"
+  expect_fail "installer: a directory at the target is refused" itr "$it/hd" "file://$it/rel"
+  expect_pass "installer: ...and nothing is left staged" sh -c 'test -z "$(ls -A "$1/.local/bin/fil")" && test -z "$(ls -A "$1/.local/bin" | grep -v "^fil$")" && test ! -e "$1/.local/libexec"' sh "$it/hd"
+  # a symbolic link for the directory (a dotfile manager's ~/.local/bin -> ~/dot/bin): the bundle
+  # goes where fil looks, ../libexec of the resolved directory
+  mkdir -p "$it/hs/dot/bin" "$it/hs/.local"
+  ln -s ../dot/bin "$it/hs/.local/bin"
+  expect_pass "installer: a symbolically linked install directory" itr "$it/hs" "file://$it/rel"
+  expect_pass "installer: ...fil is in the resolved directory" test -x "$it/hs/dot/bin/fil"
+  expect_pass "installer: ...the bundle is at ../libexec of the resolved directory, where fil looks" test -f "$it/hs/dot/libexec/fil/remote/SHA256SUMS"
+  expect_pass "installer: ...and not beside the link" test ! -e "$it/hs/.local/libexec"
+  expect_pass "installer: a reinstall leaves no staging or old copies" sh -c 'sh -c "$2" > /dev/null 2>&1; test -z "$(ls -A "$1/dot/bin" | grep -v "^fil$")" && test "$(ls -A "$1/dot/libexec/fil")" = remote' sh "$it/hs" "env HOME=$it/hs FIL_RELEASE_URL=file://$it/rel sh $it/install.sh"
+  # the tools: curl (https), and an ssh-keygen with -Y
+  mkdir -p "$it/empty"
+  it_n=$((it_n + 1))
+  if env -i HOME="$it/h$it_n" PATH="$it/empty" FIL_RELEASE_URL=https://example.invalid/releases /bin/sh "$it/install.sh" > "$it/tools.log" 2>&1; then flunk "installer: no curl for an https URL (it should have failed)"
+  else expect_pass "installer: no curl for an https URL: refused, naming curl" grep -q 'needs curl' "$it/tools.log"; fi
+  mkdir -p "$it/oldssh"
+  printf '#!/bin/sh\necho "ssh-keygen: illegal option -- Y" >&2\nexit 1\n' > "$it/oldssh/ssh-keygen"
+  chmod 755 "$it/oldssh/ssh-keygen"
+  it_n=$((it_n + 1))
+  mkdir -p "$it/h$it_n"
+  if env HOME="$it/h$it_n" PATH="$it/oldssh:$PATH" FIL_RELEASE_URL="file://$it/rel" sh "$it/install.sh" > "$it/tools.log" 2>&1; then flunk "installer: an ssh-keygen without -Y (it should have failed)"
+  else expect_pass "installer: an ssh-keygen without -Y: refused, naming OpenSSH 8.1" grep -q 'needs OpenSSH 8.1 or later' "$it/tools.log"; fi
+  expect_pass "installer: ...before anything was installed" test ! -e "$it/h$it_n/.local"
+fi
+
+# ============================================================== audit-age.sh (SECURITY.md "Audits")
+echo "== audit-age.sh"
+aa=$tmp/audits
+mkdir -p "$aa"
+touch "$aa/README.md" "$aa/LANES.md" "$aa/TEMPLATE.md"
+aa_rc() { local rc=0; "$RELEASE_DIR/audit-age.sh" --dir "$aa" "$@" > "$tmp/aa.out" 2>&1 || rc=$?; echo "$rc"; }
+expect_pass "audit-age: no report yet: a warning (3)" test "$(aa_rc --today 2026-11-14)" = 3
+expect_pass "audit-age: ...that says there is no full audit yet" grep -q 'no full security audit yet' "$tmp/aa.out"
+touch "$aa/2026-11-20-release-1.0.0.md"
+expect_pass "audit-age: a release audit is not a full audit" test "$(aa_rc --today 2026-12-01)" = 3
+touch "$aa/2026-12-01-full-1.0.0.md"
+expect_pass "audit-age: a full audit of today: ok (0)" test "$(aa_rc --today 2026-12-01)" = 0
+expect_pass "audit-age: ...naming the report" grep -q '2026-12-01-full-1.0.0.md' "$tmp/aa.out"
+expect_pass "audit-age: seven months to the day: ok" test "$(aa_rc --today 2027-07-01)" = 0
+expect_pass "audit-age: seven months and a day: a warning" test "$(aa_rc --today 2027-07-02)" = 3
+expect_pass "audit-age: ...that says more than seven months" grep -q 'more than seven months' "$tmp/aa.out"
+touch "$aa/2027-05-10-full-release-1.1.0.md"
+expect_pass "audit-age: the newest full-release report counts" test "$(aa_rc --today 2027-12-10)" = 0
+expect_pass "audit-age: ...until seven months after it" test "$(aa_rc --today 2027-12-11)" = 3
+touch "$aa/2027-13-01-full-9.9.md" "$aa/2027-12-01-full.md" "$aa/x2027-12-01-full-2.0.md" "$aa/2027-12-01-full-2.0.txt"
+expect_pass "audit-age: names that do not parse are not reports" test "$(aa_rc --today 2027-12-11)" = 3
+expect_pass "audit-age: a --today that is not a date is a usage error (2)" test "$(aa_rc --today 2027-12-32)" = 2
+expect_pass "audit-age: a missing directory is no audit (3)" test "$("$RELEASE_DIR/audit-age.sh" --dir "$tmp/no-such-dir" > /dev/null 2>&1; echo $?)" = 3
+expect_pass "audit-age: the tree's docs/audits answers 0 or 3" sh -c '"$1" > /dev/null 2>&1; rc=$?; [ "$rc" = 0 ] || [ "$rc" = 3 ]' sh "$RELEASE_DIR/audit-age.sh"
+expect_pass "preflight: the audit check passes on the tree" "$RELEASE_DIR/release-preflight.sh" 9.9.9 --only audit
+expect_pass "preflight: ...a warning or an ok, never a failure" sh -c '"$1" 9.9.9 --only audit 2>&1 | grep -Eq "^preflight: (WARN|ok) +audit: "' sh "$RELEASE_DIR/release-preflight.sh"
+expect_pass "preflight: the candidate step runs the audit check" sh -c '"$1" --list | grep -Eq "^candidate +.*audit"' sh "$RELEASE_DIR/release-preflight.sh"
+
+# ============================================================== the apt and dnf repositories (repos.sh)
+# Synthetic packages (selftest_pkg.py), real gpg with a throwaway key in a scratch GNUPGHOME, and a fake
+# docker for the install test: Docker's real run is the owner's (docs/m4/packaging.md section 7).
+echo "== release-repos (repos.sh)"
+if ! command -v gpg > /dev/null; then
+  echo "  skip repos.sh: no gpg"
+else
+  rp=$tmp/rp
+  mkdir -p "$rp/work/files" "$rp/bin"
+  mkdir -m 700 "$rp/gnupg"
+  rpg() { GNUPGHOME=$rp/gnupg LC_ALL=C gpg --batch "$@"; }
+  rpg --pinentry-mode loopback --passphrase '' --quick-generate-key "fil test repo key" ed25519 sign 1d > /dev/null 2>&1
+  rp_fpr=$(rpg -K --with-colons 2> /dev/null | awk -F: '$1 == "fpr" { print $10; exit }')
+  rpg --armor --export "$rp_fpr" > "$rp/key.asc" 2> /dev/null
+  printf '#!/bin/sh\necho "fil 9.9.9 (wire 1.99)"\n' > "$rp/payload"
+  printf '%s\t/usr/bin/fil\t755\n' "$rp/payload" > "$rp/manifest"
+  # rp_files [unsigned]: the four packages, SHA256SUMS, a .sig and WORK/verified as release-verify leaves them
+  rp_files() {
+    local a k f
+    rm -f "$rp/work/files"/*
+    for a in x86_64 aarch64; do
+      for k in deb rpm; do
+        f=$(package_file "$k" "$a" 9.9.9)
+        python3 -I "$RELEASE_DIR/selftest_pkg.py" "$k" "$rp/work/files/$f" fil 9.9.9 1 "$(package_arch "$k" "$a")" 0 "$rp/manifest"
+        [ "$k" = deb ] || [ "${1:-}" = unsigned ] || python3 -I "$RELEASE_DIR/selftest_pkg.py" sign "$rp/work/files/$f"
+      done
+    done
+    (cd "$rp/work/files" && for f in $(package_names 9.9.9); do printf '%s  %s\n' "$(sha256 "$f")" "$f"; done > SHA256SUMS && echo sig > SHA256SUMS.sig)
+    printf 'sums=%s\nrebuild=1\npresign=0\ndry=0\n' "$(sha256 "$rp/work/files/SHA256SUMS")" > "$rp/work/verified"
+  }
+  rpr() { env FIL_RELEASE_SELFTEST=1 GNUPGHOME="$rp/gnupg" FIL_PACKAGE_KEY_FILE="$rp/key.asc" "$@" "$RELEASE_DIR/repos.sh" 9.9.9 --work "$rp/work" --no-install-test; }
+  rp_files
+  expect_pass "repos: builds and signs both trees" rpr
+  o=$rp/work/repos
+  for f in apt/dists/stable/Release apt/dists/stable/InRelease apt/dists/stable/Release.gpg apt/dists/stable/main/binary-amd64/Packages apt/dists/stable/main/binary-arm64/Packages.gz \
+    apt/pool/main/f/fil/fil_9.9.9_amd64.deb apt/fil-package-key.asc rpm/repodata/repomd.xml rpm/repodata/repomd.xml.asc rpm/fil-9.9.9-1.x86_64.rpm rpm/fil.repo rpm/fil-package-key.asc; do
+    expect_pass "repos: ...$f" test -f "$o/$f"
+  done
+  mkdir -m 700 "$rp/verify"
+  GNUPGHOME=$rp/verify gpg --batch --import "$rp/key.asc" > /dev/null 2>&1
+  rpv() { GNUPGHOME=$rp/verify LC_ALL=C gpg --batch --no-autostart --verify "$@" > /dev/null 2>&1; }
+  expect_pass "repos: ...InRelease verifies with the public key alone" rpv "$o/apt/dists/stable/InRelease"
+  expect_pass "repos: ...Release.gpg verifies" rpv "$o/apt/dists/stable/Release.gpg" "$o/apt/dists/stable/Release"
+  expect_pass "repos: ...repomd.xml.asc verifies" rpv "$o/rpm/repodata/repomd.xml.asc" "$o/rpm/repodata/repomd.xml"
+  expect_pass "repos: ...fil.repo points at the site with both checks on" sh -c 'grep -qx "baseurl=https://fil.anthonywertz.com/rpm" "$1" && grep -qx gpgcheck=1 "$1" && grep -qx repo_gpgcheck=1 "$1"' sh "$o/rpm/fil.repo"
+  # every index binds the next by SHA-256, down to each package
+  expect_pass "repos: ...every digest in Release, Packages, repomd.xml and primary is right" python3 -I - "$o" << 'EOF2'
+import gzip, hashlib, os, re, sys
+o = sys.argv[1]
+h = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+apt = os.path.join(o, "apt")
+rel = open(os.path.join(apt, "dists/stable/Release")).read()
+lines = [l.split() for l in rel.split("SHA256:\n", 1)[1].splitlines()]
+assert len(lines) == 4, lines
+for digest, size, path in lines:
+    p = os.path.join(apt, "dists/stable", path)
+    assert h(p) == digest and os.path.getsize(p) == int(size), path
+    if path.endswith("Packages"):
+        st = dict(l.split(": ", 1) for l in open(p).read().splitlines() if ": " in l)
+        assert h(os.path.join(apt, st["Filename"])) == st["SHA256"], st
+rpm = os.path.join(o, "rpm")
+repomd = open(os.path.join(rpm, "repodata/repomd.xml")).read()
+datas = re.findall(r'<checksum type="sha256">([0-9a-f]{64})</checksum>.*?<location href="([^"]+)"/>', repomd, re.S)
+assert len(datas) == 3, datas
+for digest, href in datas:
+    assert h(os.path.join(rpm, href)) == digest, href
+prim = [href for _, href in datas if href.endswith("-primary.xml.gz")][0]
+xml = gzip.decompress(open(os.path.join(rpm, prim), "rb").read()).decode()
+pk = re.findall(r'<checksum type="sha256" pkgid="YES">([0-9a-f]{64})</checksum>.*?<location href="([^"]+)"/>', xml, re.S)
+assert len(pk) == 2, pk
+for digest, href in pk:
+    assert h(os.path.join(rpm, href)) == digest, href
+EOF2
+  touch "$o/apt/stale"
+  expect_pass "repos: a second run replaces the trees" rpr
+  expect_pass "repos: ...nothing of the first is left" test ! -e "$o/apt/stale"
+  # refusals
+  rm "$rp/work/verified"
+  expect_fail "repos: files that were not verified are refused" rpr
+  rp_files
+  sed -i.bak 's/^presign=0$/presign=1/' "$rp/work/verified"
+  expect_fail "repos: files verified before signing (presign=1) are refused" rpr
+  rp_files
+  printf 'x' >> "$rp/work/files/SHA256SUMS"
+  expect_fail "repos: a SHA256SUMS other than the verified one is refused" rpr
+  rp_files
+  printf 'x' >> "$rp/work/files/fil_9.9.9_arm64.deb"
+  expect_fail "repos: a file that does not match SHA256SUMS is refused" rpr
+  rp_files unsigned
+  expect_fail "repos: an unsigned rpm is refused" rpr
+  rp_files
+  expect_fail "repos: a plain-HTTP base URL is refused" rpr sh -c 'exec "$@" --base-url http://fil.example' sh
+  expect_fail "repos: a test-only override without the self-test is refused" env GNUPGHOME="$rp/gnupg" FIL_PACKAGE_KEY_FILE="$rp/key.asc" "$RELEASE_DIR/repos.sh" 9.9.9 --work "$rp/work" --no-install-test
+  # the install test, with a fake docker that records its runs
+  printf '#!/bin/sh\necho "$*" >> "%s/docker.log"\n[ -z "${FAKE_DOCKER_FAIL:-}" ] || exit 1\n' "$rp" > "$rp/bin/docker"
+  chmod 755 "$rp/bin/docker"
+  rpi() { env FIL_RELEASE_SELFTEST=1 GNUPGHOME="$rp/gnupg" FIL_PACKAGE_KEY_FILE="$rp/key.asc" FIL_DOCKER="$rp/bin/docker" "$@" "$RELEASE_DIR/repos.sh" 9.9.9 --work "$rp/work" --arch arm64; }
+  : > "$rp/docker.log"
+  expect_pass "repos: the install test runs apt and dnf" rpi
+  expect_pass "repos: ...in the pinned Debian and Fedora images, without network" sh -c 'grep -qF -- "$2" "$1" && grep -qF -- "$3" "$1" && test "$(grep -c -- "--network none" "$1")" = 2' sh "$rp/docker.log" "$DEBIAN_IMAGE" "$FEDORA_IMAGE"
+  expect_fail "repos: a failed install test fails the command" rpi FAKE_DOCKER_FAIL=1
+  GNUPGHOME=$rp/gnupg gpgconf --kill all 2> /dev/null || true
+  GNUPGHOME=$rp/verify gpgconf --kill all 2> /dev/null || true
+fi
 
 # ============================================================== release keys (release-keys.sh)
 # A real ssh-agent (started here, killed by its pid), real ssh-keygen keys and, when gpg is
@@ -3530,7 +3858,7 @@ rf=$rs/files0
 mkdir -p "$rf"
 printf 'x\n' > "$rs/payload"
 printf '%s\t/usr/bin/fil\t755\n' "$rs/payload" > "$rs/manifest"
-for f in fil-0.9.0-aarch64-linux-musl.tar.gz fil-0.9.0-source.tar.gz fil-0.9.0-x86_64-linux-musl.tar.gz fil_0.9.0_amd64.deb fil_0.9.0_arm64.deb; do echo "$f" > "$rf/$f"; done
+for f in fil-0.9.0-aarch64-linux-musl.tar.gz fil-0.9.0-source.tar.gz fil-0.9.0-x86_64-linux-musl.tar.gz fil-install.sh fil_0.9.0_amd64.deb fil_0.9.0_arm64.deb; do echo "$f" > "$rf/$f"; done
 echo ci-mac > "$rf/fil-0.9.0-universal-apple-darwin.tar.gz"
 cp "$rf/fil-0.9.0-universal-apple-darwin.tar.gz" "$rf/fil-0.9.0-universal-apple-darwin.ci.tar.gz"
 for a in x86_64 aarch64; do python3 -I "$RELEASE_DIR/selftest_pkg.py" rpm "$rf/fil-0.9.0-1.$a.rpm" fil 0.9.0 1 "$a" 0 "$rs/manifest"; done

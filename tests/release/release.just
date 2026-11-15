@@ -79,6 +79,7 @@ no-test-hooks +binaries:
 release-test:
     tests/release/lint-workflow.sh .github/workflows/release.yml
     tests/release/lint-workflow.sh --check .github/workflows/linux-check.yml .github/workflows/macos-check.yml
+    tests/release/lint-workflow.sh --scheduled .github/workflows/audit.yml
     tests/release/recipes.sh
     tests/release/selftest.sh
 
@@ -120,7 +121,8 @@ release-build out="target/release-dist":
 # Everything a release candidate must satisfy: `just release-check --dry-run DIR` for a build of a
 # branch, `just release-check --tag vX.Y.Z --complete DIR` for a release. One top-level entry per
 # archive, the section 4.3 layout, byte-identical bundle copies, the .deb and .rpm packages (exactly
-# their archive's files), SHA256SUMS exactly the four archives and the four packages,
+# their archive's files), SHA256SUMS exactly the five archives, the four packages and the installer
+# (which must pin the release key),
 # no builder path (/Users/, /home/) or FIL_TEST_ string in a binary, the path remap applied,
 # `no-test-hooks` and `release-deps`, static Linux binaries, `fil --version` where it can run, the tag,
 # the changelog and the wire. See tests/release/check.sh.
@@ -189,6 +191,17 @@ crates-check:
 release-sign-packages version *args:
     tests/release/entry-check.sh release-sign-packages
     tests/release/sign-packages.sh "{{version}}" {{args}}
+
+# fil's own signed apt and dnf repositories (docs/m4/packaging.md section 7), from the published
+# release's verified packages in target/release-verify/VERSION/files: the trees, their indexes signed
+# with the package key on the owner's machine (unlock it first: release-keys unlock --need gpg), each
+# signature checked, and an install test in the pinned Debian and Fedora images (Docker). The result
+# is target/release-verify/VERSION/repos/{apt,rpm}, for the site to serve at /apt and /rpm. Publishes
+# nothing; a separate command after `release`, run again whenever the site needs the trees.
+[positional-arguments]
+release-repos version *args:
+    tests/release/entry-check.sh release-repos
+    tests/release/repos.sh "$@"
 
 # The owner signs the macOS binary with the Developer ID and notarizes it, on their own Mac (never
 # CI; N4): verifies the draft, signs, requires the stripped result to equal CI's, notarizes, and only

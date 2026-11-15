@@ -37,6 +37,20 @@ fi
 # binary after CI (`tests/release/just.sh release-sign-macos`, docs/m4/release.md section 10.3), before publishing.
 cat << EOT
 
+## Install
+
+On Linux or macOS, as yourself (no root): \`fil-install.sh\` checks \`SHA256SUMS.sig\` against the
+release key it carries and the archive against \`SHA256SUMS\`, then copies \`fil\` into
+\`~/.local/bin\`. Download it, read it, run it:
+
+\`\`\`sh
+curl -fsSLO https://github.com/$repo/releases/download/v$v/$INSTALLER_NAME
+sh $INSTALLER_NAME --version $v
+\`\`\`
+
+Homebrew, the .deb and .rpm packages, the apt and dnf repositories and the rest: the
+[install guide](https://github.com/$repo/blob/v$v/docs/user/install.md).
+
 ## Verify what you downloaded
 
 Download the archive for your system, \`SHA256SUMS\` and \`SHA256SUMS.sig\`, then:

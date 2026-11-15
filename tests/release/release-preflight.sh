@@ -63,14 +63,14 @@ PF_KEY_WARN_DAYS=60
 PF_OVERRIDES=$(printf '%s\n' $TEST_OVERRIDES | grep -vx FIL_RELEASE_SELFTEST | tr '\n' ' ')
 
 # The checks, in the order they run.
-PF_CHECKS="overrides tools lock disk tree recipes version lockfiles github-main gh github-ssh commit-signing crates-env tag-ruleset tag-free docker vm release-key package-key apple"
+PF_CHECKS="overrides tools lock disk tree recipes version audit lockfiles github-main gh github-ssh commit-signing crates-env tag-ruleset tag-free docker vm release-key package-key apple"
 # The steps of `tests/release/just.sh release` (docs: the design's section 5), in order.
 PF_STEPS="candidate on-main dry-run dry-verify tag tag-run verify-presign sign-macos sign-packages sign-sums upload verify-signed publish verify-published crates brew finish"
 
 # pf_step_checks STEP: the checks STEP needs (besides the ones every invocation runs).
 pf_step_checks() {
   case $1 in
-    candidate) echo "version lockfiles" ;;
+    candidate) echo "version audit lockfiles" ;;
     on-main) echo "github-main" ;;
     dry-run) echo "gh" ;;
     dry-verify) echo "docker vm" ;;
@@ -470,6 +470,20 @@ pf_check_version() {
   fi
   [ "$bad" = 1 ] || pf_ok "Cargo.toml, its pins and CHANGELOG.md are at $PF_VERSION"
   return "$bad"
+}
+
+# The age of the last full security audit (SECURITY.md "Audits": one every six months): a warning
+# past seven months, or when there is none, never a failure (tests/release/audit-age.sh reads the
+# report names in docs/audits).
+pf_check_audit() {
+  local out rc=0
+  out=$("$RELEASE_DIR/audit-age.sh" --dir "$ROOT/docs/audits" 2>&1) || rc=$?
+  case $rc in
+    0) pf_ok "$out" ;;
+    3) pf_warn "$out (a warning: the release goes on)" ;;
+    *) pf_warn "audit-age.sh failed ($rc): $out (a warning: the release goes on)" ;;
+  esac
+  return 0
 }
 
 # The lockfiles: the crates each lock names are fetched into the cargo cache first (cargo fetch

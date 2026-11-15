@@ -413,9 +413,11 @@ const DOC_DOMAINS: [&str; 3] = ["example.net", "example.com", "example.org"];
 /// Words after an `@` that are placeholders or the one example host.
 const DOC_HOSTS: [&str; 4] = ["devbox", "name", "host", "HOST"];
 /// Names that look like hosts and are not: the project's own public sites (registry, forge, the
-/// two specifications the changelog cites).
-const NOT_HOSTS: [&str; 4] = [
+/// project site that serves the apt and dnf repositories, the two specifications the changelog
+/// cites).
+const NOT_HOSTS: [&str; 5] = [
     "crates.io",
+    "fil.anthonywertz.com",
     "github.com",
     "keepachangelog.com",
     "semver.org",

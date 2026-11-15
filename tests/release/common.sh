@@ -137,6 +137,11 @@ package_path() {
     *) return 1 ;;
   esac
 }
+# The distributions the packages are install-tested in (install-packages.sh, and the apt and dnf
+# repositories in repos.sh), pinned by the digest of their multi-architecture index (bump like
+# Cross.toml's). Not the -slim image: it excludes /usr/share/doc from every package it installs.
+DEBIAN_IMAGE=docker.io/library/debian:13@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8fde837fe3d7d34a0e7f1
+FEDORA_IMAGE=docker.io/library/fedora:45@sha256:a7d72ba2745b100a3351087472e5ee7b2450af7cf331e7673007e3817612839c
 # The Linux packages are named `fil` (decided, owner 2026-11-04: D1); the crate is `fil-shell`.
 PACKAGE_NAME=fil
 # package_file KIND ARCH VERSION: the file name of a package (KIND deb or rpm, ARCH x86_64 or
@@ -169,6 +174,64 @@ package_names() {
   local k a
   for k in deb rpm; do for a in x86_64 aarch64; do package_file "$k" "$a" "$1"; done; done | LC_ALL=C sort
 }
+
+# The installer (section 4.1; docs/user/install.md): packaging/install.sh of the tagged tree, byte for
+# byte, published under this name. It is a release file like the others: SHA256SUMS lists it, so the
+# release key's signature covers it.
+INSTALLER_SRC=packaging/install.sh
+INSTALLER_NAME=fil-install.sh
+# release_names VERSION: the files SHA256SUMS lists (sections 4.1 and 4.2): the five archives (the
+# macOS one twice), the four packages and the installer, sorted bytewise.
+release_names() {
+  {
+    printf '%s\n' "fil-$1-aarch64-linux-musl.tar.gz" "fil-$1-source.tar.gz" "fil-$1-universal-apple-darwin.tar.gz" "$(ci_archive_name "$1")" "fil-$1-x86_64-linux-musl.tar.gz" "$INSTALLER_NAME"
+    package_names "$1"
+  } | LC_ALL=C sort
+}
+# installer_signers FILE: the allowed-signers lines an installer script pins (its FIL_RELEASE_SIGNERS),
+# one per line, sorted.
+installer_signers() {
+  awk '
+    /^FIL_RELEASE_SIGNERS=\047/ { on = 1; sub(/^FIL_RELEASE_SIGNERS=\047/, "") }
+    on { line = $0; if (sub(/\047[ \t]*$/, "", line)) { print line; on = 0; exit } print line }
+  ' "$1" | LC_ALL=C sort
+}
+# installer_pin_problems FILE: what is wrong with how an installer script pins its key, one problem a
+# line (nothing when it is right): exactly one FIL_RELEASE_SIGNERS= and one FIL_RELEASE_PRINCIPAL=
+# assignment (a second one could replace the pinned key after release-check read the first), a
+# principal of plain characters that every pinned line names first (ssh-keygen -I matches it), the
+# fil-release namespace, and the one verify call reading exactly those (-f the file the pinned lines
+# are written to, -I the principal, -n the namespace).
+installer_pin_problems() {
+  local f=$1 n principal line
+  n=$(grep -c 'FIL_RELEASE_SIGNERS=' "$f" || true)
+  [ "$n" = 1 ] || echo "FIL_RELEASE_SIGNERS= appears $n times, not once"
+  n=$(grep -c 'FIL_RELEASE_PRINCIPAL=' "$f" || true)
+  [ "$n" = 1 ] || echo "FIL_RELEASE_PRINCIPAL= appears $n times, not once"
+  n=$(grep -c 'FIL_RELEASE_NAMESPACE=' "$f" || true)
+  [ "$n" = 1 ] && grep -qx 'FIL_RELEASE_NAMESPACE=fil-release' "$f" || echo "FIL_RELEASE_NAMESPACE is not set once, to fil-release"
+  principal=$(sed -n 's/^FIL_RELEASE_PRINCIPAL=\([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$f")
+  if [ -z "$principal" ]; then
+    echo "no FIL_RELEASE_PRINCIPAL=NAME line (NAME of [A-Za-z0-9._-])"
+  else
+    while IFS= read -r line; do
+      [ "${line%% *}" = "$principal" ] || echo "a pinned line does not name the principal '$principal' first: ${line%% *}"
+    done <<EOF
+$(installer_signers "$f")
+EOF
+  fi
+  # shellcheck disable=SC2016 # the installer's own text, matched literally
+  n=$(grep -cF 'printf '\''%s\n'\'' "$FIL_RELEASE_SIGNERS" > "$tmp/signers"' "$f" || true)
+  [ "$n" = 1 ] || echo "the pinned lines are not written to \$tmp/signers exactly once"
+  # shellcheck disable=SC2016
+  n=$(grep -cF 'ssh-keygen -Y verify -f "$tmp/signers" -I "$FIL_RELEASE_PRINCIPAL" -n "$FIL_RELEASE_NAMESPACE"' "$f" || true)
+  [ "$n" = 1 ] || echo "the verify call is not exactly once ssh-keygen -Y verify -f \"\$tmp/signers\" -I \"\$FIL_RELEASE_PRINCIPAL\" -n \"\$FIL_RELEASE_NAMESPACE\""
+  n=$(grep -v '^[[:space:]]*#' "$f" | grep -c 'ssh-keygen -Y verify' || true)
+  [ "$n" = 2 ] || echo "ssh-keygen -Y verify appears $n times (the probe for -Y and the one verify call)"
+}
+# signers_release_lines FILE: the `fil-release` lines of an allowed-signers file (.github/release-signers),
+# sorted: what the installer must pin.
+signers_release_lines() { grep -E '^[^#[:space:]]+[[:space:]]+namespaces="fil-release"[[:space:]]' "$1" | LC_ALL=C sort || true; }
 
 # The committer time of REF (default HEAD): the SOURCE_DATE_EPOCH of a release (section 4.4).
 source_date_epoch() { git -C "$ROOT" log -1 --format=%ct "${1:-HEAD}"; }
@@ -204,13 +267,14 @@ clean_build_env() {
 }
 
 # rewrite_sums DIR VERSION: DIR/SHA256SUMS for the release files of VERSION in DIR (section 4.2):
-# the five archives (the macOS one twice, section 4.1) and the four packages, sorted bytewise. package.sh writes it, and the owner's
-# signing step (sign-packages.sh) rewrites it after signing the rpms.
+# the five archives (the macOS one twice, section 4.1), the four packages and the installer, sorted
+# bytewise (release_names). package.sh writes it, and the owner's signing steps (sign-macos.sh,
+# sign-packages.sh) rewrite it.
 rewrite_sums() {
   local dir=$1 v=$2 f
   (
     cd "$dir" || exit 1
-    for f in $({ printf '%s\n' "fil-$v-aarch64-linux-musl.tar.gz" "fil-$v-source.tar.gz" "fil-$v-universal-apple-darwin.tar.gz" "$(ci_archive_name "$v")" "fil-$v-x86_64-linux-musl.tar.gz"; package_names "$v"; } | LC_ALL=C sort); do
+    for f in $(release_names "$v"); do
       [ -f "$f" ] || die "rewrite_sums: no $f in $dir"
       printf '%s  %s\n' "$(sha256 "$f")" "$f"
     done > SHA256SUMS.new

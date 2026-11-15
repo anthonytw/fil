@@ -3,16 +3,18 @@
 //!
 //! # How the daemon is started
 //!
-//! [`ensure_daemon`] tries to connect to the socket. If nobody answers, it takes the **start
-//! lock** (`fil-<major>-<rev>.start`, an `flock` held only while starting), tries once more, and then
+//! [`ensure_daemon`] tries to connect to the build's socket. If nobody answers, it takes the
+//! wire's **start lock** (`fil-<major>-<rev>.start`, an `flock` held only while starting, by a
+//! relay of any build of the wire), tries once more, and then
 //! runs the launcher: the same binary with a subcommand that calls
 //! [`run_daemon`](crate::run_daemon), with null stdio, in `/`, and without the SSH login's
 //! variables. It then polls the socket until it answers.
 //!
 //! Two relays that start together serialize on the start lock, so the second finds the first's
 //! daemon and **exactly one daemon is started**. If the lock is bypassed (a daemon started by
-//! hand, say), the daemon takes its own lock (`fil-<major>-<rev>.lock`, held for its whole life), so a
-//! second daemon exits at once. The lock is released when the process dies, however it dies, so
+//! hand, say), the daemon takes its build's lock (`fil-<major>-<rev>-v<ver>.lock`, held for its
+//! whole life), so a second daemon of the build exits at once. The lock is released when the
+//! process dies, however it dies, so
 //! a socket file left behind by a crash is known to be stale: only the lock holder removes it.
 //! And a relay that finds the lock held but no socket starts nothing: the holder is starting, on
 //! its way out, or about to bind its socket again after somebody removed it (it checks every
@@ -164,7 +166,7 @@ mod tests {
         let dir = scratch("holder");
         let paths = Paths::in_dir(&dir);
         let sock = paths.socket();
-        let holder = open_lock_file(&paths.lock()).unwrap();
+        let holder = open_lock_file(&paths.build_lock()).unwrap();
         flock(&holder, FlockOperation::NonBlockingLockExclusive).unwrap();
         let wait = Duration::from_millis(200);
         assert!(matches!(
@@ -314,12 +316,16 @@ pub fn ensure_daemon(paths: &Paths, launcher: &DaemonLauncher) -> Result<Ensured
     result
 }
 
-/// Whether a daemon of this revision is alive by its locks: it holds the lock file, or the claim
-/// of a daemon waiting to take the path back ([`Paths::claim`]). Probes (see
-/// [`lock_is_held`](crate::paths::lock_is_held)); a claim nobody holds is removed
-/// ([`claim_is_held`](crate::paths::claim_is_held)).
+/// Whether a daemon of this build is alive: it holds its build lock, or the claim of a daemon
+/// waiting to take the path back ([`Paths::claim`]), or something answers on its lending socket
+/// (its build lock file was removed with its socket: it makes both again at its next check, and a
+/// daemon started now could not start beside it, since it holds the wire lock and lends it to
+/// other builds only). Probes (see [`lock_is_held`](crate::paths::lock_is_held)); a claim nobody
+/// holds is removed ([`claim_is_held`](crate::paths::claim_is_held)).
 fn one_is_alive(paths: &Paths) -> bool {
-    crate::paths::lock_is_held(&paths.lock()) || crate::paths::claim_is_held(&paths.claim())
+    crate::paths::lock_is_held(&paths.build_lock())
+        || crate::paths::claim_is_held(&paths.claim())
+        || crate::paths::something_answers(&paths.lend())
 }
 
 /// Polls the socket while a daemon of this revision is alive ([`one_is_alive`]): the stream once
@@ -520,16 +526,23 @@ pub(crate) fn is_current_at(file: &std::fs::File, dir: &std::fs::File, name: &Pa
     }
 }
 
-/// A daemon that is exiting removes `fil-<major>-<rev>.lock` and `fil-<major>-<rev>.start`, so nothing of a
-/// finished daemon (its pid, the time it last started) stays in `/tmp` (DESIGN.md section 11.1,
-/// principle 5). A crashed daemon leaves them; the next one reuses them.
+/// A daemon that is exiting removes its build lock (`fil-<major>-<rev>-v<ver>.lock`) and, when it
+/// is the last daemon of its wire, the wire's `fil-<major>-<rev>.lock` and
+/// `fil-<major>-<rev>.start`, so nothing of a finished daemon (its pid, the time it last started)
+/// stays in `/tmp` (DESIGN.md section 11.1, principle 5). A crashed daemon leaves them; the next
+/// one reuses them.
 ///
 /// Removing a lock file under an `flock` is racy, so it is done only while holding the start
-/// lock: no relay is in the middle of starting a daemon then. A relay or a daemon that had
-/// already opened the files notices (the lock it got is on a file that is no longer at the path
-/// and it opens the new one: see [`is_current`]). `own_lock` is the daemon's lock; the path is
-/// removed only if it still names that file. The directory stays, as with tmux.
-pub(crate) fn clean_up_files(paths: &Paths, own_lock: &std::fs::File) {
+/// lock: no relay is in the middle of starting a daemon of the wire then. A relay or a daemon
+/// that had already opened the files notices (the lock it got is on a file that is no longer at
+/// the path and it opens the new one: see [`is_current`]). `own_lock` is the daemon's build lock
+/// and `own_wire` its descriptor of the wire lock; each path is removed only if it still names
+/// that file. The wire's two files stay while a daemon of another build of the wire holds its
+/// build lock: it shares the wire lock ([`crate::lend`]), and removing the file under it would
+/// leave its lock on a file the install's garbage collection cannot see. (A daemon takes its build
+/// lock before it borrows the wire lock, so one that is borrowing it now counts.) The directory
+/// stays, as with tmux.
+pub(crate) fn clean_up_files(paths: &Paths, own_lock: &std::fs::File, own_wire: &std::fs::File) {
     let start_path = paths.start_lock();
     let Ok(start) = open_lock_file(&start_path) else {
         return;
@@ -540,10 +553,15 @@ pub(crate) fn clean_up_files(paths: &Paths, own_lock: &std::fs::File) {
     if !is_current(&start, &start_path) {
         return;
     }
-    if is_current(own_lock, &paths.lock()) {
-        let _ = std::fs::remove_file(paths.lock());
+    if is_current(own_lock, &paths.build_lock()) {
+        let _ = std::fs::remove_file(paths.build_lock());
     }
-    let _ = std::fs::remove_file(&start_path);
+    if !crate::paths::other_build_of_wire_alive(paths) {
+        if is_current(own_wire, &paths.lock()) {
+            let _ = std::fs::remove_file(paths.lock());
+        }
+        let _ = std::fs::remove_file(&start_path);
+    }
     // And a crashed waiter's claim (one that is held is a live daemon's, and stays).
     crate::paths::claim_is_held(&paths.claim());
 }

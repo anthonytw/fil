@@ -122,18 +122,34 @@ async fn has_the_session(d: &Running) -> bool {
     )
 }
 
-/// `(dev, inode)` of what the daemon keeps: the directory, the socket, the lock and start files.
-/// A file that was deleted and made again has another inode, so a repair cannot pass for a
-/// survival.
+/// What else must go, beside a daemon's build lock and socket, for a successor of the same build
+/// to start beside it: the wire lock (which the live daemon holds, and lends only to other
+/// builds) and the lending socket (one that answers is a live daemon of this build). A relay
+/// that finds only the build lock and socket gone waits for the live daemon's repair instead.
+fn remove_wire_files(paths: &Paths) {
+    std::fs::remove_file(paths.lock()).unwrap();
+    std::fs::remove_file(paths.lend()).unwrap();
+}
+
+/// `(dev, inode)` of what the daemon keeps: the directory, the socket, the wire's lock and start
+/// files, the build lock and the lending socket. A file that was deleted and made again has
+/// another inode, so a repair cannot pass for a survival.
 fn identities(p: &Paths) -> Vec<Option<(u64, u64)>> {
-    [p.dir.clone(), p.socket(), p.lock(), p.start_lock()]
-        .iter()
-        .map(|f| {
-            std::fs::symlink_metadata(f)
-                .ok()
-                .map(|m| (m.dev(), m.ino()))
-        })
-        .collect()
+    [
+        p.dir.clone(),
+        p.socket(),
+        p.lock(),
+        p.start_lock(),
+        p.build_lock(),
+        p.lend(),
+    ]
+    .iter()
+    .map(|f| {
+        std::fs::symlink_metadata(f)
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    })
+    .collect()
 }
 
 /// A real cleaner that can be pointed at a tree with an age of [`AGE_SECS`].
@@ -295,7 +311,12 @@ async fn without_a_defense_the_cleaner_takes_the_files() {
         Cleaner::TmpCleaner => {
             assert_eq!(after[0], before[0], "the directory");
             assert_eq!(after[1], before[1], "tmp_cleaner never removes a socket");
-            assert_eq!(&after[2..], &[None, None], "the lock and start files");
+            assert_eq!(
+                &after[2..5],
+                &[None, None, None],
+                "the lock and start files"
+            );
+            assert_eq!(after[5], before[5], "nor the lending socket");
         }
     }
     if after[1].is_some() {
@@ -334,7 +355,7 @@ async fn a_removed_lock_file_does_not_let_a_second_daemon_take_the_socket() {
     let tree = Tree::new();
     let d = run(&tree, keeping(true, true)).await;
     let sock = identities(&d.paths)[1];
-    std::fs::remove_file(d.paths.lock()).unwrap();
+    std::fs::remove_file(d.paths.build_lock()).unwrap();
     assert!(!lock_is_held(&d.paths), "nothing holds a lock file now");
 
     // Before the daemon's next look: a relay would see the socket answer and start nothing, but
@@ -474,8 +495,9 @@ async fn stranded(
     )
     .await;
     let paths = a.paths.clone();
-    std::fs::remove_file(paths.lock()).unwrap();
+    std::fs::remove_file(paths.build_lock()).unwrap();
     std::fs::remove_file(paths.socket()).unwrap();
+    remove_wire_files(&paths);
     let b = Daemon::start(paths.clone(), config(CAT))
         .await
         .expect("the successor starts");
@@ -555,7 +577,7 @@ async fn a_take_back_never_acts_in_a_directory_made_again_by_someone_else() {
     std::fs::remove_dir_all(&tree.dir).unwrap();
     std::fs::create_dir(&tree.dir).unwrap();
     std::fs::set_permissions(&tree.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::os::unix::fs::symlink(&victim, paths.lock()).unwrap();
+    std::os::unix::fs::symlink(&victim, paths.build_lock()).unwrap();
     std::os::unix::fs::symlink(outside.join("s"), paths.socket()).unwrap();
 
     b_handle.shutdown(true);
@@ -573,7 +595,7 @@ async fn a_take_back_never_acts_in_a_directory_made_again_by_someone_else() {
         matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
         "the daemon connected to a socket through a link in an untrusted directory"
     );
-    for p in [paths.lock(), paths.socket()] {
+    for p in [paths.build_lock(), paths.socket()] {
         assert!(
             std::fs::symlink_metadata(&p)
                 .unwrap()
@@ -584,7 +606,7 @@ async fn a_take_back_never_acts_in_a_directory_made_again_by_someone_else() {
     assert!(outside.join("s").exists());
 
     // The directory as it should be: A takes the path back.
-    std::fs::remove_file(paths.lock()).unwrap();
+    std::fs::remove_file(paths.build_lock()).unwrap();
     std::fs::remove_file(paths.socket()).unwrap();
     std::fs::set_permissions(&tree.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     wait_until(
@@ -679,7 +701,7 @@ async fn a_directory_that_is_no_longer_ours_is_left_alone() {
     use std::os::unix::fs::PermissionsExt;
     let tree = Tree::new();
     let d = run(&tree, keeping(true, true)).await;
-    std::fs::remove_file(d.paths.lock()).unwrap();
+    std::fs::remove_file(d.paths.build_lock()).unwrap();
     std::fs::set_permissions(&tree.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     // Old times on the directory and the socket: a look that set them would show.
     let old = Timespec {
@@ -695,7 +717,7 @@ async fn a_directory_that_is_no_longer_ours_is_left_alone() {
     }
     tokio::time::sleep(EVERY * 5).await;
     assert!(
-        !d.paths.lock().exists(),
+        !d.paths.build_lock().exists(),
         "a file was made in a refused directory"
     );
     for p in [tree.dir.clone(), d.paths.socket()] {
@@ -825,8 +847,9 @@ async fn a_predecessor_leaves_its_successor_alone(every: Duration) {
     let tree = Tree::new();
     let a = run(&tree, keeping_every(every)).await;
     let paths = a.paths.clone();
-    std::fs::remove_file(paths.lock()).unwrap();
+    std::fs::remove_file(paths.build_lock()).unwrap();
     std::fs::remove_file(paths.socket()).unwrap();
+    remove_wire_files(&paths);
     // A relay that finds no socket starts a daemon, which takes the lock and the path.
     let b = Daemon::start(paths.clone(), config(CAT))
         .await
@@ -879,8 +902,9 @@ async fn a_predecessor_does_not_bind_a_missing_socket_it_has_no_lock_for() {
     let tree = Tree::new();
     let a = run(&tree, keeping_every(Duration::from_millis(300))).await;
     let paths = a.paths.clone();
-    std::fs::remove_file(paths.lock()).unwrap();
+    std::fs::remove_file(paths.build_lock()).unwrap();
     std::fs::remove_file(paths.socket()).unwrap();
+    remove_wire_files(&paths);
     let b = Daemon::start(paths.clone(), config(CAT))
         .await
         .expect("the successor starts");

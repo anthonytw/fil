@@ -18,7 +18,7 @@
 //! door and nothing else.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fil_daemon::paths::{DirFacts, check_dir};
@@ -108,25 +108,49 @@ pub async fn connect_local_as(paths: &Paths, uid: u32) -> Result<PipeLink, Local
         .check_socket_len()
         .map_err(|e| LocalError::Unsafe(e.to_string()))?;
     check_socket_dir(&paths.dir)?;
-    let sock = paths.socket();
-    let stream =
-        match tokio::time::timeout(LOCAL_CONNECT, tokio::net::UnixStream::connect(&sock)).await {
-            Ok(Ok(s)) => s,
+    // New sessions go to the newest daemon of this wire (DESIGN.md section 5.3): the running
+    // daemons of this wire newest build first, then this build's own socket, then one from
+    // before daemons were keyed by build; the first that answers.
+    let candidates = {
+        let p = paths.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut c: Vec<PathBuf> =
+                fil_daemon::paths::sockets_of_wire(&p.dir, p.major, p.revision)
+                    .into_iter()
+                    .map(|(_, s)| s)
+                    .collect();
+            if !c.contains(&p.socket()) {
+                let at = c.len().saturating_sub(1);
+                c.insert(at, p.socket());
+            }
+            c
+        })
+        .await
+        .unwrap_or_else(|_| vec![paths.socket()])
+    };
+    let mut stream = None;
+    for sock in &candidates {
+        match tokio::time::timeout(LOCAL_CONNECT, tokio::net::UnixStream::connect(sock)).await {
+            Ok(Ok(s)) => {
+                stream = Some(s);
+                break;
+            }
             Ok(Err(e))
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                let p = paths.clone();
-                let others = tokio::task::spawn_blocking(move || other_daemons(&p))
-                    .await
-                    .unwrap_or_default();
-                return Err(LocalError::NoDaemon(others));
-            }
+                ) => {}
             Ok(Err(e)) => return Err(LocalError::Io(e.kind().to_string())),
             Err(_) => return Err(LocalError::Timeout(LOCAL_CONNECT)),
-        };
+        }
+    }
+    let Some(stream) = stream else {
+        let p = paths.clone();
+        let others = tokio::task::spawn_blocking(move || other_daemons(&p))
+            .await
+            .unwrap_or_default();
+        return Err(LocalError::NoDaemon(others));
+    };
     // The directory is ours and 0700, so only we could have put a socket in it; the kernel says
     // who is listening all the same.
     match stream.peer_cred() {

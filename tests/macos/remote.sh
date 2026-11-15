@@ -533,11 +533,12 @@ clock_restore() {
   return 0
 }
 
-# ids: the daemon's directory, socket, lock and start file as device:inode, or gone.
+# ids: the daemon's directory, its build's socket, the wire lock and start file as device:inode, or gone.
 tmp_ids() {
-  local d=/tmp/fil-$(id -u) rev f out=""
+  local d=/tmp/fil-$(id -u) rev ver f out=""
   rev=$(fil --version | sed -n 's/.*wire \([0-9]*\)\.\([0-9]*\).*/\1-\2/p')
-  for f in "$d" "$d/fil-$rev.sock" "$d/fil-$rev.lock" "$d/fil-$rev.start"; do
+  ver=$(fil --version | sed -n "1s/^fil \([^ ]*\) .*/\1/p")
+  for f in "$d" "$d/fil-$rev-v$ver.sock" "$d/fil-$rev.lock" "$d/fil-$rev.start"; do
     out="$out $(stat -f '%d:%i' "$f" 2> /dev/null || echo gone)"
   done
   echo "${out# }"
@@ -545,18 +546,19 @@ tmp_ids() {
 
 # tmp_case MODE DAEMON_ARGS...: see scenario_tmp_cleaners.
 tmp_case() {
-  local mode=$1 d rev dpid sp before after day gone
+  local mode=$1 d rev ver dpid sp before after day gone
   shift
   d=/tmp/fil-$(id -u)
   rev=$(fil --version | sed -n 's/.*wire \([0-9]*\)\.\([0-9]*\).*/\1-\2/p')
+  ver=$(fil --version | sed -n "1s/^fil \([^ ]*\) .*/\1/p")
   [[ -z $(daemon_pids) ]] || fail "$mode: a daemon is running before the case starts: $(daemon_pids | tr '\n' ' ')"
   rm -rf "$d"
   tmpclean-daemon "$@" > "$OUT/run/$SCENARIO/daemon-$mode.log" 2>&1 &
   dpid=$!
   HELPERS+=("$dpid")
   local i
-  for ((i = 0; i < 100; i++)); do [[ -S $d/fil-$rev.sock ]] && break; sleep 0.1; done
-  [[ -S $d/fil-$rev.sock ]] || fail "$mode: the daemon did not come up: $(cat "$OUT/run/$SCENARIO/daemon-$mode.log")"
+  for ((i = 0; i < 100; i++)); do [[ -S $d/fil-$rev-v$ver.sock ]] && break; sleep 0.1; done
+  [[ -S $d/fil-$rev-v$ver.sock ]] || fail "$mode: the daemon did not come up: $(cat "$OUT/run/$SCENARIO/daemon-$mode.log")"
   # What a relay leaves when it starts a daemon (it did not start this one).
   : > "$d/fil-$rev.start"
   chmod 600 "$d/fil-$rev.start"

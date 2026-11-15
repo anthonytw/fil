@@ -15,7 +15,7 @@ The client relays the agent at `SSH_AUTH_SOCK` as it was when `fil` started, nev
 
 ## The socket that survives reconnects
 
-Every session on the host gets a stable `SSH_AUTH_SOCK`, `/tmp/fil-$UID/a-<major>-<rev>/<session>.sock`, whether or not a client relays. A program started while nobody relays finds the path and is refused, and works once a client with `-A` attaches. Because the path never changes for the life of the session, a reconnect, a takeover or a reattach doesn't leave a long-running shell with a dead agent socket, which is the usual way `git push` fails after you come back to tmux.
+Every session on the host gets a stable `SSH_AUTH_SOCK`, `/tmp/fil-$UID/a-<hash>/<session>.sock` (`<hash>` names the daemon's build), whether or not a client relays. A program started while nobody relays finds the path and is refused, and works once a client with `-A` attaches. Because the path never changes for the life of the session, a reconnect, a takeover or a reattach doesn't leave a long-running shell with a dead agent socket, which is the usual way `git push` fails after you come back to tmux.
 
 The socket exists only while the client holding the session relays its agent. Detached, or held by a client that doesn't relay, it is removed and a connection is refused at once. `agent_socket = false` in the host's [`daemon.toml`](daemon.md) drops the stable path altogether: sessions then have no `SSH_AUTH_SOCK`, and the agent is never relayed.
 

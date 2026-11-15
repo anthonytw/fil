@@ -432,7 +432,10 @@ fn in_session_commands_name_a_daemon_of_another_revision() {
     w.host("older", old);
     let _client = w.attach(old, "older", "work");
     let before = sock_names(&w.socks);
-    assert_eq!(before, [format!("fil-1-{old}.sock")]);
+    assert_eq!(
+        before,
+        [format!("fil-1-{old}-v{}.sock", env!("CARGO_PKG_VERSION"))]
+    );
 
     // A newer `fil` inside the session of the older daemon.
     for args in [

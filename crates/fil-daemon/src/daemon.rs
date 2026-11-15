@@ -7,12 +7,17 @@
 //!
 //! # Lifecycle
 //!
-//! - **Single instance.** The daemon holds an exclusive `flock` on `fil-<major>-<rev>.lock` for its
-//!   whole life (its pid is written there). A second daemon for the same major waits briefly,
-//!   for one on its way out, then reports [`StartError::AlreadyRunning`] and exits cleanly. The
-//!   lock dies with the process, so a socket file that exists while the lock is free is stale
-//!   and is removed by the daemon that takes the lock, unless something answers on it: a lock
-//!   file that a cleaner or a person removed makes a free lock under a live daemon.
+//! - **Single instance per build.** The daemon holds an exclusive `flock` on its build lock,
+//!   `fil-<major>-<rev>-v<ver>.lock`, for its whole life (its pid is written there). A second
+//!   daemon of the same build waits briefly, for one on its way out, then reports
+//!   [`StartError::AlreadyRunning`] and exits cleanly. The lock dies with the process, so a socket
+//!   file that exists while the lock is free is stale and is removed by the daemon that takes the
+//!   lock, unless something answers on it: a lock file that a cleaner or a person removed makes a
+//!   free lock under a live daemon.
+//! - **The wire lock.** Every daemon of a wire also holds `fil-<major>-<rev>.lock` for its whole
+//!   life, the sign of life the install's garbage collection reads: the first takes it, and each
+//!   later one, of another build, is handed the first one's open file over its lending socket, so
+//!   they all hold the one lock ([`crate::lend`]).
 //! - **Temporary-file cleaners.** The files live in `/tmp`, which some systems age. The daemon
 //!   holds a shared `flock` on its socket directory, sets fresh times on its files every hour
 //!   ([`Keeping`]) and repairs what is missing: the directory, its lock on it, the lock file and
@@ -22,12 +27,14 @@
 //!   `idle_exit_secs` in the configuration, `0` never), the daemon removes its socket, takes one
 //!   last look for a connection that raced it, and exits. A relay that arrives later starts a
 //!   new one. A session counts as long as its shell runs, attached or not.
-//! - **Upgrades.** The protocol major and the wire revision are in the socket path, so daemons
-//!   of different builds run side by side. New sessions go to the daemon of the client's own
-//!   wire (the relay routes by the client's hello and starts only its own); old sessions stay on
-//!   the old daemon until they end, reachable by a client of the old wire through any relay on
-//!   the host, and the old daemon then idles out. The daemon's answer to `ListSessions` names the
-//!   others it finds ([`other_daemons`](crate::other_daemons)) for `fil ls` to mention.
+//! - **Upgrades.** The protocol major, the wire revision and the build's version are in the
+//!   socket path, so daemons of different builds run side by side. New sessions go to the newest
+//!   daemon of the client's own wire (the relay routes by the client's hello and starts only its
+//!   own build's); old sessions stay on the old daemon until they end, and a daemon that a newer
+//!   build of its wire has superseded exits as soon as it has none ([`Inner::idle_for`]). A
+//!   daemon of an older wire stays reachable by a client of that wire through any relay on the
+//!   host. The daemon's answer to `ListSessions` names the other wires it finds
+//!   ([`other_daemons`](crate::other_daemons)) for `fil ls` to mention.
 //! - **Stopping.** SIGTERM and SIGINT stop the daemon after hanging up every session (as
 //!   closing their terminals would). SIGHUP is ignored.
 //!
@@ -73,6 +80,10 @@ const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long stopping the daemon then waits for the connections to tell their clients how the
 /// session ended and hang up.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a daemon with nothing to do waits before it asks whether a newer build of its wire
+/// runs (then it exits: [`Inner::idle_for`]). A moment, so a client that reconnects right after
+/// its session's last connection closed is not cut off.
+const SUPERSEDED_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
@@ -627,22 +638,42 @@ impl Inner {
         }
     }
 
-    /// Resolves after the daemon has had nothing to do for `idle`.
-    async fn idle_for(&self, idle: Option<Duration>) {
-        let Some(idle) = idle else {
-            return std::future::pending().await;
-        };
+    /// Resolves after the daemon has had nothing to do (no session, no connection) for `idle`,
+    /// or, sooner, once it has nothing to do and `superseded` says a daemon of a newer build of
+    /// its wire runs: new sessions go to that one, so this one exits when its last session ends
+    /// (DESIGN.md section 5.3). That is asked [`SUPERSEDED_GRACE`] after the daemon becomes idle
+    /// and then every `step`, also with no idle time (`idle_exit_secs = 0`).
+    async fn idle_for(
+        &self,
+        idle: Option<Duration>,
+        step: Duration,
+        superseded: impl Fn() -> bool,
+    ) {
         let mut rx = self.busy.subscribe();
         loop {
             let closed = rx.wait_for(|b| *b == 0).await.is_err();
             if closed {
                 return std::future::pending().await;
             }
-            tokio::select! {
-                () = tokio::time::sleep(idle) => return,
-                busy = async { rx.wait_for(|b| *b != 0).await.is_ok() } => {
-                    if !busy {
-                        return std::future::pending().await;
+            let since = tokio::time::Instant::now();
+            let mut next = SUPERSEDED_GRACE;
+            loop {
+                let wait = match idle {
+                    Some(i) => next.min(i.saturating_sub(since.elapsed())),
+                    None => next,
+                };
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {
+                        if idle.is_some_and(|i| since.elapsed() >= i) || superseded() {
+                            return;
+                        }
+                        next = step;
+                    }
+                    busy = async { rx.wait_for(|b| *b != 0).await.is_ok() } => {
+                        if !busy {
+                            return std::future::pending().await;
+                        }
+                        break;
                     }
                 }
             }
@@ -711,6 +742,15 @@ pub struct Daemon {
     /// `(device, inode)` of the socket this daemon bound, to unlink only that one: another
     /// daemon may have replaced it by the time this one retires or exits.
     bound: Option<(u64, u64)>,
+    /// The lending socket ([`crate::lend`]): a daemon of another build of the wire that starts
+    /// is handed this daemon's descriptor of the wire lock on it.
+    lend: UnixListener,
+    /// `(device, inode)` of the lending socket this daemon bound.
+    lend_bound: Option<(u64, u64)>,
+    /// This daemon's descriptor of the wire lock (`fil-<major>-<rev>.lock`), held for its whole
+    /// life and shared with every daemon of the wire: never unlocked, only replaced when the file
+    /// was removed ([`Daemon::check_wire`]) and closed at exit.
+    wire: Arc<Mutex<File>>,
     /// The daemon lock and the directory lock, held for the daemon's life.
     held: Arc<Mutex<Held>>,
     keeping: Keeping,
@@ -734,16 +774,17 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Takes the lock, removes a stale socket, reads the server policy, binds the Unix socket
-    /// and, when `cfg.direct` and the policy allows the direct transport, the UDP port. Direct
-    /// mode that cannot start (no free port) is logged and left off: the pipe still works. Must be
-    /// called inside a tokio runtime.
+    /// Takes the build lock, then the wire lock (taking it, or borrowing it from a running daemon
+    /// of another build of the wire: [`crate::lend`]), removes a stale socket, reads the server
+    /// policy, binds the Unix socket and the lending socket and, when `cfg.direct` and the policy
+    /// allows the direct transport, the UDP port. Direct mode that cannot start (no free port) is
+    /// logged and left off: the pipe still works. Must be called inside a tokio runtime.
     pub async fn start(paths: Paths, cfg: DaemonConfig) -> Result<Daemon, StartError> {
         paths.check_socket_len()?;
         ensure_socket_dir(&paths.dir)?;
         let io = |path: PathBuf| move |source| StartError::Io { path, source };
 
-        let lock_path = paths.lock();
+        let lock_path = paths.build_lock();
         let mut lock = open_lock_file(&lock_path).map_err(io(lock_path.clone()))?;
         let deadline = tokio::time::Instant::now() + cfg.lock_wait;
         loop {
@@ -758,16 +799,32 @@ impl Daemon {
                 }
             }
         }
-        // A daemon of this revision that lost its lock file to a successor waits to take the
+        // A daemon of this build that lost its lock file to a successor waits to take the
         // lock back when that one exits, and says so with its claim: it is this lock's rightful
         // holder, and its sessions are reachable only through it. Step aside (the lock goes when
         // this returns), as for a daemon that holds the lock.
         if crate::paths::claim_is_held(&paths.claim()) {
-            tracing::info!("a daemon of this revision is taking its socket back; not starting");
+            tracing::info!("a daemon of this build is taking its socket back; not starting");
             return Err(StartError::AlreadyRunning(lock_path));
         }
         lock.set_len(0).map_err(io(lock_path.clone()))?;
         writeln!(lock, "{}", std::process::id()).map_err(io(lock_path.clone()))?;
+
+        // The wire lock, held for this daemon's whole life (docs/m4/release.md section 6.4.4),
+        // after the build lock: an exiting daemon of another build leaves the wire's files while
+        // this one's build lock is held, so the lock it lends is never removed under it.
+        let (wire, got) = match crate::lend::acquire(&paths, cfg.lock_wait).await {
+            Ok(w) => w,
+            Err(crate::lend::WireLockError::NotLent) => {
+                tracing::info!(
+                    "the wire lock is held and no daemon of the wire lends it (a daemon from \
+                     before daemons were keyed by build holds it); not starting"
+                );
+                return Err(StartError::AlreadyRunning(paths.lock()));
+            }
+            Err(crate::lend::WireLockError::Io(e)) => return Err(io(paths.lock())(e)),
+        };
+        tracing::debug!(?got, "holding the wire lock");
 
         // Holding the lock, nothing else is serving this socket: whatever is there is stale.
         // Unless something answers on it. The lock file is not proof that nobody runs: if it
@@ -796,6 +853,17 @@ impl Daemon {
             Err(rustix::io::Errno::NOENT) => {}
             Err(e) => return Err(io(sock)(e.into())),
         }
+        // The lending socket the same way: holding the build lock, one nobody answers on is a
+        // crashed daemon's of this build.
+        let lend_path = paths.lend();
+        if something_answers_in(&dir, &paths.dir, name_of(&lend_path)) != Probe::Quiet {
+            tracing::warn!("something answers on this build's lending socket; not starting");
+            return Err(StartError::AlreadyRunning(lock_path));
+        }
+        match rustix::fs::unlinkat(&dir, name_of(&lend_path), rustix::fs::AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(io(lend_path)(e.into())),
+        }
         // A crashed daemon of this revision may have left agent sockets (each names a session).
         let stale = paths.clean_stale_agent_sockets();
         if stale > 0 {
@@ -803,6 +871,8 @@ impl Daemon {
         }
         let (unix, bound) = bind_socket_in(&dir, &paths).map_err(io(sock.clone()))?;
         let bound = Some(bound);
+        let (lend, lend_bound) = bind_in(&dir, &paths, &paths.lend()).map_err(io(paths.lend()))?;
+        let lend_bound = Some(lend_bound);
 
         let registry = KeyRegistry::new();
         // The first read of the policy, off the async workers: it may wait on NSS.
@@ -861,6 +931,9 @@ impl Daemon {
             paths,
             unix,
             bound,
+            lend,
+            lend_bound,
+            wire: Arc::new(Mutex::new(wire)),
             held: Arc::new(Mutex::new(Held {
                 lock,
                 dir_lock,
@@ -968,20 +1041,38 @@ impl Daemon {
             Some(d) if self.keeping.dir_lock => !dir_lock_is_current(d, &self.paths.dir),
             _ => std::fs::symlink_metadata(&self.paths.dir).is_err(),
         };
+        let gone = |p: PathBuf| {
+            std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        };
         dir_gone
-            || !crate::start::is_current(&held.lock, &self.paths.lock())
-            || std::fs::symlink_metadata(self.paths.socket())
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            || !crate::start::is_current(&held.lock, &self.paths.build_lock())
+            || gone(self.paths.socket())
+            || gone(self.paths.lend())
     }
 
     /// What a look found, applied on the loop: a socket that is gone is bound again, but only
     /// by the daemon that holds the lock on the lock file at its path (the invariant that makes
     /// it the one daemon of this revision).
     fn apply(&mut self, report: Report) {
-        if !(report.socket_missing && report.holds_lock) {
+        if !report.holds_lock {
             return;
         }
-        let sock = self.paths.socket();
+        if report.socket_missing {
+            self.rebind(false);
+        }
+        if report.lend_missing {
+            self.rebind(true);
+        }
+    }
+
+    /// Binds the socket (or, with `lend`, the lending socket) again after it was removed: see
+    /// [`Daemon::apply`].
+    fn rebind(&mut self, lend: bool) {
+        let sock = if lend {
+            self.paths.lend()
+        } else {
+            self.paths.socket()
+        };
         // The other kind of look may have bound it since this one looked.
         if std::fs::symlink_metadata(&sock).is_ok() {
             return;
@@ -995,8 +1086,13 @@ impl Daemon {
         }
         match self
             .bind_dir()
-            .and_then(|dir| bind_socket_in(&dir, &self.paths))
+            .and_then(|dir| bind_in(&dir, &self.paths, &sock))
         {
+            Ok((l, id)) if lend => {
+                self.lend = l;
+                self.lend_bound = Some(id);
+                tracing::warn!("the lending socket was removed; bound it again");
+            }
             Ok((l, id)) => {
                 let old = std::mem::replace(&mut self.unix, l);
                 self.bound = Some(id);
@@ -1004,9 +1100,64 @@ impl Daemon {
                 self.drain(old);
             }
             Err(e) => {
-                tracing::error!(error = %e, "the socket was removed and cannot be bound again")
+                tracing::error!(error = %e, lend, "a socket was removed and cannot be bound again")
             }
         }
+    }
+
+    /// The wire lock's file is no longer the one this daemon's descriptor is on (it was removed,
+    /// by a cleaner or by hand): the lock it shares with the other daemons of the wire is on a
+    /// file the install's garbage collection cannot see. Takes the lock on the file at the path
+    /// again, or borrows it from a daemon of the wire that already has ([`crate::lend::acquire`]),
+    /// on a task of its own; [`Daemon::run`] installs the result. Returns the task, unless the
+    /// descriptor is still the file at the path.
+    fn check_wire(&self) -> Option<tokio::task::JoinHandle<Option<File>>> {
+        let wire = self.wire.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::start::is_current(&wire, &self.paths.lock()) {
+            return None;
+        }
+        drop(wire);
+        let paths = self.paths.clone();
+        Some(tokio::spawn(async move {
+            match crate::lend::acquire(&paths, Duration::from_secs(1)).await {
+                Ok((f, got)) => {
+                    tracing::warn!(?got, "the wire lock file was removed; holding the new one");
+                    Some(f)
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "the wire lock file was removed; not held yet");
+                    None
+                }
+            }
+        }))
+    }
+
+    /// Lends this daemon's descriptor of the wire lock to the daemon on `stream`, on a task of its
+    /// own, if the descriptor is the file at the path; otherwise hangs up (the borrower asks
+    /// another daemon, or takes the new file's lock).
+    fn lend_one(&self, stream: UnixStream) {
+        let lent = {
+            let wire = self.wire.lock().unwrap_or_else(|e| e.into_inner());
+            if !crate::start::is_current(&wire, &self.paths.lock()) {
+                tracing::debug!("not lending the wire lock: its file was replaced");
+                return;
+            }
+            // A second descriptor of the same open file description: it shares the lock.
+            match wire.try_clone() {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot lend the wire lock");
+                    return;
+                }
+            }
+        };
+        let uid = self.inner.cfg.allowed_uid;
+        tokio::spawn(async move {
+            match crate::lend::lend(stream, &lent, uid).await {
+                Ok(()) => tracing::debug!("lent the wire lock"),
+                Err(e) => tracing::debug!(error = %e, "did not lend the wire lock"),
+            }
+        });
     }
 
     /// The socket directory a repair or a retiring daemon binds in: the one this daemon checked
@@ -1133,16 +1284,57 @@ impl Daemon {
         check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut pending: Option<oneshot::Receiver<Report>> = None;
         let mut repairing: Option<oneshot::Receiver<Report>> = None;
+        let mut wire_fix: Option<tokio::task::JoinHandle<Option<File>>> = None;
         let check_now = self.check_now.clone();
+        // The idle wait is made once and kept across the loop's turns (made again only after a
+        // retire that stayed): made in the `select!`, it would start over at every other event,
+        // the short check's every 15 s included, and an idle time longer than that never ran out.
+        let (idle_inner, idle_paths) = (self.inner.clone(), self.paths.clone());
+        let idle_wait = move || {
+            let (inner, paths) = (idle_inner.clone(), idle_paths.clone());
+            Box::pin(async move {
+                let idle = inner.cfg.idle_exit;
+                inner
+                    .idle_for(idle, check_every, || crate::paths::superseded(&paths))
+                    .await;
+            })
+        };
+        let mut idle = idle_wait();
         let exit = loop {
             tokio::select! {
                 _ = keep.tick() => {
                     if let Some(rx) = self.start_look(true) {
                         pending = Some(rx);
                     }
+                    if wire_fix.is_none() {
+                        wire_fix = self.check_wire();
+                    }
                 }
-                _ = check.tick() => self.check_files(&mut repairing),
-                () = check_now.notified() => self.check_files(&mut repairing),
+                _ = check.tick() => {
+                    self.check_files(&mut repairing);
+                    if wire_fix.is_none() {
+                        wire_fix = self.check_wire();
+                    }
+                }
+                () = check_now.notified() => {
+                    self.check_files(&mut repairing);
+                    if wire_fix.is_none() {
+                        wire_fix = self.check_wire();
+                    }
+                }
+                fixed = async { wire_fix.as_mut().unwrap().await }, if wire_fix.is_some() => {
+                    wire_fix = None;
+                    if let Ok(Some(f)) = fixed {
+                        *self.wire.lock().unwrap_or_else(|e| e.into_inner()) = f;
+                    }
+                }
+                accepted = self.lend.accept() => match accepted {
+                    Ok((stream, _)) => self.lend_one(stream),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed on the lending socket");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                },
                 report = async { pending.as_mut().unwrap().await }, if pending.is_some() => {
                     pending = None;
                     if let Ok(report) = report {
@@ -1162,10 +1354,11 @@ impl Daemon {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 },
-                () = self.inner.idle_for(self.inner.cfg.idle_exit) => {
+                () = &mut idle => {
                     if self.retire().await {
                         break Exit::Idle;
                     }
+                    idle = idle_wait();
                 }
                 _ = async { let _ = stop.wait_for(Option::is_some).await; } => {
                     break Exit::Shutdown;
@@ -1174,6 +1367,10 @@ impl Daemon {
         };
         self.stopped.store(true, Ordering::Release);
         remove_socket_if_ours(&self.paths.socket(), self.bound);
+        remove_socket_if_ours(&self.paths.lend(), self.lend_bound);
+        if let Some(t) = wire_fix.take() {
+            t.abort();
+        }
         if exit == Exit::Shutdown && *self.stop.borrow() == Some(true) {
             self.kill_sessions().await;
             // Each attached client's connection is still telling it how its session ended
@@ -1188,7 +1385,8 @@ impl Daemon {
         self.paths.remove_agent_dir();
         {
             let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-            clean_up_files(&self.paths, &held.lock);
+            let wire = self.wire.lock().unwrap_or_else(|e| e.into_inner());
+            clean_up_files(&self.paths, &held.lock, &wire);
             release_claim(&mut held, &self.paths, None);
         }
         tracing::info!(?exit, "daemon stopping");
@@ -1333,6 +1531,8 @@ fn dir_lock_or_log(r: std::io::Result<File>) -> Option<File> {
 struct Report {
     /// The socket is gone from its path.
     socket_missing: bool,
+    /// The lending socket is gone from its path.
+    lend_missing: bool,
     /// This daemon holds the lock on the lock file that is at its path now.
     holds_lock: bool,
     /// The socket directory passed its checks: nothing in a directory that did not is touched,
@@ -1391,6 +1591,7 @@ impl Look {
     fn repair(&self) -> Report {
         let none = Report {
             socket_missing: false,
+            lend_missing: false,
             holds_lock: false,
             dir_ok: false,
         };
@@ -1420,7 +1621,7 @@ impl Look {
         // a new file and its lock (a daemon that starts meanwhile finds this one answering and
         // leaves, see `start`; one that is still checking holds the lock for a moment, so this
         // waits for it a little, as `start` does), and write the pid again.
-        let lock_path = self.paths.lock();
+        let lock_path = self.paths.build_lock();
         if !held.lost_lock && !crate::start::is_current(&held.lock, &lock_path) {
             match self.relock(&lock_path, Duration::from_secs(1)) {
                 Ok(f) => {
@@ -1469,10 +1670,12 @@ impl Look {
         }
         // Only the holder of the lock on the lock file at the path owns the socket path.
         let holds_lock = crate::start::is_current(&held.lock, &lock_path);
-        let socket_missing = std::fs::symlink_metadata(self.paths.socket())
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        let gone = |p: PathBuf| {
+            std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        };
         Report {
-            socket_missing,
+            socket_missing: gone(self.paths.socket()),
+            lend_missing: gone(self.paths.lend()),
             holds_lock,
             dir_ok: true,
         }
@@ -1572,7 +1775,7 @@ fn name_of(path: &std::path::Path) -> &std::path::Path {
 /// replaced while it waits (a lock on a file no longer at the path excludes nobody). The
 /// directory is checked again before each open and once the lock is held.
 fn wait_for_lock(dir: &File, paths: &Paths, stopped: &AtomicBool) -> Result<File, WaitEnd> {
-    let lock = paths.lock();
+    let lock = paths.build_lock();
     let name = name_of(&lock);
     loop {
         if !crate::paths::dir_still_trusted(dir, &paths.dir) {
@@ -1663,14 +1866,23 @@ thread_local! {
 ///   (`fchmodat`, not through a link where the platform allows it).
 /// - Only then does the socket listen, so no connection is accepted while its mode is wider.
 fn bind_socket_in(dir: &File, paths: &Paths) -> std::io::Result<(UnixListener, (u64, u64))> {
+    bind_in(dir, paths, &paths.socket())
+}
+
+/// [`bind_socket_in`] for the socket at `sock`, a path in the socket directory (the daemon's
+/// socket or its lending socket).
+fn bind_in(
+    dir: &File,
+    paths: &Paths,
+    sock: &std::path::Path,
+) -> std::io::Result<(UnixListener, (u64, u64))> {
     use rustix::fs::{AtFlags, FileType, Mode, chmodat, statat};
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketType, bind, listen, socket};
     let moved = || std::io::Error::other("the socket directory changed");
     if !crate::paths::dir_still_trusted(dir, &paths.dir) {
         return Err(moved());
     }
-    let sock = paths.socket();
-    let name = name_of(&sock);
+    let name = name_of(sock);
     let fd = socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
     rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
     #[cfg(target_os = "linux")]
@@ -1679,7 +1891,7 @@ fn bind_socket_in(dir: &File, paths: &Paths) -> std::io::Result<(UnixListener, (
     if let Some(f) = BIND_HOOKS.with(|h| h.borrow_mut().before.take()) {
         f();
     }
-    bind(&fd, &SocketAddrUnix::new(sock.as_path())?)?;
+    bind(&fd, &SocketAddrUnix::new(sock)?)?;
     #[cfg(test)]
     if let Some(f) = BIND_HOOKS.with(|h| h.borrow_mut().after.take()) {
         f();
@@ -2533,7 +2745,7 @@ mod tests {
         assert!(std::fs::symlink_metadata(p.socket()).is_err());
 
         let mut held = Held {
-            lock: open_lock_file(&p.lock()).unwrap(),
+            lock: open_lock_file(&p.build_lock()).unwrap(),
             dir_lock: None,
             lost_lock: true,
             claim: Some(claim),
@@ -2552,7 +2764,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = socket_dir(&tmp);
         let mut held = Held {
-            lock: open_lock_file(&p.lock()).unwrap(),
+            lock: open_lock_file(&p.build_lock()).unwrap(),
             dir_lock: None,
             lost_lock: true,
             claim: Some(open_lock_file(&p.claim()).unwrap()),

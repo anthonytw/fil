@@ -3,7 +3,7 @@
 //! and `fil` depends on it, not the other way round). Not shipped.
 //!
 //! ```text
-//! fil-daemon-dev [--dir DIR] [--revision N] daemon [--command SCRIPT]
+//! fil-daemon-dev [--dir DIR] [--revision N] [--build VER] daemon [--command SCRIPT]
 //!                                            run the daemon (what the relay starts); sessions run
 //!                                            `sh -c SCRIPT` instead of a login shell
 //! fil-daemon-dev [--dir DIR] relay           the stdio relay (`fil server --stdio`)
@@ -11,7 +11,8 @@
 //!
 //! `--dir` replaces `/tmp/fil-$UID` (it is still checked for owner and mode); configuration and
 //! the log then live inside it. `--revision N` makes the daemon (or the relay and the daemon it
-//! starts) a build of wire revision N, for the tests of daemons that run side by side. Listing, killing and detaching are `fil ls`, `fil kill` and
+//! starts) a build of wire revision N, and `--build VER` a build of version VER, for the tests of
+//! daemons that run side by side. Listing, killing and detaching are `fil ls`, `fil kill` and
 //! `fil detach`; the tests send those requests themselves over a pipe through the relay.
 
 use std::ffi::OsString;
@@ -25,13 +26,18 @@ fn main() -> ExitCode {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mut dir = None;
     let mut revision: Option<u16> = None;
-    // `--dir DIR` and `--revision N`, in either order, before the command.
-    while args.len() >= 2 && (args[0] == "--dir" || args[0] == "--revision") {
+    let mut build: Option<String> = None;
+    // `--dir DIR`, `--revision N` and `--build VER`, in any order, before the command.
+    while args.len() >= 2 && (args[0] == "--dir" || args[0] == "--revision" || args[0] == "--build")
+    {
         let value = args.remove(1);
-        if args.remove(0) == "--dir" {
+        let flag = args.remove(0);
+        if flag == "--dir" {
             dir = Some(std::path::PathBuf::from(value));
-        } else {
+        } else if flag == "--revision" {
             revision = value.to_str().and_then(|v| v.parse().ok());
+        } else {
+            build = value.to_str().map(str::to_owned);
         }
     }
     let mut paths = dir
@@ -39,6 +45,9 @@ fn main() -> ExitCode {
         .map_or_else(Paths::for_current_user, Paths::in_dir);
     if let Some(r) = revision {
         paths = paths.with_revision(r);
+    }
+    if let Some(v) = &build {
+        paths = paths.with_version(v.clone());
     }
     let Some(cmd) = args.first().and_then(|a| a.to_str()).map(str::to_owned) else {
         eprintln!("usage: fil-daemon-dev [--dir DIR] daemon [--command SCRIPT] | relay");
@@ -66,6 +75,10 @@ fn main() -> ExitCode {
             if let Some(r) = revision {
                 daemon_args.push("--revision".into());
                 daemon_args.push(r.to_string().into());
+            }
+            if let Some(v) = &build {
+                daemon_args.push("--build".into());
+                daemon_args.push(v.into());
             }
             daemon_args.push("daemon".into());
             run_relay(&RelayOptions::with_paths(

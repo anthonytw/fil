@@ -46,7 +46,7 @@ impl Scratch {
 
     /// The pid in the lock file: the daemon holding it.
     pub fn daemon_pid(&self) -> Option<u32> {
-        std::fs::read_to_string(self.paths().lock())
+        std::fs::read_to_string(self.paths().build_lock())
             .ok()?
             .trim()
             .parse()
@@ -78,7 +78,7 @@ pub fn lock_is_held(paths: &Paths) -> bool {
     let Ok(f) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(paths.lock())
+        .open(paths.build_lock())
     else {
         return false;
     };

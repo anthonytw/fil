@@ -334,8 +334,11 @@ fn two_revisions_share_a_socket_directory_and_ls_notes_the_other() {
     );
     assert_eq!(
         lock_names(&w.socks),
-        [format!("fil-1-{a}.sock"), format!("fil-1-{b}.sock")],
-        "two sockets, named for their revisions and nothing else"
+        [
+            format!("fil-1-{a}-v{}.sock", env!("CARGO_PKG_VERSION")),
+            format!("fil-1-{b}-v{}.sock", env!("CARGO_PKG_VERSION"))
+        ],
+        "two sockets, named for their wires and builds and nothing else"
     );
 
     // And the first still answers, noting the second. Nothing was killed or replaced.
@@ -383,7 +386,7 @@ fn a_session_survives_the_remote_being_upgraded_in_place() {
     assert!(took < Duration::from_secs(10), "took {took:?}");
     assert_eq!(
         lock_names(&w.socks),
-        [format!("fil-1-{old}.sock")],
+        [format!("fil-1-{old}-v{}.sock", env!("CARGO_PKG_VERSION"))],
         "the new relay started nothing for an old client"
     );
 
@@ -407,6 +410,9 @@ fn a_session_survives_the_remote_being_upgraded_in_place() {
     );
     assert_eq!(
         lock_names(&w.socks),
-        [format!("fil-1-{old}.sock"), format!("fil-1-{new}.sock")]
+        [
+            format!("fil-1-{old}-v{}.sock", env!("CARGO_PKG_VERSION")),
+            format!("fil-1-{new}-v{}.sock", env!("CARGO_PKG_VERSION"))
+        ]
     );
 }

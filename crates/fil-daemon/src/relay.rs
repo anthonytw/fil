@@ -14,9 +14,13 @@
 //! must not strand that session: it reads the client's first frames (the layout of the frame and
 //! of `Hello` is frozen, so any build can), and
 //!
-//! - **the client's wire is the relay's own:** ensure the daemon (start it if needed), as ever;
-//! - **another wire whose daemon is running** (`fil-<major>-<rev>.sock`; revision 0 is the
-//!   pre-revision `fil-<major>.sock`): connect to it. Nothing is started;
+//! - **the client's wire is the relay's own:** the newest daemon of the wire (new sessions go
+//!   there): a running daemon of a newer build than the relay's, or one from before daemons were
+//!   keyed by build (`fil-<major>-<rev>.sock`, which holds the wire lock alone), and otherwise
+//!   the relay's own build's daemon, started if needed;
+//! - **another wire whose daemon is running** (the newest of `fil-<major>-<rev>-v<ver>.sock`,
+//!   then `fil-<major>-<rev>.sock`; revision 0 is the pre-revision `fil-<major>.sock`): connect
+//!   to it. Nothing is started;
 //! - **another wire with no daemon:** answer with this relay's `Hello` and
 //!   `Error(VersionMismatch)` and end, so the client can say which side is newer. Nothing is
 //!   started: a daemon of a wire nobody asked for would only idle.
@@ -385,12 +389,19 @@ fn refuse<W: Write>(output: &mut W, revision: u16) -> Result<(), RelayError> {
     write_control(output, &ControlMsg::Error(ErrorCode::VersionMismatch))
 }
 
-/// What to tell the user when this relay has just started a daemon and daemons of other wires
-/// are running: their sessions are not in the new one. One line and no numbers: `fil ls` names
-/// the daemons (its "also running" lines), so the two do not say the same thing twice, and a
-/// plain `fil HOST` after an upgrade, which has no `fil ls` output, still hears it.
+/// What to tell the user when this relay has just started a daemon and daemons of other builds
+/// (of another wire, or older ones of this wire) are running: their sessions are not in the new
+/// one. One line and no numbers: `fil ls` names the daemons (its "also running" lines), so the
+/// two do not say the same thing twice, and a plain `fil HOST` after an upgrade, which has no
+/// `fil ls` output, still hears it.
 fn others_note(paths: &Paths) -> Option<String> {
-    if crate::paths::other_daemons(paths).is_empty() {
+    let others = crate::paths::running_daemons(&paths.dir)
+        .into_iter()
+        .any(|d| {
+            (d.major, d.revision, d.version.as_deref())
+                != (paths.major, paths.revision, Some(paths.version.as_str()))
+        });
+    if !others {
         return None;
     }
     Some(
@@ -424,16 +435,31 @@ where
     let sock = match want {
         Want::Gone => return Ok(RelayEnd::PipeClosed),
         Want::Wire { major, revision } if (major, revision) != own => {
-            // Another build's client. Its daemon, if it is running; never a new daemon of
-            // another wire. (The directory was checked above: a socket in someone else's
-            // directory is not to be trusted.)
-            match UnixStream::connect(opts.paths.socket_of(major, revision)) {
-                Ok(s) => s,
-                Err(_) => {
+            // Another wire's client. The newest of its daemons that is running; never a new
+            // daemon of another wire. (The directory was checked above: a socket in someone
+            // else's directory is not to be trusted.)
+            match connect_newest(&opts.paths, major, revision, |_| true) {
+                Some(s) => s,
+                None => {
                     refuse(&mut output, opts.paths.revision)?;
                     return Ok(RelayEnd::Refused);
                 }
             }
+        }
+        // This wire: new sessions go to the newest daemon of the wire. One of a newer build than
+        // this relay's that is running takes the connection (an older `fil` on the host starts
+        // no daemon of its own beside it), as does a daemon of this wire from before daemons
+        // were keyed by build (it holds the wire lock alone: none can start beside it); otherwise
+        // this relay's own build's daemon, started if need be.
+        Want::Own | Want::Wire { .. }
+            if let Some(s) = connect_newest(&opts.paths, own.0, own.1, |v| {
+                v.is_none_or(|v| {
+                    crate::paths::compare_versions(v, &opts.paths.version)
+                        == std::cmp::Ordering::Greater
+                })
+            }) =>
+        {
+            s
         }
         Want::Own | Want::Wire { .. } => {
             let ensured = ensure_daemon(&opts.paths, &opts.launcher)?;
@@ -451,6 +477,21 @@ where
         }
     };
     pump_chunks(rx, held, ended, output, sock)
+}
+
+/// Connects to the newest running daemon of wire `major`/`revision` whose build `pick` takes
+/// (`None` is a daemon from before daemons were keyed by build), trying them newest first
+/// ([`crate::paths::sockets_of_wire`]) and going on to the next when one does not answer.
+fn connect_newest(
+    paths: &Paths,
+    major: u16,
+    revision: u16,
+    pick: impl Fn(Option<&str>) -> bool,
+) -> Option<UnixStream> {
+    crate::paths::sockets_of_wire(&paths.dir, major, revision)
+        .into_iter()
+        .filter(|(v, _)| pick(v.as_deref()))
+        .find_map(|(_, sock)| UnixStream::connect(sock).ok())
 }
 
 /// Copies `input` to the socket and the socket to `output`, byte for byte, until one side ends.

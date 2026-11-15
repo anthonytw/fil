@@ -749,3 +749,136 @@ fn only_install_gc_removes_the_root_and_only_when_empty() {
     assert!(!w.root().exists(), "--install-gc removes the emptied root");
     assert!(w.home.join(".local/share").is_dir(), "never its parents");
 }
+
+// ---- §6.4.4 with several daemons of one wire (1.0 decision D2) ---------------------------------
+
+/// A real `fil server --daemon` of build `version`, in the world's socket directory, killed (by
+/// its pid) when dropped.
+struct DaemonProc {
+    child: std::process::Child,
+}
+
+impl DaemonProc {
+    fn start(w: &World, version: &str) -> DaemonProc {
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_fil"))
+            .args(["server", "--daemon"])
+            .env("HOME", &w.home)
+            .env("XDG_CONFIG_HOME", w.home.join(".config"))
+            .env("XDG_STATE_HOME", w.home.join(".local/state"))
+            .env("FIL_TEST_SOCKET_DIR", &w.sock)
+            .env("FIL_TEST_VERSION", version)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let socket = fil_daemon::Paths::in_dir(&w.sock)
+            .with_version(version)
+            .socket();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon of {version} did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        DaemonProc { child }
+    }
+
+    /// SIGTERM, and wait for the process to be gone.
+    fn stop(mut self) {
+        let pid = rustix::process::Pid::from_child(&self.child);
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for DaemonProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The wire lock as GC sees it, sampled without a pause from the moment the first daemon of the
+/// wire answers until `stop` is set: every sample that was not "held".
+fn watch_the_lock(
+    lock: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<(u64, Vec<Probe>)> {
+    std::thread::spawn(move || {
+        let (mut n, mut gaps) = (0u64, Vec::new());
+        while !stop.load(Ordering::Acquire) {
+            let p = fil::install::probe::probe(&lock);
+            n += 1;
+            if p != Probe::Held && gaps.len() < 16 {
+                gaps.push(p);
+            }
+        }
+        (n, gaps)
+    })
+}
+
+/// Daemons of two builds of one wire run side by side and share `fil-<major>-<rev>.lock` (the
+/// second is handed the first one's open file): GC finds it held at every sample while either
+/// runs, through the first one's exit, on the same file all along (no daemon took a new one),
+/// and keeps every directory of the wire, forced pass included; once the last daemon exits the
+/// lock is gone and the directories are collected.
+#[test]
+fn several_daemons_of_one_wire_hold_the_lock_without_a_gap() {
+    let _serial = serial();
+    let w = World::new("builds");
+    std::fs::create_dir_all(w.home.join(".config/fil")).unwrap();
+    std::fs::write(w.home.join(".config/fil/daemon.toml"), "direct = false\n").unwrap();
+    let wire = format!(
+        "w{}.{}",
+        fil_proto::limits::PROTOCOL_MAJOR,
+        fil_proto::version::wire_revision()
+    );
+    w.copy(&format!("0.0.1-{wire}"), OLD);
+    w.copy(&format!("0.0.2-{wire}"), OLD);
+    let (lock, _start) = gc::lock_files(
+        &w.sock,
+        fil_proto::limits::PROTOCOL_MAJOR,
+        fil_proto::version::wire_revision(),
+    );
+    let inode = || {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&lock).map(|m| m.ino()).ok()
+    };
+
+    let a = DaemonProc::start(&w, "0.0.1");
+    let first = inode().expect("the first daemon made the wire lock");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = watch_the_lock(lock.clone(), stop.clone());
+    assert_eq!(w.pass(&Pass::Forced).in_use, 2);
+
+    let b = DaemonProc::start(&w, "0.0.2");
+    assert_eq!(w.pass(&Pass::Forced).in_use, 2);
+    a.stop();
+    assert_eq!(
+        w.pass(&Pass::Forced).in_use,
+        2,
+        "the second daemon still holds the wire lock"
+    );
+    assert_eq!(inode(), Some(first), "the same file, never taken again");
+    // And the first build's own files went with it, the wire's stayed.
+    let a_paths = fil_daemon::Paths::in_dir(&w.sock).with_version("0.0.1");
+    assert!(!a_paths.build_lock().exists() && !a_paths.socket().exists());
+    assert!(lock.exists(), "the wire lock stays for the second daemon");
+
+    stop.store(true, Ordering::Release);
+    let (samples, gaps) = watcher.join().unwrap();
+    assert!(samples > 10, "{samples}");
+    assert!(
+        gaps.is_empty(),
+        "GC saw the wire lock free: {gaps:?} of {samples}"
+    );
+
+    b.stop();
+    assert_eq!(fil::install::probe::probe(&lock), Probe::Absent);
+    assert!(!lock.exists(), "the last daemon removed the wire lock");
+    let r = w.pass(&Pass::Forced);
+    assert_eq!((r.removed, r.in_use), (2, 0), "{r:?}");
+}

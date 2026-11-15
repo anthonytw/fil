@@ -1,0 +1,429 @@
+//! Daemons of several builds of one wire on one host (DESIGN.md section 5.3; the 1.0 decision
+//! D2): each build has its own socket, they share the wire lock (`fil-<major>-<rev>.lock`, handed
+//! over by `SCM_RIGHTS`, so the install's garbage collection finds it held from the first start
+//! to the last exit: docs/m4/release.md section 6.4.4), new connections go to the newest build,
+//! and an older daemon exits once its last session ends.
+
+mod common;
+
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use common::*;
+use fil_daemon::{Daemon, DaemonLauncher, Paths, RelayOptions, StartError, ensure_daemon};
+use rustix::fs::{FlockOperation, flock};
+
+const BIN: &str = env!("CARGO_BIN_EXE_fil-daemon-dev");
+
+/// A daemon of build `version` in the scratch directory, in this process.
+async fn start_build(s: &Scratch, version: &str, script: &str) -> Running {
+    let paths = s.paths().with_version(version);
+    fil_daemon::ensure_socket_dir(&s.dir).unwrap();
+    let daemon = Daemon::start(paths.clone(), config(script))
+        .await
+        .expect("daemon starts");
+    Running {
+        paths,
+        handle: daemon.handle(),
+        udp_port: daemon.udp_port(),
+        fingerprint: daemon.fingerprint(),
+        registry: daemon.registry().clone(),
+        task: tokio::spawn(daemon.run()),
+    }
+}
+
+/// What GC's probe says of `lock` (docs/m4/release.md section 6.3): a shared, non-blocking
+/// `flock` on a read-only open fails with `EWOULDBLOCK` only while someone holds it.
+#[derive(Debug, PartialEq, Eq)]
+enum Seen {
+    Held,
+    Free,
+    Missing,
+}
+
+fn probe(lock: &Path) -> Seen {
+    use rustix::fs::{CWD, Mode, OFlags, openat};
+    match openat(
+        CWD,
+        lock,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Err(_) => Seen::Missing,
+        Ok(fd) => match flock(&fd, FlockOperation::NonBlockingLockShared) {
+            Err(rustix::io::Errno::WOULDBLOCK) => Seen::Held,
+            _ => Seen::Free,
+        },
+    }
+}
+
+/// Samples the wire lock without a pause until `stop` is set; returns how many samples, and the
+/// first few that were not "held".
+fn watch(lock: PathBuf, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<(u64, Vec<Seen>)> {
+    std::thread::spawn(move || {
+        let (mut n, mut gaps) = (0u64, Vec::new());
+        while !stop.load(Ordering::Acquire) {
+            let p = probe(&lock);
+            n += 1;
+            if p != Seen::Held && gaps.len() < 16 {
+                gaps.push(p);
+            }
+        }
+        (n, gaps)
+    })
+}
+
+fn inode(p: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| m.ino())
+}
+
+/// Two builds of one wire, in this process: both start (the second borrows the first's wire
+/// lock), each has its own socket and sessions, the lock is held throughout and on one file, and
+/// the last one out removes the wire's files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_builds_of_one_wire_run_side_by_side_on_one_wire_lock() {
+    let s = Scratch::new();
+    let old = start_build(&s, "0.0.1", CAT).await;
+    let lock = old.paths.lock();
+    let file = inode(&lock).expect("the wire lock");
+    let mut a = Client::attach(old.pipe().await, Connect::new("main", key(1))).await;
+    a.wait_screen("ready").await;
+
+    let new = start_build(&s, "0.0.2", CAT).await;
+    assert_ne!(old.paths.socket(), new.paths.socket());
+    assert_ne!(old.paths.agent_dir(), new.paths.agent_dir());
+    assert_eq!(
+        inode(&lock),
+        Some(file),
+        "the second build took no new file"
+    );
+    // A session of the same name on the new build is its own.
+    let mut b = Client::attach(new.pipe().await, Connect::new("main", key(2))).await;
+    b.wait_screen("ready").await;
+    a.type_bytes(b"from-a\n").await;
+    a.wait_screen("from-a").await;
+    assert!(!b.screen().contains("from-a"));
+    let running = fil_daemon::paths::running_daemons(&s.dir);
+    assert_eq!(
+        running
+            .iter()
+            .map(|d| d.version.clone().unwrap())
+            .collect::<Vec<_>>(),
+        ["0.0.2", "0.0.1"],
+        "newest first"
+    );
+
+    let old_paths = old.paths.clone();
+    old.stop().await;
+    assert_eq!(probe(&lock), Seen::Held, "the new build holds it on");
+    assert_eq!(inode(&lock), Some(file));
+    assert!(!old_paths.build_lock().exists() && !old_paths.lend().exists());
+    b.type_bytes(b"still\n").await;
+    b.wait_screen("still").await;
+
+    let new_paths = new.paths.clone();
+    new.stop().await;
+    assert_eq!(probe(&lock), Seen::Missing, "the last daemon removed it");
+    assert!(!new_paths.build_lock().exists() && !new_paths.socket().exists());
+}
+
+/// The invariant, with real processes: from the first daemon's start to the last one's exit,
+/// GC's probe finds the wire lock held at every sample, through starts of other builds (two at
+/// once among them), a crash (SIGKILL) of the daemon that took the lock, and a clean exit; and
+/// it is the same file all along.
+#[test]
+fn the_wire_lock_is_held_from_the_first_start_to_the_last_exit() {
+    let s = Scratch::new();
+    fil_daemon::ensure_socket_dir(&s.dir).unwrap();
+    std::fs::write(s.paths().config, "direct = false\n").unwrap();
+    let launcher = |v: &str| {
+        DaemonLauncher::new(
+            BIN,
+            [
+                "--dir".to_string(),
+                s.dir.display().to_string(),
+                "--build".into(),
+                v.into(),
+                "daemon".into(),
+            ],
+        )
+    };
+    let paths = |v: &str| s.paths().with_version(v);
+    let _cleanup: Vec<KillOnDrop> = ["0.1.0", "0.2.0", "0.3.0", "0.4.0"]
+        .iter()
+        .map(|v| KillOnDrop(paths(v).build_lock()))
+        .collect();
+    let lock = s.paths().lock();
+
+    let first = ensure_daemon(&paths("0.1.0"), &launcher("0.1.0")).expect("the first build");
+    assert!(first.started);
+    let file = inode(&lock).expect("the wire lock");
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = watch(lock.clone(), stop.clone());
+
+    // Two builds start at once beside it: both borrow (or one borrows from the other).
+    let (p2, l2, p3, l3) = (
+        paths("0.2.0"),
+        launcher("0.2.0"),
+        paths("0.3.0"),
+        launcher("0.3.0"),
+    );
+    let t2 = std::thread::spawn(move || ensure_daemon(&p2, &l2).map(|e| e.started));
+    let t3 = std::thread::spawn(move || ensure_daemon(&p3, &l3).map(|e| e.started));
+    assert!(t2.join().unwrap().expect("0.2.0"));
+    assert!(t3.join().unwrap().expect("0.3.0"));
+
+    // The first one crashes: the others hold the same lock on.
+    let pid = |v: &str| -> i32 {
+        std::fs::read_to_string(paths(v).build_lock())
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let first_pid = pid("0.1.0");
+    kill(first_pid, "-KILL");
+    fil_testkit::wait_until("the first daemon to die", WAIT, || {
+        !pid_alive(first_pid as u32)
+    });
+    // A build that starts now borrows from the survivors.
+    let fourth = ensure_daemon(&paths("0.4.0"), &launcher("0.4.0")).expect("0.4.0");
+    assert!(fourth.started);
+    // A clean exit of another.
+    let second_pid = pid("0.2.0");
+    kill(second_pid, "-TERM");
+    fil_testkit::wait_until("the second daemon to exit", WAIT, || {
+        !pid_alive(second_pid as u32)
+    });
+
+    stop.store(true, Ordering::Release);
+    let (samples, gaps) = watcher.join().unwrap();
+    assert!(samples > 100, "{samples}");
+    assert!(
+        gaps.is_empty(),
+        "the wire lock was not held: {gaps:?} of {samples} samples"
+    );
+    assert_eq!(inode(&lock), Some(file), "nobody took a new file");
+
+    // The last two exit: the lock goes with the last.
+    for v in ["0.3.0", "0.4.0"] {
+        let p = pid(v);
+        kill(p, "-TERM");
+        fil_testkit::wait_until("a daemon to exit", WAIT, || !pid_alive(p as u32));
+    }
+    assert_eq!(probe(&lock), Seen::Missing);
+    assert!(!s.paths().start_lock().exists());
+    drop(first);
+    drop(fourth);
+}
+
+fn kill(pid: i32, sig: &str) {
+    let _ = std::process::Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status();
+}
+
+/// Kills the daemon whose pid is in the build lock at the path, when dropped, if it still holds
+/// that lock (a private directory: ours alone).
+struct KillOnDrop(PathBuf);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let held = std::fs::File::open(&self.0)
+            .is_ok_and(|f| flock(&f, FlockOperation::NonBlockingLockShared).is_err());
+        if let (true, Ok(text)) = (held, std::fs::read_to_string(&self.0))
+            && let Ok(pid) = text.trim().parse::<i32>()
+        {
+            kill(pid, "-KILL");
+        }
+    }
+}
+
+/// An older build's daemon exits as soon as its last session ends once a newer build of its wire
+/// runs, even with no idle time configured; the newer one, and an older one with nothing newer
+/// beside it, stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_build_exits_when_its_last_session_ends() {
+    let s = Scratch::new();
+    let script = "echo ready; read x; exit 0";
+    let old = start_build(&s, "0.0.1", script).await;
+    let mut a = Client::attach(old.pipe().await, Connect::new("work", key(1))).await;
+    a.wait_screen("ready").await;
+    a.detach().await;
+    a.hang_up();
+    // Alone, and idle with no session... it has one, detached: it stays. Nothing newer runs.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!old.task.is_finished(), "nothing newer runs: it stays");
+
+    let new = start_build(&s, "0.0.2", CAT).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!old.task.is_finished(), "its session still runs");
+
+    // The session ends: the old daemon goes, the new stays.
+    let mut a = Client::attach(
+        fil_daemon_pipe(&old.paths).await,
+        Connect::new("work", key(1)),
+    )
+    .await;
+    a.wait_screen("ready").await;
+    a.type_bytes(b"bye\n").await;
+    let exit = tokio::time::timeout(Duration::from_secs(10), old.task)
+        .await
+        .expect("the older daemon exits once its last session ends")
+        .unwrap();
+    assert_eq!(exit, fil_daemon::Exit::Idle);
+    assert!(!old.paths.socket().exists());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!new.task.is_finished(), "the newest build stays");
+    assert_eq!(probe(&new.paths.lock()), Seen::Held);
+    new.stop().await;
+}
+
+/// The idle time runs out even when it is longer than the short file check: the wait is kept
+/// across the daemon's other events (it used to start over at each check, so with the shipped
+/// 15-second check and five-minute idle time the daemon never exited on its own).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_time_longer_than_the_check_runs_out() {
+    let s = Scratch::new();
+    fil_daemon::ensure_socket_dir(&s.dir).unwrap();
+    let mut cfg = config(CAT);
+    cfg.idle_exit = Some(Duration::from_millis(1200));
+    let mut daemon = Daemon::start(s.paths(), cfg).await.expect("starts");
+    daemon.set_keeping(fil_daemon::paths::Keeping {
+        check: Duration::from_millis(100),
+        ..fil_daemon::paths::Keeping::default()
+    });
+    let exit = tokio::time::timeout(Duration::from_secs(10), daemon.run())
+        .await
+        .expect("the idle daemon exits");
+    assert_eq!(exit, fil_daemon::Exit::Idle);
+}
+
+/// A pipe link straight to the socket of `paths` (no relay: a relay routes to the newest build).
+async fn fil_daemon_pipe(paths: &Paths) -> fil_transport::pipe::PipeLink {
+    let sock = tokio::net::UnixStream::connect(paths.socket())
+        .await
+        .unwrap();
+    fil_transport::pipe::PipeLink::accept(sock, fil_transport::pipe::PipeConfig::default())
+        .await
+        .unwrap()
+}
+
+/// New connections go to the newest build of the client's wire: a relay of an older build
+/// connects to a newer build's daemon and starts nothing of its own; a relay of a newer build
+/// than any running starts its own beside the old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_route_to_the_newest_build_of_the_wire() {
+    let s = Scratch::new();
+    let newer = start_build(&s, "0.0.5", CAT).await;
+    // A relay of build 0.0.4 (whose launcher would fail if it were used).
+    let old_relay = RelayOptions::with_paths(
+        s.paths().with_version("0.0.4"),
+        DaemonLauncher::new("/nonexistent/fil", Vec::<String>::new()),
+    );
+    let mut a = Client::attach(
+        pipe_through_relay(old_relay).await,
+        Connect::new("main", key(1)),
+    )
+    .await;
+    a.wait_screen("ready").await;
+    assert_eq!(
+        newer.handle_sessions().await,
+        1,
+        "the session is on the newer build"
+    );
+    assert!(!s.paths().with_version("0.0.4").socket().exists());
+    a.detach().await;
+    newer.stop().await;
+}
+
+trait Sessions {
+    async fn handle_sessions(&self) -> usize;
+}
+
+impl Sessions for Running {
+    async fn handle_sessions(&self) -> usize {
+        match ask(self, fil_proto::msg::Request::ListSessions).await {
+            fil_proto::msg::Response::Sessions { list, .. } => list.len(),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// A daemon of this wire from before daemons were keyed by build holds the wire lock alone (on
+/// its own descriptor) and lends nothing: a keyed daemon does not start beside it (its sessions
+/// would be beside a lock it cannot share), and a relay connects to it instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_from_before_builds_keeps_its_wire() {
+    let s = Scratch::new();
+    fil_daemon::ensure_socket_dir(&s.dir).unwrap();
+    let p = s.paths();
+    let legacy_lock = std::fs::File::create(p.lock()).unwrap();
+    flock(&legacy_lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+    let legacy = std::os::unix::net::UnixListener::bind(p.socket_of(p.major, p.revision)).unwrap();
+    let mut cfg = config(CAT);
+    cfg.lock_wait = Duration::from_millis(200);
+    let started = Daemon::start(p.clone(), cfg).await;
+    assert!(matches!(started, Err(StartError::AlreadyRunning(_))));
+    assert!(!p.socket().exists());
+    // The relay of this build goes to the legacy daemon's socket, and starts nothing.
+    let mut opts = RelayOptions::with_paths(
+        p.clone(),
+        DaemonLauncher::new("/nonexistent/fil", Vec::<String>::new()),
+    );
+    // No client opening here: the stream goes to the relay's own wire after this wait.
+    opts.hello_wait = Duration::from_millis(100);
+    let (_client, relay_end) = UnixStream::pair().unwrap();
+    let input = relay_end.try_clone().unwrap();
+    std::thread::spawn(move || fil_daemon::relay(input, relay_end, &opts));
+    legacy.set_nonblocking(false).unwrap();
+    let accepted = tokio::task::spawn_blocking(move || legacy.accept().is_ok());
+    assert!(
+        tokio::time::timeout(WAIT, accepted).await.unwrap().unwrap(),
+        "the relay connected to the legacy daemon"
+    );
+}
+
+/// A lent descriptor is kept only if it is the wire lock at its path now, a regular file of ours,
+/// and holds (or takes) the lock; one of a replaced file, or one another process holds the lock
+/// against, is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_borrowed_descriptor_is_checked() {
+    let s = Scratch::new();
+    let d = start_build(&s, "0.0.7", CAT).await;
+    let other = s.paths().with_version("0.0.8");
+    // A good borrow.
+    let f = fil_daemon::lend::borrow(&d.paths.lend(), &other.lock())
+        .await
+        .expect("the daemon lends");
+    assert_eq!(inode(&other.lock()), {
+        use std::os::unix::fs::MetadataExt;
+        Some(f.metadata().unwrap().ino())
+    });
+    drop(f);
+    // The borrower asks about another path: the descriptor is not that file.
+    let elsewhere = s.dir.join("elsewhere.lock");
+    std::fs::write(&elsewhere, "").unwrap();
+    assert!(
+        fil_daemon::lend::borrow(&d.paths.lend(), &elsewhere)
+            .await
+            .is_err()
+    );
+    // Not a lending socket at all: nothing comes.
+    assert!(
+        fil_daemon::lend::borrow(&s.dir.join("nothing.lend"), &other.lock())
+            .await
+            .is_err()
+    );
+    // A file of ours that another descriptor holds the lock against: refused by the lock check.
+    let held = s.dir.join("held.lock");
+    let holder = std::fs::File::create(&held).unwrap();
+    flock(&holder, FlockOperation::NonBlockingLockExclusive).unwrap();
+    let mine = std::fs::File::open(&held).unwrap();
+    assert!(fil_daemon::lend::verify(&mine, &held).is_err());
+    d.stop().await;
+}

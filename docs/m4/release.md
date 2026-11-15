@@ -139,6 +139,18 @@ share/doc/fil/{README.md,CHANGELOG.md,LICENSE,THIRD-PARTY-NOTICES.md,config.exam
 
 The bootstrap script (`docs/m4/plan.md` §3, U1; the exact text is M4 OQ-1) builds the directory name from its own constants: `v=<ver>-w<major>.<rev>`, with both parts checked at compile time against the pattern of §6.2 (the same check, so a build cannot install a directory that GC never recognizes). It `exec`s `fil server --stdio` from the exact-version directory only after the checks in the plan. Nothing in this file changes those checks.
 
+### 5.3 Several daemons of one wire
+
+Since the 1.0 decision D2 (`DESIGN.md` §5.3), each build of fil runs its own daemon, so a host can have several daemons of one wire at once: one per installed version that a client has used, each with its own socket (`fil-<major>-<rev>-v<ver>.sock`) and its own build lock (`fil-<major>-<rev>-v<ver>.lock`). They keep §6.4.4's signs of life as written, which this section explains; it changes nothing in §6.
+
+- **The wire lock is shared, not taken in turn** (owner, 2026-11-14). The first daemon of a wire opens `fil-<major>-<rev>.lock` and takes the exclusive `flock`; every later daemon of the wire is handed that daemon's open file description over a Unix socket in the socket directory (`SCM_RIGHTS`), so every daemon of the wire holds the one exclusive lock for its whole life, and the lock is held without a gap from the first daemon's start to the last one's exit. §6.3's probe finds it held at every instant in between, and the file at the path is the same one throughout. No daemon ever unlocks it; each only closes its descriptor when it exits.
+- **The start lock** is still the wire's (`fil-<major>-<rev>.start`): a relay holds it while it starts a daemon of the wire, of any build, so GC's rule 2.3 covers a daemon that is starting.
+- **The files stay while any daemon of the wire runs.** An exiting daemon removes the wire's lock and start files only when no daemon of another build of the wire holds its build lock, decided under the start lock; a starting daemon takes its build lock before it borrows the wire lock, so one that is borrowing counts.
+- **Each daemon refreshes its own install directory** (§6.4.4's second sign of life), from its own executable, as before: several daemons of one wire keep several version directories fresh.
+- **A daemon from before D2** holds the wire lock on its own descriptor and has no lending socket, so a D2 daemon of the same wire does not start beside it (the relay connects to the old daemon instead), and the lock stays held by one process, as before.
+
+The rejected alternatives were handing the lock over when a daemon exits (a forced pass could probe in the moment between the release and the takeover) and a new install root (§6.4.5; it gives up the promise to older copies).
+
 ## 6. FROZEN: the `--install-gc` contract
 
 `fil server --install-gc` (the `remove` mode of the bootstrap, `fil install --remove HOST`) and the collection that `fil server --install-finish` runs after an install both select what to remove with **one** function, which implements this section. This section fixes what any copy of fil, now or later, may rely on when it judges another copy's directories. 0.1.0 is the only release whose rules every later copy has to honor, so a keep reason that 0.1.0 lacks can never be relied on later. That is why §6.3 has a "recently used" rule.

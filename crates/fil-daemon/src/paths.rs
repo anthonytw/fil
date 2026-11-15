@@ -1,21 +1,29 @@
 //! Where the daemon lives on disk, and the checks that make that safe (DESIGN.md section 5.3).
 //!
 //! ```text
-//! /tmp/fil-$UID/             mode 0700, owned by us (refused otherwise)
-//!     fil-<major>-<rev>.sock  the daemon's Unix socket (mode 0600)
-//!     fil-<major>-<rev>.lock  held (flock) by the running daemon for its whole life; holds its pid
-//!     fil-<major>-<rev>.start the start lock: held for a moment by a relay that is starting
-//!                             the daemon; the empty file stays until the daemon exits
-//!     a-<major>-<rev>/        mode 0700: the sessions' agent sockets (`<session>.sock`, 0600),
-//!                             removed at a clean exit when empty
+//! /tmp/fil-$UID/                   mode 0700, owned by us (refused otherwise)
+//!     fil-<major>-<rev>-v<ver>.sock  a daemon's Unix socket (mode 0600), one per build
+//!     fil-<major>-<rev>-v<ver>.lock  held (flock) by that build's daemon for its whole life; its pid
+//!     fil-<major>-<rev>-v<ver>.lend  that daemon's lending socket (mode 0600): it hands the wire
+//!                                    lock to a daemon of another build of the wire (`crate::lend`)
+//!     fil-<major>-<rev>.lock         the wire lock: held (flock) for as long as any daemon of the
+//!                                    wire runs, every daemon of the wire sharing one open file
+//!                                    (docs/m4/release.md section 6.4.4)
+//!     fil-<major>-<rev>.start        the start lock: held for a moment by a relay that is starting
+//!                                    a daemon of the wire; the empty file stays until the last
+//!                                    daemon of the wire exits
+//!     a-<hash>/                      mode 0700: one build's agent sockets (`<session>.sock`,
+//!                                    0600), removed at a clean exit when empty
 //! ~/.config/fil/daemon.toml  optional configuration (see [`crate::DaemonConfig`])
 //! ~/.local/state/fil/daemon.log
 //! ```
 //!
-//! `<rev>` is the wire revision (`fil_proto::limits::PROTOCOL_REVISION`): a new build starts its own
-//! daemon next to the old build's, which keeps serving the sessions it has. The names hold two
-//! numbers and nothing else: no session name, no host name. A daemon from before revisions used
-//! `fil-<major>.sock` (and `.lock`, `.start`); it is found, never started.
+//! `<rev>` is the wire revision (`fil_proto::limits::PROTOCOL_REVISION`) and `<ver>` the build's
+//! package version: a new build starts its own daemon next to the old build's, which keeps
+//! serving the sessions it has, whether or not the two share a wire. The names hold the wire's two
+//! numbers and the version, and nothing else: no session name, no host name. A daemon from before
+//! builds were keyed used `fil-<major>-<rev>.sock` (and one from before revisions
+//! `fil-<major>.sock`); it is found, never started.
 //!
 //! The directory is deliberately not under `$XDG_RUNTIME_DIR`: systemd-logind removes that
 //! directory when the user's last login ends, which would strand a live daemon.
@@ -79,7 +87,92 @@ fn socket_dir_override() -> Option<PathBuf> {
     None
 }
 
-/// Every path the daemon, the relay and the launcher need, for one protocol major and wire revision.
+/// The environment variable that overrides this process's build version ([`build_version`]),
+/// in builds with the `test-hooks` feature. A release build does not read it at all.
+pub const TEST_VERSION_ENV: &str = "FIL_TEST_VERSION";
+
+/// The longest build version a daemon's file names carry: the socket path must fit
+/// `sockaddr_un` ([`MAX_SOCKET_PATH`]) with a 10-digit uid and a 5-digit major and revision.
+pub const MAX_NAME_VERSION: usize = 32;
+
+/// This build's package version, as the daemon's file names carry it: `CARGO_PKG_VERSION`,
+/// except that a build with the `test-hooks` feature takes `FIL_TEST_VERSION` when it is set to a
+/// version the names allow, so a test can run several builds' daemons from one checkout.
+pub fn build_version() -> String {
+    #[cfg(feature = "test-hooks")]
+    if let Some(v) = std::env::var(TEST_VERSION_ENV)
+        .ok()
+        .filter(|v| version_ok(v))
+    {
+        return v;
+    }
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+const _: () = assert!(
+    env!("CARGO_PKG_VERSION").len() <= MAX_NAME_VERSION,
+    "the package version must fit the daemon's file names"
+);
+
+/// Whether `ver` can be in a daemon's file names: the install directory's version pattern
+/// (`docs/m4/release.md` section 6.2: a leading digit, `[0-9A-Za-z.-]`, no `+`), at most
+/// [`MAX_NAME_VERSION`] bytes.
+pub fn version_ok(ver: &str) -> bool {
+    ver.len() <= MAX_NAME_VERSION && fil_transport::pipe::PipeCommand::install_version_ok(ver)
+}
+
+/// Orders two build versions as semantic versions: the dot-separated core part by part, then a
+/// pre-release (after the first `-`) before the same core without one, its dot-separated
+/// identifiers compared the same way. A part that is all digits compares as a number and comes
+/// before one that is not; two that are not compare as text. Never equal for two different
+/// strings (the whole text breaks a tie, `1.0` against `1.0.0`), so "the newest" is one build.
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn part(a: &str, b: &str) -> Ordering {
+        let num = |s: &str| {
+            (!s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+                .then(|| s.trim_start_matches('0').to_string())
+        };
+        match (num(a), num(b)) {
+            (Some(x), Some(y)) => x.len().cmp(&y.len()).then_with(|| x.cmp(&y)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.cmp(b),
+        }
+    }
+    fn dotted(a: &str, b: &str) -> Ordering {
+        let (mut x, mut y) = (a.split('.'), b.split('.'));
+        loop {
+            match (x.next(), y.next()) {
+                (Some(p), Some(q)) => match part(p, q) {
+                    Ordering::Equal => {}
+                    o => return o,
+                },
+                (Some(_), None) => return Ordering::Greater,
+                (None, Some(_)) => return Ordering::Less,
+                (None, None) => return Ordering::Equal,
+            }
+        }
+    }
+    let split = |v: &'_ str| -> (String, Option<String>) {
+        match v.split_once('-') {
+            Some((c, p)) => (c.to_string(), Some(p.to_string())),
+            None => (v.to_string(), None),
+        }
+    };
+    let ((core_a, pre_a), (core_b, pre_b)) = (split(a), split(b));
+    dotted(&core_a, &core_b)
+        .then_with(|| match (&pre_a, &pre_b) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(p), Some(q)) => dotted(p, q),
+        })
+        .then_with(|| a.cmp(b))
+}
+
+/// Every path the daemon, the relay and the launcher need, for one protocol major, wire revision
+/// and build.
 #[derive(Clone, Debug)]
 pub struct Paths {
     /// The socket directory (`/tmp/fil-$UID`).
@@ -89,6 +182,10 @@ pub struct Paths {
     /// The wire revision in the file names, and the one the daemon speaks. Daemons of different
     /// revisions run side by side.
     pub revision: u16,
+    /// The build's package version, in the names of the build's own files ([`build_version`]).
+    /// Daemons of different builds of one wire run side by side and share the wire lock
+    /// ([`Paths::lock`]).
+    pub version: String,
     /// The optional configuration file.
     pub config: PathBuf,
     /// The daemon's log.
@@ -111,6 +208,7 @@ impl Paths {
             dir,
             major: PROTOCOL_MAJOR,
             revision: wire_revision(),
+            version: build_version(),
             config,
             log,
         }
@@ -123,6 +221,7 @@ impl Paths {
         Paths {
             major: PROTOCOL_MAJOR,
             revision: wire_revision(),
+            version: build_version(),
             config: dir.join("daemon.toml"),
             log: dir.join("daemon.log"),
             dir,
@@ -143,14 +242,36 @@ impl Paths {
         self
     }
 
-    /// `fil-<major>-<rev>.sock`.
-    pub fn socket(&self) -> PathBuf {
-        self.file("sock")
+    /// The same locations for another build of the wire (a daemon of another version, side by
+    /// side with this one). `version` should pass [`version_ok`]: the names are built from it.
+    pub fn with_version(mut self, version: impl Into<String>) -> Paths {
+        self.version = version.into();
+        self
     }
 
-    /// The socket of the daemon of wire `major`/`revision` in this directory, whichever it is:
-    /// `fil-<major>-<rev>.sock`, or the pre-revision `fil-<major>.sock` for revision 0. Numbers
-    /// only, so a client's claim of a wire cannot name any other path.
+    /// `fil-<major>-<rev>-v<ver>.sock`: this build's socket.
+    pub fn socket(&self) -> PathBuf {
+        self.build_file("sock")
+    }
+
+    /// `fil-<major>-<rev>-v<ver>.lock`: held by this build's daemon for its whole life (it holds
+    /// its pid). Only its holder binds the build's socket and lending socket: it is what makes one
+    /// daemon of a build.
+    pub fn build_lock(&self) -> PathBuf {
+        self.build_file("lock")
+    }
+
+    /// `fil-<major>-<rev>-v<ver>.lend`: this build's lending socket, on which its daemon hands
+    /// the wire lock ([`Paths::lock`]) to a daemon of another build of the wire ([`crate::lend`]).
+    pub fn lend(&self) -> PathBuf {
+        self.build_file("lend")
+    }
+
+    /// The socket of a daemon of wire `major`/`revision` from before daemons were keyed by build
+    /// (then the one daemon of its wire): `fil-<major>-<rev>.sock`, or the pre-revision
+    /// `fil-<major>.sock` for revision 0. Numbers only, so a client's claim of a wire cannot name
+    /// any other path. Such a daemon holds the wire lock on a file of its own and lends nothing,
+    /// so no daemon of the keyed kind can start beside it: a relay connects to it instead.
     pub fn socket_of(&self, major: u16, revision: u16) -> PathBuf {
         if revision == 0 {
             self.dir.join(format!("fil-{major}.sock"))
@@ -159,21 +280,28 @@ impl Paths {
         }
     }
 
-    /// `a-<major>-<rev>/<session>.sock`: the session's stable `SSH_AUTH_SOCK` (DESIGN.md section
-    /// 10). The session creates and checks the directory (mode 0700) when a client first relays
-    /// its agent. The wire revision is in it, as in the daemon's socket, so daemons of two builds
-    /// with a session of the same name (an upgrade, side by side: `main` in both) each have their
-    /// own; a session never moves to another daemon, so its path stays the same for its life. The
-    /// directory's name is short so the longest path fits `sockaddr_un`: a 10-digit uid, a
-    /// 64-byte session name and a revision up to 9999 make 98 bytes.
+    /// `a-<hash>/<session>.sock`: the session's stable `SSH_AUTH_SOCK` (DESIGN.md section 10).
+    /// The session creates and checks the directory (mode 0700) when a client first relays its
+    /// agent. The directory is the build's own, as its socket is, so daemons of two builds with a
+    /// session of the same name (an upgrade, side by side: `main` in both) each have their own; a
+    /// session never moves to another daemon, so its path stays the same for its life. The
+    /// directory's name is short so the longest path fits `sockaddr_un`: a 10-digit uid and a
+    /// 64-byte session name make 100 bytes.
     pub fn agent_socket(&self, session: &fil_proto::msg::SessionName) -> PathBuf {
         self.agent_dir().join(format!("{session}.sock"))
     }
 
-    /// `a-<major>-<rev>/`: this revision's agent sockets ([`Paths::agent_socket`]). Only the
-    /// daemon of this revision, which holds its lock, puts sockets in it.
+    /// `a-<hash>/`: this build's agent sockets ([`Paths::agent_socket`]). `<hash>` is the 32-bit
+    /// FNV-1a of `<major>-<rev>-<ver>` in eight hex digits, because the version itself does not
+    /// fit the longest agent socket path. Only the daemon of this build, which holds its build
+    /// lock, puts sockets in it.
     pub fn agent_dir(&self) -> PathBuf {
-        self.dir.join(format!("a-{}-{}", self.major, self.revision))
+        let mut h: u32 = 0x811c_9dc5;
+        for b in format!("{}-{}-{}", self.major, self.revision, self.version).bytes() {
+            h ^= u32::from(b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        self.dir.join(format!("a-{h:08x}"))
     }
 
     /// At start, holding the daemon lock: removes the agent sockets a crashed daemon of this
@@ -221,22 +349,26 @@ impl Paths {
         agent_dir_is_ours(&dir) && std::fs::remove_dir(&dir).is_ok()
     }
 
-    /// `fil-<major>-<rev>.lock`: held by the running daemon.
+    /// `fil-<major>-<rev>.lock`: the wire lock, held by every running daemon of the wire for its
+    /// whole life (docs/m4/release.md section 6.4.4, FROZEN). The first daemon of the wire opens
+    /// and locks it; every later one is handed an open descriptor of that very file, already
+    /// locked, over a lending socket ([`crate::lend`]), so all of them hold the one exclusive lock
+    /// and it is held from the first start to the last exit.
     pub fn lock(&self) -> PathBuf {
         self.file("lock")
     }
 
-    /// `fil-<major>-<rev>.start`: held by a relay that is starting the daemon.
+    /// `fil-<major>-<rev>.start`: held by a relay that is starting a daemon of the wire.
     pub fn start_lock(&self) -> PathBuf {
         self.file("start")
     }
 
-    /// `fil-<major>-<rev>.claim`: held only by a daemon that lost its lock file to a successor
-    /// and waits to take the path back (DESIGN.md section 5.3). While it is held, a relay
-    /// starts no daemon of this revision and a daemon that starts steps aside, so the lock goes
+    /// `fil-<major>-<rev>-v<ver>.claim`: held only by a daemon that lost its build lock file to a
+    /// successor and waits to take the path back (DESIGN.md section 5.3). While it is held, a
+    /// relay starts no daemon of this build and a daemon that starts steps aside, so the lock goes
     /// to the waiting daemon when the successor exits.
     pub fn claim(&self) -> PathBuf {
-        self.file("claim")
+        self.build_file("claim")
     }
 
     fn file(&self, ext: &str) -> PathBuf {
@@ -244,14 +376,21 @@ impl Paths {
             .join(format!("fil-{}-{}.{ext}", self.major, self.revision))
     }
 
-    /// Checks the socket path fits in `sockaddr_un`, with a message that says so.
+    fn build_file(&self, ext: &str) -> PathBuf {
+        self.dir.join(format!(
+            "fil-{}-{}-v{}.{ext}",
+            self.major, self.revision, self.version
+        ))
+    }
+
+    /// Checks the socket paths (the socket and the lending socket) fit in `sockaddr_un`, with a
+    /// message that says so.
     pub fn check_socket_len(&self) -> Result<(), DirError> {
-        let len = self.socket().as_os_str().as_bytes().len();
-        if len > MAX_SOCKET_PATH {
-            return Err(DirError::PathTooLong {
-                path: self.socket(),
-                len,
-            });
+        for path in [self.socket(), self.lend()] {
+            let len = path.as_os_str().as_bytes().len();
+            if len > MAX_SOCKET_PATH {
+                return Err(DirError::PathTooLong { path, len });
+            }
         }
         Ok(())
     }
@@ -314,11 +453,12 @@ impl Paths {
 
     /// Sets the access and modification times of everything this daemon keeps in the socket
     /// directory to now, which also renews the change time (a cleaner looks at all three, and
-    /// the change time cannot be set back by anyone): the directory, the socket, the lock and
-    /// start files, and the agent directory with its sockets, when they pass the same checks as
-    /// at start (a claim file is kept by the daemon that holds it, through its own descriptor).
-    /// Only this daemon's own revision: the leftovers of a crashed daemon of another
-    /// are not kept alive, so they still age out. A link is never followed. Returns how many
+    /// the change time cannot be set back by anyone): the directory, the socket and the lending
+    /// socket, the build lock, the wire's lock and start files, and the agent directory with its
+    /// sockets, when they pass the same checks as at start (a claim file is kept by the daemon
+    /// that holds it, through its own descriptor). Only this daemon's own build and wire: the
+    /// leftovers of a crashed daemon of another are not kept alive, so they still age out. (Every
+    /// daemon of the wire refreshes the wire's two files.) A link is never followed. Returns how many
     /// entries were touched; one that is missing or not ours is skipped.
     pub fn refresh_times(&self) -> usize {
         use rustix::fs::{AtFlags, CWD, Timestamps, UTIME_NOW, utimensat};
@@ -335,6 +475,8 @@ impl Paths {
         for p in [
             self.dir.clone(),
             self.socket(),
+            self.lend(),
+            self.build_lock(),
             self.lock(),
             self.start_lock(),
         ] {
@@ -612,11 +754,19 @@ pub struct DaemonSocket {
     pub path: PathBuf,
 }
 
-/// The daemon sockets in `dir`, of every major and revision: `fil-<major>-<rev>.sock` and the
-/// older `fil-<major>.sock`. The directory is not created; a missing one gives an empty list. A
-/// socket may be a crashed daemon's: see [`other_daemons`] for the ones that are alive.
+/// The daemon sockets in `dir`, of every major, revision and build: `fil-<major>-<rev>-v<ver>.sock`
+/// and the older `fil-<major>-<rev>.sock` and `fil-<major>.sock`, sorted by wire. The directory
+/// is not created; a missing one gives an empty list. A socket may be a crashed daemon's: see
+/// [`running_daemons`] for the ones that are alive, with their builds.
 pub fn list_sockets(dir: &Path) -> Vec<DaemonSocket> {
-    list_named(dir, "sock")
+    let mut out = list_named(dir, "sock");
+    out.extend(list_builds(dir, "sock").into_iter().map(|b| DaemonSocket {
+        major: b.major,
+        revision: b.revision,
+        path: b.path,
+    }));
+    out.sort();
+    out
 }
 
 /// The entries of `dir` named `fil-<major>-<rev>.<ext>` or `fil-<major>.<ext>`, sorted, with
@@ -656,6 +806,169 @@ fn parse_daemon_name(name: &OsStr, ext: &str) -> Option<(u16, u16)> {
         Some((major, rev)) => Some((number(major)?, number(rev)?)),
         None => Some((number(stem)?, 0)),
     }
+}
+
+/// A file in the socket directory named for a daemon's build: `fil-<major>-<rev>-v<ver>.<ext>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildFile {
+    pub major: u16,
+    pub revision: u16,
+    pub version: String,
+    /// The entry's own path.
+    pub path: PathBuf,
+}
+
+/// `(major, revision, version)` from a name `fil-<major>-<rev>-v<ver>.<ext>`, with `<ver>` a
+/// version the names allow ([`version_ok`]). The revision is digits, so the first `-v` after it
+/// ends it, whatever the version holds.
+fn parse_build_name(name: &OsStr, ext: &str) -> Option<(u16, u16, String)> {
+    let stem = name
+        .to_str()?
+        .strip_prefix("fil-")?
+        .strip_suffix(ext)?
+        .strip_suffix('.')?;
+    let (major, rest) = stem.split_once('-')?;
+    let (rev, ver) = rest.split_once("-v")?;
+    let number = |s: &str| {
+        if s.is_empty() || s.len() > 5 || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse::<u16>().ok()
+    };
+    let (major, rev) = (number(major)?, number(rev)?);
+    version_ok(ver).then(|| (major, rev, ver.to_string()))
+}
+
+/// The entries of `dir` named `fil-<major>-<rev>-v<ver>.<ext>`, of every wire and build. The
+/// directory is not created; a missing one gives an empty list.
+pub fn list_builds(dir: &Path, ext: &str) -> Vec<BuildFile> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.filter_map(Result::ok)
+        .filter_map(|e| {
+            let (major, revision, version) = parse_build_name(&e.file_name(), ext)?;
+            Some(BuildFile {
+                major,
+                revision,
+                version,
+                path: e.path(),
+            })
+        })
+        .collect()
+}
+
+/// A daemon running on this host, as the socket directory shows it: what a client running here
+/// (or the relay) can reach, and which build it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningDaemon {
+    pub major: u16,
+    pub revision: u16,
+    /// The build's version, from its file names; none for a daemon from before daemons were keyed
+    /// by build (its socket is `fil-<major>-<rev>.sock` or `fil-<major>.sock`).
+    pub version: Option<String>,
+    /// Its socket.
+    pub socket: PathBuf,
+}
+
+/// The running daemons in `dir`, of every wire and build, by wire and then newest build first.
+/// A daemon keyed by its build is running while it holds its build lock (a crashed one's
+/// leftover socket is not listed, and a live one whose socket was just removed is: it binds it
+/// again within [`Keeping::check`]). A daemon from before that is listed when its wire lock is
+/// held, its socket is there and no daemon keyed by build runs on its wire (it holds the wire
+/// lock alone, so none can). Probes only (see [`lock_is_held`]): nothing is created, removed or
+/// connected to.
+pub fn running_daemons(dir: &Path) -> Vec<RunningDaemon> {
+    let mut out: Vec<RunningDaemon> = list_builds(dir, "lock")
+        .into_iter()
+        .filter(|b| lock_is_held(&b.path))
+        .map(|b| RunningDaemon {
+            socket: Paths::in_dir(dir)
+                .with_major(b.major)
+                .with_revision(b.revision)
+                .with_version(b.version.clone())
+                .socket(),
+            major: b.major,
+            revision: b.revision,
+            version: Some(b.version),
+        })
+        .collect();
+    for legacy in list_named(dir, "sock") {
+        let wire = (legacy.major, legacy.revision);
+        if out.iter().any(|d| (d.major, d.revision) == wire)
+            || !std::fs::symlink_metadata(&legacy.path).is_ok_and(|m| m.file_type().is_socket())
+        {
+            continue;
+        }
+        if lock_is_held(&legacy.path.with_extension("lock")) {
+            out.push(RunningDaemon {
+                major: legacy.major,
+                revision: legacy.revision,
+                version: None,
+                socket: legacy.path,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        (a.major, a.revision)
+            .cmp(&(b.major, b.revision))
+            .then_with(|| match (&a.version, &b.version) {
+                (Some(x), Some(y)) => compare_versions(y, x),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+    });
+    out
+}
+
+/// The sockets a connection of wire `major`/`revision` may go to, in the order to try them: the
+/// running daemons of the wire keyed by build, newest first ([`running_daemons`]), then the
+/// socket of a daemon from before ([`Paths::socket_of`]), which is tried even when no lock shows
+/// it (only a connect tells a live one from a leftover, and a leftover refuses at once).
+pub fn sockets_of_wire(dir: &Path, major: u16, revision: u16) -> Vec<(Option<String>, PathBuf)> {
+    let mut out: Vec<(Option<String>, PathBuf)> = running_daemons(dir)
+        .into_iter()
+        .filter(|d| (d.major, d.revision) == (major, revision) && d.version.is_some())
+        .map(|d| (d.version, d.socket))
+        .collect();
+    out.push((None, Paths::in_dir(dir).socket_of(major, revision)));
+    out
+}
+
+/// Whether a daemon of a newer build of this wire is running: then this one is superseded (new
+/// sessions go to the newest daemon of a wire), and exits as soon as it has no session and no
+/// connection, without waiting for the idle time.
+pub fn superseded(paths: &Paths) -> bool {
+    list_builds(&paths.dir, "lock").into_iter().any(|b| {
+        (b.major, b.revision) == (paths.major, paths.revision)
+            && compare_versions(&b.version, &paths.version) == std::cmp::Ordering::Greater
+            && lock_is_held(&b.path)
+    })
+}
+
+/// Whether a daemon of another build of this wire holds its build lock: the wire lock and its
+/// start file are then still that daemon's, and an exiting daemon leaves them.
+pub(crate) fn other_build_of_wire_alive(paths: &Paths) -> bool {
+    list_builds(&paths.dir, "lock").into_iter().any(|b| {
+        (b.major, b.revision) == (paths.major, paths.revision)
+            && b.version != paths.version
+            && lock_is_held(&b.path)
+    })
+}
+
+/// The lending sockets of the other builds of this wire: where a starting daemon asks for the
+/// wire lock ([`crate::lend`]). Newest build first (a newer daemon is likelier to outlive the
+/// handoff); a leftover of a crashed daemon refuses the connection and is skipped.
+pub(crate) fn lenders(paths: &Paths) -> Vec<PathBuf> {
+    let mut l: Vec<BuildFile> = list_builds(&paths.dir, "lend")
+        .into_iter()
+        .filter(|b| {
+            (b.major, b.revision) == (paths.major, paths.revision) && b.version != paths.version
+        })
+        .collect();
+    l.sort_by(|a, b| compare_versions(&b.version, &a.version));
+    l.into_iter().map(|b| b.path).collect()
 }
 
 /// Whether the daemon with this lock file is running: it holds the lock for its whole life. A
@@ -769,26 +1082,44 @@ pub(crate) mod tests {
         }
     }
 
-    /// The agent socket of the longest session name and uid still fits a socket path, up to
-    /// revision 9999; and two revisions never share one.
+    /// The agent socket of the longest session name and uid still fits a socket path, whatever
+    /// the wire and version; and two revisions, or two builds of one wire, never share one.
     #[test]
-    fn the_agent_socket_path_fits_and_is_the_revisions_own() {
+    fn the_agent_socket_path_fits_and_is_the_builds_own() {
         let p = Paths::in_dir(format!("/tmp/fil-{}", u32::MAX));
         let name: fil_proto::msg::SessionName = "x".repeat(64).parse().unwrap();
-        let sock = p.clone().with_revision(9999).agent_socket(&name);
-        assert!(
-            sock.as_os_str().len() <= MAX_SOCKET_PATH,
+        let sock = p
+            .clone()
+            .with_major(u16::MAX)
+            .with_revision(u16::MAX)
+            .with_version("9".repeat(MAX_NAME_VERSION))
+            .agent_socket(&name);
+        assert_eq!(
+            sock.as_os_str().len(),
+            MAX_SOCKET_PATH,
             "{}",
             sock.display()
         );
-        assert_eq!(sock.as_os_str().len(), 98);
         let main: fil_proto::msg::SessionName = "main".parse().unwrap();
-        let (a, b) = (
+        let (a, b, c) = (
             p.clone().with_revision(6).agent_socket(&main),
             p.clone().with_revision(7).agent_socket(&main),
+            p.clone()
+                .with_revision(6)
+                .with_version("0.0.1")
+                .agent_socket(&main),
         );
         assert_ne!(a.parent(), b.parent());
-        assert_eq!(a, p.dir.join(format!("a-{PROTOCOL_MAJOR}-6/main.sock")));
+        assert_ne!(a.parent(), c.parent());
+        // FNV-1a of "1-6-0.0.1", pinned so the name cannot drift between builds of one version.
+        assert_eq!(
+            p.clone()
+                .with_major(1)
+                .with_revision(6)
+                .with_version("0.0.1")
+                .agent_dir(),
+            p.dir.join("a-b30bb485")
+        );
     }
 
     #[test]
@@ -1197,9 +1528,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn file_names_carry_the_major() {
-        let p = Paths::in_dir("/tmp/x").with_major(7).with_revision(3);
-        assert_eq!(p.socket(), Path::new("/tmp/x/fil-7-3.sock"));
+    fn file_names_carry_the_major_the_revision_and_the_build() {
+        let p = Paths::in_dir("/tmp/x")
+            .with_major(7)
+            .with_revision(3)
+            .with_version("1.2.0-rc.1");
+        assert_eq!(p.socket(), Path::new("/tmp/x/fil-7-3-v1.2.0-rc.1.sock"));
+        assert_eq!(p.build_lock(), Path::new("/tmp/x/fil-7-3-v1.2.0-rc.1.lock"));
+        assert_eq!(p.lend(), Path::new("/tmp/x/fil-7-3-v1.2.0-rc.1.lend"));
+        assert_eq!(p.claim(), Path::new("/tmp/x/fil-7-3-v1.2.0-rc.1.claim"));
+        // The wire's own files carry the wire only (docs/m4/release.md section 6.2, FROZEN).
         assert_eq!(p.lock(), Path::new("/tmp/x/fil-7-3.lock"));
         assert_eq!(p.start_lock(), Path::new("/tmp/x/fil-7-3.start"));
         // The same major at another revision shares no file.
@@ -1207,11 +1545,152 @@ pub(crate) mod tests {
         assert_ne!(p.socket(), q.socket());
         assert_ne!(p.lock(), q.lock());
         assert_ne!(p.start_lock(), q.start_lock());
+        // Another build of the same wire shares the wire's files and nothing else.
+        let r = p.clone().with_version("1.2.0");
+        assert_ne!(p.socket(), r.socket());
+        assert_ne!(p.build_lock(), r.build_lock());
+        assert_ne!(p.lend(), r.lend());
+        assert_ne!(p.claim(), r.claim());
+        assert_eq!(p.lock(), r.lock());
+        assert_eq!(p.start_lock(), r.start_lock());
         assert!(p.check_socket_len().is_ok());
         let long = Paths::in_dir(format!("/tmp/{}", "a".repeat(120)));
         assert!(matches!(
             long.check_socket_len(),
             Err(DirError::PathTooLong { .. })
         ));
+        // The longest uid, wire and version fit.
+        let widest = Paths::in_dir(format!("/tmp/fil-{}", u32::MAX))
+            .with_major(u16::MAX)
+            .with_revision(u16::MAX)
+            .with_version("9".repeat(MAX_NAME_VERSION));
+        assert!(widest.check_socket_len().is_ok());
+    }
+
+    #[test]
+    fn build_names_parse_back() {
+        let ok = |s: &str| parse_build_name(OsStr::new(s), "sock");
+        assert_eq!(ok("fil-1-13-v0.3.0.sock"), Some((1, 13, "0.3.0".into())));
+        assert_eq!(
+            ok("fil-1-13-v1.0.0-rc.1.sock"),
+            Some((1, 13, "1.0.0-rc.1".into()))
+        );
+        // A version may hold `-v`: the revision's digits end at the first one.
+        assert_eq!(ok("fil-1-13-v1.0-v2.sock"), Some((1, 13, "1.0-v2".into())));
+        assert_eq!(ok("fil-1-13.sock"), None, "a daemon from before builds");
+        assert_eq!(ok("fil-1-13-v.sock"), None);
+        assert_eq!(
+            ok("fil-1-13-vx.sock"),
+            None,
+            "a version starts with a digit"
+        );
+        assert_eq!(ok("fil-1-13-v0.3+b.sock"), None);
+        assert_eq!(ok("fil-1-x-v0.3.0.sock"), None);
+        assert_eq!(ok("fil-1-13-v0.3.0.lock"), None);
+        assert_eq!(
+            ok(&format!(
+                "fil-1-13-v{}.sock",
+                "1".repeat(MAX_NAME_VERSION + 1)
+            )),
+            None
+        );
+        // And the two-number parser never takes a build's name for a wire's.
+        assert_eq!(
+            parse_daemon_name(OsStr::new("fil-1-13-v0.3.0.sock"), "sock"),
+            None
+        );
+        assert_eq!(
+            parse_daemon_name(OsStr::new("fil-1-13-v0.3.0.lock"), "lock"),
+            None
+        );
+    }
+
+    #[test]
+    fn versions_order_as_semantic_versions() {
+        use std::cmp::Ordering::{Greater, Less};
+        let order = [
+            "0.2.9",
+            "0.3.0-alpha",
+            "0.3.0-alpha.1",
+            "0.3.0-alpha.beta",
+            "0.3.0-beta.2",
+            "0.3.0-beta.11",
+            "0.3.0-rc.1",
+            "0.3.0",
+            "0.3.1",
+            "0.10.0",
+            "1.0.0",
+        ];
+        for w in order.windows(2) {
+            assert_eq!(compare_versions(w[0], w[1]), Less, "{} < {}", w[0], w[1]);
+            assert_eq!(compare_versions(w[1], w[0]), Greater, "{} > {}", w[1], w[0]);
+        }
+        assert_eq!(
+            compare_versions("1.0.0", "1.0.0"),
+            std::cmp::Ordering::Equal
+        );
+        // Different strings are never equal, so the newest is one build.
+        assert_ne!(compare_versions("1.0", "1.0.0"), std::cmp::Ordering::Equal);
+        assert_ne!(compare_versions("01.0", "1.0"), std::cmp::Ordering::Equal);
+    }
+
+    /// The running daemons are found by their build locks (a crashed one's socket is not one),
+    /// newest first within a wire, and one from before builds were keyed by its wire lock and
+    /// socket, but only when no keyed daemon runs on its wire.
+    #[test]
+    fn running_daemons_and_superseded() {
+        use rustix::fs::{FlockOperation, flock};
+        use std::os::unix::fs::DirBuilderExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("s");
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let p = Paths::in_dir(&dir).with_major(1).with_revision(20);
+        let held = |path: PathBuf| {
+            let f = File::create(path).unwrap();
+            flock(&f, FlockOperation::NonBlockingLockExclusive).unwrap();
+            f
+        };
+        let old = p.clone().with_version("0.9.0");
+        let new = p.clone().with_version("0.10.0");
+        let _a = held(old.build_lock());
+        let _b = held(new.build_lock());
+        // A crashed build: its lock file nobody holds.
+        std::fs::write(p.clone().with_version("0.11.0").build_lock(), "1\n").unwrap();
+        // A daemon of wire 1.19 from before builds were keyed: its socket and wire lock.
+        let legacy = p.clone().with_revision(19);
+        let _l = held(legacy.lock());
+        let _ls = std::os::unix::net::UnixListener::bind(legacy.socket_of(1, 19)).unwrap();
+        // A leftover legacy socket of wire 1.20, whose wire the keyed daemons hold.
+        dead_socket(&p.socket_of(1, 20));
+        let found: Vec<(u16, Option<String>)> = running_daemons(&dir)
+            .into_iter()
+            .map(|d| (d.revision, d.version))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (19, None),
+                (20, Some("0.10.0".into())),
+                (20, Some("0.9.0".into()))
+            ]
+        );
+        let socks: Vec<PathBuf> = sockets_of_wire(&dir, 1, 20)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(socks, [new.socket(), old.socket(), p.socket_of(1, 20)]);
+        assert!(superseded(&old));
+        assert!(!superseded(&new));
+        assert!(other_build_of_wire_alive(&new));
+        std::fs::write(new.lend(), "").unwrap();
+        assert_eq!(lenders(&old), [new.lend()]);
+        assert!(lenders(&new).is_empty(), "only other builds lend");
+        drop(_a);
+        // Another test's `fork` (before its `exec` closes the copy) can hold it for a moment.
+        fil_testkit::wait_until(
+            "the old build's lock is released",
+            fil_testkit::WAIT,
+            || !other_build_of_wire_alive(&new),
+        );
     }
 }

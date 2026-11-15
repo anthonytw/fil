@@ -48,12 +48,25 @@ async fn start_rev(s: &Scratch, revision: u16, script: &str) -> Running {
     }
 }
 
+/// `ListSessions` straight to `d`'s socket: a relay would send it to the newest daemon of the
+/// family, whichever answers.
 async fn list(d: &Running) -> (Vec<String>, Vec<OtherDaemon>) {
-    match ask(d, Request::ListSessions).await {
+    let link = d.direct_link().await;
+    let answer = request_rev(&link, Request::ListSessions, d.paths.revision).await;
+    link.close();
+    match answer {
         Response::Sessions { list, others, .. } => {
             (list.iter().map(|s| s.name.to_string()).collect(), others)
         }
         other => panic!("{other:?}"),
+    }
+}
+
+/// A daemon of this build's version at another revision, as `ListSessions` names it.
+fn other_build(revision: u16) -> OtherDaemon {
+    OtherDaemon {
+        version: Some(fil_proto::msg::FilVersion::ours()),
+        ..other(revision)
     }
 }
 
@@ -92,14 +105,15 @@ async fn daemons_of_two_revisions_run_side_by_side_and_each_lists_the_other() {
     // Each answers for itself and names the other. The new one cannot list the old one's session.
     let (old_list, old_others) = list(&old).await;
     assert_eq!(old_list, ["keep"]);
-    assert_eq!(old_others, [other(rev_new())]);
+    assert_eq!(old_others, [other_build(rev_new())]);
     let (new_list, new_others) = list(&new).await;
     assert!(new_list.is_empty(), "sessions are not shared: {new_list:?}");
-    assert_eq!(new_others, [other(rev_old())]);
+    assert_eq!(new_others, [other_build(rev_old())]);
 
-    // Each says its own revision in its Hello.
+    // Each says its own revision in its Hello (straight to its socket: a relay sends a 1.x
+    // client to the newest daemon of the family).
     for (d, rev) in [(&old, rev_old()), (&new, rev_new())] {
-        let link = d.pipe().await;
+        let link = d.direct_link().await;
         send_ctl(&link, &hello_rev(rev)).await;
         let (_, p) = tokio::time::timeout(WAIT, link.recv())
             .await
@@ -340,14 +354,21 @@ fn relay_options(paths: Paths) -> fil_daemon::RelayOptions {
     )
 }
 
-/// The in-place upgrade (DESIGN.md section 5.3): a client of the old wire is attached, the
-/// remote's `fil` is replaced by a newer build, and the client reconnects. The new relay must
-/// route it to the still-running old daemon, where its session is, and start nothing.
+/// The in-place upgrade (DESIGN.md section 5.3): a client of an older, incompatible wire (two
+/// pre-1.0 revisions: within the 1.x family every connection goes to the newest daemon instead)
+/// is attached, the remote's `fil` is replaced by a newer build, and the client reconnects. The
+/// new relay must route it to the still-running old daemon, where its session is, and start
+/// nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_old_wire_reaches_its_session_through_a_newer_relay() {
     let s = Scratch::new();
-    let old = start_rev(&s, rev_old(), CAT).await;
-    let mut first = Client::attach(old.pipe().await, Connect::new("work", key(1))).await;
+    let (old_rev, new_rev) = (rev_pre() - 1, rev_pre());
+    let old = start_rev(&s, old_rev, CAT).await;
+    let mut first = Client::attach(
+        old.pipe().await,
+        Connect::new("work", key(1)).revision(old_rev),
+    )
+    .await;
     first.wait_screen("ready").await;
     first.type_bytes(b"before the upgrade\n").await;
     first.wait_screen("before the upgrade").await;
@@ -356,9 +377,15 @@ async fn a_client_of_the_old_wire_reaches_its_session_through_a_newer_relay() {
     drop(first); // the pipe goes with the ssh connection; the session lives on
 
     // The remote is upgraded: ssh now runs the NEW relay. No new daemon exists yet.
-    let newer = s.paths().with_revision(rev_new());
+    let newer = s.paths().with_revision(new_rev);
     let link = pipe_through_relay(relay_options(newer.clone())).await;
-    let mut again = Client::attach(link, Connect::new("work", key(1)).resume(resume)).await;
+    let mut again = Client::attach(
+        link,
+        Connect::new("work", key(1))
+            .resume(resume)
+            .revision(old_rev),
+    )
+    .await;
     assert!(
         again.refused.is_none() && again.errors.is_empty(),
         "refused: {:?} {:?}",
@@ -380,7 +407,7 @@ async fn a_client_of_the_old_wire_reaches_its_session_through_a_newer_relay() {
     assert!(!newer.socket().exists() && !newer.lock().exists() && !newer.start_lock().exists());
     // And `fil ls` of the old wire (through the same new relay) lists the session.
     let list_link = pipe_through_relay(relay_options(newer)).await;
-    match request_rev(&list_link, Request::ListSessions, rev_old()).await {
+    match request_rev(&list_link, Request::ListSessions, old_rev).await {
         Response::Sessions { list, .. } => assert_eq!(list.len(), 1),
         other => panic!("{other:?}"),
     }

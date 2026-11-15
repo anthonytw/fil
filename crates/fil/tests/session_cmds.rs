@@ -421,14 +421,14 @@ fn forward_outside_a_session_needs_a_host() {
 
 // ---- the revision rule -------------------------------------------------------------------------
 
-/// The session's daemon is of another wire revision than this `fil` (the host's `fil` was
-/// upgraded while the session ran on): the in-session command says which side is newer and what
-/// to do, for all three commands, and starts nothing.
+/// The session's daemon is of another, incompatible wire revision than this `fil` (two pre-1.0
+/// revisions; the host's `fil` was upgraded while the session ran on): the in-session command
+/// says which side is newer and what to do, for all three commands, and starts nothing.
 #[test]
 fn in_session_commands_name_a_daemon_of_another_revision() {
     let w = World::new("rev");
-    let old = ours();
-    let new = old + 1;
+    let new = fil_proto::limits::FIRST_STABLE_REVISION - 1;
+    let old = new - 1;
     w.host("older", old);
     let _client = w.attach(old, "older", "work");
     let before = sock_names(&w.socks);
@@ -474,6 +474,21 @@ fn in_session_commands_name_a_daemon_of_another_revision() {
         "{}",
         out.stderr
     );
+}
+
+/// Within the 1.x family a newer `fil` inside a session of an older 1.x revision's daemon works
+/// with it: the two revisions talk, and the in-session command reaches that daemon.
+#[test]
+fn in_session_commands_reach_a_daemon_of_another_1x_revision() {
+    let w = World::new("rev1x");
+    let old = ours();
+    let new = old + 1;
+    w.host("older", old);
+    let _client = w.attach(old, "older", "work");
+    let before = sock_names(&w.socks);
+    let out = w.inside_as(new, "work", &["ports"]);
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert_eq!(sock_names(&w.socks), before, "it started no daemon");
 }
 
 /// The daemon of this revision runs, but the session is in a daemon of another: "no such

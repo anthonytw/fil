@@ -118,7 +118,7 @@ pub async fn connect_local_as(paths: &Paths, uid: u32) -> Result<PipeLink, Local
             let mut c: Vec<PathBuf> =
                 fil_daemon::paths::sockets_of_wire(&p.dir, p.major, p.revision)
                     .into_iter()
-                    .map(|(_, s)| s)
+                    .map(|d| d.socket)
                     .collect();
             if !c.contains(&p.socket()) {
                 let at = c.len().saturating_sub(1);

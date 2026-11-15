@@ -20,7 +20,7 @@ flowchart LR
 ## Listing and ending
 
 ```sh
-fil ls devbox                 # NAME, TERM, FORWARDS, ATTACHED, LAST OUTPUT, CREATED
+fil ls devbox                 # NAME, TERM, FORWARDS, ATTACHED, LAST OUTPUT, CREATED, FIL
 fil kill devbox build         # end "build"
 ```
 

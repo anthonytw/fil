@@ -14,14 +14,19 @@
 //! must not strand that session: it reads the client's first frames (the layout of the frame and
 //! of `Hello` is frozen, so any build can), and
 //!
-//! - **the client's wire is the relay's own:** the newest daemon of the wire (new sessions go
-//!   there): a running daemon of a newer build than the relay's, or one from before daemons were
-//!   keyed by build (`fil-<major>-<rev>.sock`, which holds the wire lock alone), and otherwise
-//!   the relay's own build's daemon, started if needed;
-//! - **another wire whose daemon is running** (the newest of `fil-<major>-<rev>-v<ver>.sock`,
+//! "Wire" here is the client's **family** ([`crate::paths::same_family`]): for a 1.x client every
+//! 1.x revision, which all work together (docs/v1/wire.md, decision 9); otherwise its one
+//! revision.
+//!
+//! - **the client's family is the relay's own:** the newest daemon of the family (new sessions go
+//!   there): a running daemon of a newer build than the relay's, of any revision of the family,
+//!   or one of the client's revision from before daemons were keyed by build
+//!   (`fil-<major>-<rev>.sock`, which holds the wire lock alone), and otherwise the relay's own
+//!   build's daemon, started if needed (so a 1.x relay never refuses a 1.x client);
+//! - **another family whose daemon is running** (the newest of `fil-<major>-<rev>-v<ver>.sock`,
 //!   then `fil-<major>-<rev>.sock`; revision 0 is the pre-revision `fil-<major>.sock`): connect
 //!   to it. Nothing is started;
-//! - **another wire with no daemon:** answer with this relay's `Hello` and
+//! - **another family with no daemon:** answer with this relay's `Hello` and
 //!   `Error(VersionMismatch)` and end, so the client can say which side is newer. Nothing is
 //!   started: a daemon of a wire nobody asked for would only idle.
 //!
@@ -432,12 +437,26 @@ where
     let rx = read_in_background(input);
     let (want, held, ended) = read_opening(&rx, &mut output, opts.hello_wait)?;
     let own = (opts.paths.major, opts.paths.revision);
+    let theirs = match want {
+        Want::Wire { major, revision } => (major, revision),
+        Want::Own | Want::Gone => own,
+    };
+    let newer_than_ours = |d: &crate::paths::RunningDaemon| match &d.version {
+        // A daemon of the client's revision from before daemons were keyed by build holds that
+        // revision's wire lock alone: none can start beside it, so it takes the connection.
+        None => true,
+        Some(v) => {
+            crate::paths::compare_builds((v, d.revision), (&opts.paths.version, own.1))
+                == std::cmp::Ordering::Greater
+        }
+    };
     let sock = match want {
         Want::Gone => return Ok(RelayEnd::PipeClosed),
-        Want::Wire { major, revision } if (major, revision) != own => {
-            // Another wire's client. The newest of its daemons that is running; never a new
-            // daemon of another wire. (The directory was checked above: a socket in someone
-            // else's directory is not to be trusted.)
+        Want::Wire { major, revision } if !crate::paths::same_family((major, revision), own) => {
+            // Another family's client (another major, or a revision from before 1.x that is not
+            // ours). The newest of its daemons that is running; never a new daemon of another
+            // wire. (The directory was checked above: a socket in someone else's directory is not
+            // to be trusted.)
             match connect_newest(&opts.paths, major, revision, |_| true) {
                 Some(s) => s,
                 None => {
@@ -446,18 +465,13 @@ where
                 }
             }
         }
-        // This wire: new sessions go to the newest daemon of the wire. One of a newer build than
-        // this relay's that is running takes the connection (an older `fil` on the host starts
-        // no daemon of its own beside it), as does a daemon of this wire from before daemons
-        // were keyed by build (it holds the wire lock alone: none can start beside it); otherwise
-        // this relay's own build's daemon, started if need be.
+        // This relay's family (its own revision, or for a 1.x relay any 1.x revision: they all
+        // work together, docs/v1/wire.md decision 9): new sessions go to the newest daemon of the
+        // family. One of a newer build than this relay's that is running takes the connection
+        // (an older `fil` on the host starts no daemon of its own beside it); otherwise this
+        // relay's own build's daemon, started if need be, whatever 1.x revision the client is.
         Want::Own | Want::Wire { .. }
-            if let Some(s) = connect_newest(&opts.paths, own.0, own.1, |v| {
-                v.is_none_or(|v| {
-                    crate::paths::compare_versions(v, &opts.paths.version)
-                        == std::cmp::Ordering::Greater
-                })
-            }) =>
+            if let Some(s) = connect_newest(&opts.paths, theirs.0, theirs.1, newer_than_ours) =>
         {
             s
         }
@@ -479,19 +493,20 @@ where
     pump_chunks(rx, held, ended, output, sock)
 }
 
-/// Connects to the newest running daemon of wire `major`/`revision` whose build `pick` takes
-/// (`None` is a daemon from before daemons were keyed by build), trying them newest first
-/// ([`crate::paths::sockets_of_wire`]) and going on to the next when one does not answer.
+/// Connects to the newest running daemon of the family of wire `major`/`revision` that `pick`
+/// takes (a version of `None` is a daemon from before daemons were keyed by build), trying them
+/// newest first ([`crate::paths::sockets_of_wire`]) and going on to the next when one does not
+/// answer.
 fn connect_newest(
     paths: &Paths,
     major: u16,
     revision: u16,
-    pick: impl Fn(Option<&str>) -> bool,
+    pick: impl Fn(&crate::paths::RunningDaemon) -> bool,
 ) -> Option<UnixStream> {
     crate::paths::sockets_of_wire(&paths.dir, major, revision)
         .into_iter()
-        .filter(|(v, _)| pick(v.as_deref()))
-        .find_map(|(_, sock)| UnixStream::connect(sock).ok())
+        .filter(|d| pick(d))
+        .find_map(|d| UnixStream::connect(d.socket).ok())
 }
 
 /// Copies `input` to the socket and the socket to `output`, byte for byte, until one side ends.

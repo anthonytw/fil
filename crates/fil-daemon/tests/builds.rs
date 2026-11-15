@@ -20,7 +20,12 @@ const BIN: &str = env!("CARGO_BIN_EXE_fil-daemon-dev");
 
 /// A daemon of build `version` in the scratch directory, in this process.
 async fn start_build(s: &Scratch, version: &str, script: &str) -> Running {
-    let paths = s.paths().with_version(version);
+    start_build_rev(s, fil_proto::version::wire_revision(), version, script).await
+}
+
+/// [`start_build`] for a build of wire revision `revision`.
+async fn start_build_rev(s: &Scratch, revision: u16, version: &str, script: &str) -> Running {
+    let paths = s.paths().with_revision(revision).with_version(version);
     fil_daemon::ensure_socket_dir(&s.dir).unwrap();
     let daemon = Daemon::start(paths.clone(), config(script))
         .await
@@ -301,6 +306,75 @@ async fn an_idle_time_longer_than_the_check_runs_out() {
         .await
         .expect("the idle daemon exits");
     assert_eq!(exit, fil_daemon::Exit::Idle);
+}
+
+/// The 1.x family (docs/v1/wire.md, decision 9): builds of two 1.x revisions each hold their own
+/// revision's wire lock (release.md section 6.4.4 names it per revision), a relay of the older
+/// one sends its client to the newer one's daemon, the older daemon counts as superseded by the
+/// newer one and exits when its last session ends, and the newer one's `ListSessions` gives its
+/// sessions its own version and names the older daemon with its version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_1x_family_routes_and_retires_across_revisions() {
+    let s = Scratch::new();
+    let r16 = fil_proto::version::wire_revision();
+    let r17 = r16 + 1;
+    assert!(r16 >= fil_proto::limits::FIRST_STABLE_REVISION);
+    let script = "echo ready; read x; exit 0";
+    let old = start_build_rev(&s, r16, "1.0.0", script).await;
+    let mut a = Client::attach(
+        fil_daemon_pipe(&old.paths).await,
+        Connect::new("work", key(1)),
+    )
+    .await;
+    a.wait_screen("ready").await;
+    let new = start_build_rev(&s, r17, "1.1.0", CAT).await;
+    // One lock per revision, each held by its own daemons.
+    assert_ne!(old.paths.lock(), new.paths.lock());
+    assert_eq!(probe(&old.paths.lock()), Seen::Held);
+    assert_eq!(probe(&new.paths.lock()), Seen::Held);
+    assert!(fil_daemon::paths::superseded(&old.paths));
+    assert!(!fil_daemon::paths::superseded(&new.paths));
+
+    // A relay of the older build (the older revision) connects its client to the newer daemon.
+    let old_relay = RelayOptions::with_paths(
+        old.paths.clone(),
+        DaemonLauncher::new("/nonexistent/fil", Vec::<String>::new()),
+    );
+    let mut b = Client::attach(
+        pipe_through_relay(old_relay).await,
+        Connect::new("fresh", key(2)),
+    )
+    .await;
+    b.wait_screen("ready").await;
+    match ask(&new, fil_proto::msg::Request::ListSessions).await {
+        fil_proto::msg::Response::Sessions { list, others, .. } => {
+            let names: Vec<String> = list.iter().map(|s| s.name.to_string()).collect();
+            assert_eq!(names, ["fresh"]);
+            assert!(list.iter().all(|s| s.daemon_version.as_str() == "1.1.0"));
+            assert!(
+                others.iter().any(|o| o.revision == r16
+                    && o.version.as_ref().map(|v| v.as_str()) == Some("1.0.0")),
+                "{others:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    b.detach().await;
+
+    // The older daemon's last session ends: it exits; the newer one stays.
+    a.type_bytes(b"bye\n").await;
+    let exit = tokio::time::timeout(Duration::from_secs(10), old.task)
+        .await
+        .expect("the superseded 1.x daemon exits")
+        .unwrap();
+    assert_eq!(exit, fil_daemon::Exit::Idle);
+    assert_eq!(
+        probe(&old.paths.lock()),
+        Seen::Missing,
+        "its revision's lock went with it"
+    );
+    assert_eq!(probe(&new.paths.lock()), Seen::Held);
+    new.stop().await;
 }
 
 /// A pipe link straight to the socket of `paths` (no relay: a relay routes to the newest build).

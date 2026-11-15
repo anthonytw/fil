@@ -37,7 +37,7 @@ pub enum MgmtError {
     #[error("{}", .0.explain(Peer::RemoteHost))]
     Version(VersionMismatch),
     #[error(
-        "the fil on the remote host refused this fil's version (a different wire revision): upgrade whichever fil is older"
+        "the fil on the remote host speaks a wire this fil can use but did not connect it to a daemon (its relay routes by exact wire revision, as development builds before 1.0 did): upgrade the fil on the remote host"
     )]
     VersionRefused,
     #[error("the daemon refused the request: {0}")]
@@ -270,16 +270,26 @@ fn refusal(why: &ForwardRefusal, port: u16) -> String {
     }
 }
 
-/// What `fil ls` says about daemons of other wire revisions running beside the one it asked: it
-/// cannot list their sessions, and the user should know they exist and how to reach them. Empty
-/// when there are none. Numbers only.
+/// What `fil ls` says about the other daemons running beside the one it asked: it cannot list
+/// their sessions, and the user should know they exist. A daemon of another wire is reached with
+/// a fil of that wire; one of this fil's own family (any 1.x build, for a 1.x fil) is an older
+/// or newer build whose sessions this fil cannot reach yet (every connection goes to the newest
+/// daemon of the family until a client can name a daemon: DESIGN.md section 5.3). Empty when
+/// there are none. Numbers and versions only.
 pub fn other_daemons_note(others: &[OtherDaemon]) -> String {
+    use fil_proto::version::WireVersion;
     let mut out = String::new();
     for d in others {
-        out.push_str(&format!(
-            "also running: {}; use that fil version for its sessions\n",
-            d.describe()
-        ));
+        let family = WireVersion::ours().compatible(&WireVersion {
+            major: d.major,
+            revision: d.revision,
+        });
+        let advice = if family && d.version.is_some() {
+            "its sessions run on until they end; this fil cannot reach them yet"
+        } else {
+            "use that fil version for its sessions"
+        };
+        out.push_str(&format!("also running: {}; {advice}\n", d.describe()));
     }
     out
 }
@@ -289,7 +299,7 @@ pub fn format_sessions(list: &[SessionSummary], truncated: bool, now_unix_ms: u6
     if list.is_empty() {
         return "no sessions\n".to_string();
     }
-    let rows: Vec<[String; 6]> = list
+    let rows: Vec<[String; 7]> = list
         .iter()
         .map(|s| {
             let attached = match &s.attached {
@@ -312,6 +322,8 @@ pub fn format_sessions(list: &[SessionSummary], truncated: bool, now_unix_ms: u6
                 attached,
                 last,
                 format!("{} ago", age(now_unix_ms, s.created_unix_ms)),
+                // The daemon's build (decision D2): validated as `[A-Za-z0-9.+-]{1,32}`.
+                s.daemon_version.as_str().to_string(),
             ]
         })
         .collect();
@@ -322,6 +334,7 @@ pub fn format_sessions(list: &[SessionSummary], truncated: bool, now_unix_ms: u6
         "ATTACHED",
         "LAST OUTPUT",
         "CREATED",
+        "FIL",
     ];
     let mut widths = head.map(str::len);
     for row in &rows {
@@ -329,7 +342,7 @@ pub fn format_sessions(list: &[SessionSummary], truncated: bool, now_unix_ms: u6
             *w = (*w).max(cell.chars().count());
         }
     }
-    let line = |cells: [&str; 6]| {
+    let line = |cells: [&str; 7]| {
         let mut out = String::new();
         for (i, (cell, w)) in cells.iter().zip(widths).enumerate() {
             if i + 1 == cells.len() {
@@ -344,7 +357,7 @@ pub fn format_sessions(list: &[SessionSummary], truncated: bool, now_unix_ms: u6
     let mut out = line(head);
     for row in &rows {
         out.push_str(&line([
-            &row[0], &row[1], &row[2], &row[3], &row[4], &row[5],
+            &row[0], &row[1], &row[2], &row[3], &row[4], &row[5], &row[6],
         ]));
     }
     if truncated {
@@ -427,7 +440,14 @@ mod tests {
         assert!(lines[1].starts_with("main "));
         assert!(lines[1].contains("laptop for 2h"));
         assert!(lines[1].contains("3s ago"));
-        assert!(lines[1].ends_with("4d ago"));
+        assert!(lines[1].contains("4d ago"));
+        // The last column is the daemon's build (decision D2).
+        assert!(lines[0].ends_with("FIL"), "{}", lines[0]);
+        assert!(
+            lines[1].ends_with(env!("CARGO_PKG_VERSION")),
+            "{}",
+            lines[1]
+        );
         assert!(lines[2].contains(" - "), "{}", lines[2]);
         assert!(lines[2].contains("1m ago"));
         assert!(lines[3].contains("never"));
@@ -756,6 +776,19 @@ mod tests {
         );
         assert!(out.contains("older fil (before wire revisions)"), "{out}");
         assert!(out.starts_with("NAME"), "the table comes first: {out}");
+        assert!(out.contains("rev 4; use that fil version"), "{out}");
+        // Another build of this fil's family (any 1.x revision) is named with its version, and
+        // is not reached with "that fil version" (every connection goes to the newest daemon).
+        let family = other_daemons_note(&[OtherDaemon {
+            major: fil_proto::limits::PROTOCOL_MAJOR,
+            revision: fil_proto::limits::FIRST_STABLE_REVISION,
+            version: Some(fil_proto::msg::FilVersion::new("1.0.0").unwrap()),
+            ext: fil_proto::ext::RowExt::default(),
+        }]);
+        assert!(
+            family.contains("fil 1.0.0; its sessions run on until they end"),
+            "{family}"
+        );
         // Another major is named as such, not passed off as a revision of this one.
         let major = Response::Sessions {
             list: vec![],

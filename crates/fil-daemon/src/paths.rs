@@ -922,27 +922,65 @@ pub fn running_daemons(dir: &Path) -> Vec<RunningDaemon> {
     out
 }
 
-/// The sockets a connection of wire `major`/`revision` may go to, in the order to try them: the
-/// running daemons of the wire keyed by build, newest first ([`running_daemons`]), then the
-/// socket of a daemon from before ([`Paths::socket_of`]), which is tried even when no lock shows
-/// it (only a connect tells a live one from a leftover, and a leftover refuses at once).
-pub fn sockets_of_wire(dir: &Path, major: u16, revision: u16) -> Vec<(Option<String>, PathBuf)> {
-    let mut out: Vec<(Option<String>, PathBuf)> = running_daemons(dir)
+/// Whether wires `a` and `b` (major, revision) are one **family** for routing and retiring
+/// daemons (docs/v1/wire.md, decision 9): the same major, and the same revision or both at least
+/// `FIRST_STABLE_REVISION` (16, the 1.x wire, whose revisions all work together). It is the
+/// relation the hello check accepts ([`fil_proto::version::WireVersion::compatible`]). The wire
+/// lock stays per revision ([`Paths::lock`]): a family is about where connections go, not which
+/// lock a daemon holds.
+pub fn same_family(a: (u16, u16), b: (u16, u16)) -> bool {
+    use fil_proto::version::WireVersion;
+    WireVersion {
+        major: a.0,
+        revision: a.1,
+    }
+    .compatible(&WireVersion {
+        major: b.0,
+        revision: b.1,
+    })
+}
+
+/// Orders two builds, newest last: by version ([`compare_versions`]), then by wire revision (two
+/// builds that say the same version, development builds, the later wire first).
+pub fn compare_builds(a: (&str, u16), b: (&str, u16)) -> std::cmp::Ordering {
+    compare_versions(a.0, b.0).then(a.1.cmp(&b.1))
+}
+
+/// The daemons a connection of wire `major`/`revision` may go to, in the order to try them: the
+/// running daemons of its family keyed by build ([`same_family`]: for a 1.x wire every 1.x
+/// revision, otherwise the one revision), newest build first ([`compare_builds`]), then the
+/// socket of a daemon of that very revision from before daemons were keyed by build
+/// ([`Paths::socket_of`], version `None`), which is tried even when no lock shows it (only a
+/// connect tells a live one from a leftover, and a leftover refuses at once).
+pub fn sockets_of_wire(dir: &Path, major: u16, revision: u16) -> Vec<RunningDaemon> {
+    let mut out: Vec<RunningDaemon> = running_daemons(dir)
         .into_iter()
-        .filter(|d| (d.major, d.revision) == (major, revision) && d.version.is_some())
-        .map(|d| (d.version, d.socket))
+        .filter(|d| d.version.is_some() && same_family((d.major, d.revision), (major, revision)))
         .collect();
-    out.push((None, Paths::in_dir(dir).socket_of(major, revision)));
+    out.sort_by(|a, b| {
+        compare_builds(
+            (b.version.as_deref().unwrap_or(""), b.revision),
+            (a.version.as_deref().unwrap_or(""), a.revision),
+        )
+    });
+    out.push(RunningDaemon {
+        major,
+        revision,
+        version: None,
+        socket: Paths::in_dir(dir).socket_of(major, revision),
+    });
     out
 }
 
-/// Whether a daemon of a newer build of this wire is running: then this one is superseded (new
-/// sessions go to the newest daemon of a wire), and exits as soon as it has no session and no
-/// connection, without waiting for the idle time.
+/// Whether a daemon of a newer build of this one's family is running ([`same_family`]: for a
+/// 1.x daemon a newer 1.x build of any revision): then this one is superseded (new sessions go to
+/// the newest daemon of a family), and exits as soon as it has no session and no connection,
+/// without waiting for the idle time.
 pub fn superseded(paths: &Paths) -> bool {
     list_builds(&paths.dir, "lock").into_iter().any(|b| {
-        (b.major, b.revision) == (paths.major, paths.revision)
-            && compare_versions(&b.version, &paths.version) == std::cmp::Ordering::Greater
+        same_family((b.major, b.revision), (paths.major, paths.revision))
+            && compare_builds((&b.version, b.revision), (&paths.version, paths.revision))
+                == std::cmp::Ordering::Greater
             && lock_is_held(&b.path)
     })
 }
@@ -1066,23 +1104,51 @@ pub(crate) fn dir_still_trusted(held: &File, dir: &Path) -> bool {
         && dir_lock_is_current(held, dir)
 }
 
-/// The running daemons in `dir` other than the one `paths` names: those of another wire revision
-/// (or major), which a fil of this revision cannot talk to. `fil ls` mentions them
-/// (DESIGN.md section 5.3). They are found by their lock files, which a live daemon holds for its
-/// whole life: a crashed daemon's leftover socket is not one, and a live daemon whose socket was
-/// removed (it binds it again within [`Keeping::check`]) still is. Numbers only, at most
-/// [`MAX_OTHER_DAEMONS`].
+/// The running daemons in `dir` other than the one `paths` names, whose sessions the daemon that
+/// answers does not list: every other build ([`running_daemons`], with its version), of another
+/// wire or of this one's family, and a daemon known only by its held wire lock
+/// (`fil-<major>-<rev>.lock`, version `None`) on a wire where no daemon keyed by build runs. `fil
+/// ls` mentions them (DESIGN.md section 5.3). They are found by their locks, which a live daemon
+/// holds for its whole life: a crashed daemon's leftover socket is not one, and a live daemon
+/// whose socket was removed (it binds it again within [`Keeping::check`]) still is. Numbers and
+/// versions only, at most [`MAX_OTHER_DAEMONS`].
 pub fn other_daemons(paths: &Paths) -> Vec<OtherDaemon> {
-    list_named(&paths.dir, "lock")
+    let running = running_daemons(&paths.dir);
+    let keyed: Vec<OtherDaemon> = running
+        .iter()
+        .filter(|d| d.version.is_some())
+        .filter(|d| {
+            (d.major, d.revision, d.version.as_deref())
+                != (paths.major, paths.revision, Some(paths.version.as_str()))
+        })
+        .map(|d| OtherDaemon {
+            major: d.major,
+            revision: d.revision,
+            version: d
+                .version
+                .as_deref()
+                .and_then(|v| fil_proto::msg::FilVersion::new(v).ok()),
+            ext: fil_proto::ext::RowExt::default(),
+        })
+        .collect();
+    let by_wire = list_named(&paths.dir, "lock")
         .into_iter()
         .filter(|d| (d.major, d.revision) != (paths.major, paths.revision))
+        .filter(|d| {
+            !running
+                .iter()
+                .any(|r| r.version.is_some() && (r.major, r.revision) == (d.major, d.revision))
+        })
         .filter(|d| lock_is_held(&d.path))
         .map(|d| OtherDaemon {
             major: d.major,
             revision: d.revision,
             version: None,
             ext: fil_proto::ext::RowExt::default(),
-        })
+        });
+    keyed
+        .into_iter()
+        .chain(by_wire)
         .take(MAX_OTHER_DAEMONS)
         .collect()
 }
@@ -1624,6 +1690,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_1x_revisions_are_one_family_and_older_ones_are_not() {
+        use std::cmp::Ordering::{Greater, Less};
+        let s = fil_proto::limits::FIRST_STABLE_REVISION;
+        assert!(same_family((1, s), (1, s + 1)));
+        assert!(same_family((1, s + 5), (1, s)));
+        assert!(same_family((1, s - 1), (1, s - 1)));
+        assert!(!same_family((1, s - 1), (1, s)));
+        assert!(!same_family((1, s - 2), (1, s - 1)));
+        assert!(!same_family((1, s), (2, s)));
+        assert!(!same_family((1, 0), (1, s)));
+        // Newest by version first, the revision breaking a tie.
+        assert_eq!(compare_builds(("1.1.0", s), ("1.0.0", s + 1)), Greater);
+        assert_eq!(compare_builds(("1.0.0", s), ("1.0.0", s + 1)), Less);
+    }
+
+    /// The family's daemons, newest first, whatever their 1.x revision; a pre-1.0 revision only
+    /// its own.
+    #[test]
+    fn sockets_of_a_1x_wire_span_the_family() {
+        use rustix::fs::{FlockOperation, flock};
+        use std::os::unix::fs::DirBuilderExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("s");
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let s = fil_proto::limits::FIRST_STABLE_REVISION;
+        let held = |p: &Paths| {
+            let f = File::create(p.build_lock()).unwrap();
+            flock(&f, FlockOperation::NonBlockingLockExclusive).unwrap();
+            f
+        };
+        let base = Paths::in_dir(&dir).with_major(1);
+        let a = base.clone().with_revision(s).with_version("1.0.0");
+        let b = base.clone().with_revision(s + 1).with_version("1.1.0");
+        let c = base.clone().with_revision(s + 1).with_version("1.0.5");
+        let pre = base.clone().with_revision(s - 1).with_version("0.3.0");
+        let _locks = [held(&a), held(&b), held(&c), held(&pre)];
+        let order: Vec<PathBuf> = sockets_of_wire(&dir, 1, s)
+            .into_iter()
+            .map(|d| d.socket)
+            .collect();
+        assert_eq!(
+            order,
+            [b.socket(), c.socket(), a.socket(), base.socket_of(1, s)]
+        );
+        let order: Vec<PathBuf> = sockets_of_wire(&dir, 1, s - 1)
+            .into_iter()
+            .map(|d| d.socket)
+            .collect();
+        assert_eq!(order, [pre.socket(), base.socket_of(1, s - 1)]);
+        assert!(superseded(&a) && superseded(&c) && !superseded(&b));
+        assert!(!superseded(&pre), "a pre-1.0 build is not in the family");
+        // The wire lock is per revision: revision s+1's daemons are not revision s's.
+        assert!(!other_build_of_wire_alive(&a));
+        assert!(other_build_of_wire_alive(&b));
+    }
+
+    #[test]
     fn versions_order_as_semantic_versions() {
         use std::cmp::Ordering::{Greater, Less};
         let order = [
@@ -1694,7 +1817,7 @@ pub(crate) mod tests {
         );
         let socks: Vec<PathBuf> = sockets_of_wire(&dir, 1, 20)
             .into_iter()
-            .map(|(_, s)| s)
+            .map(|d| d.socket)
             .collect();
         assert_eq!(socks, [new.socket(), old.socket(), p.socket_of(1, 20)]);
         assert!(superseded(&old));

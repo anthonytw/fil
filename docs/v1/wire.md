@@ -38,8 +38,8 @@ This note is the contract. `DESIGN.md` §8.5 ("Versioning") points here and foll
 9. **Routing is D2's job (PR #8), and for routing "the wire" is the 1.x family.** For deciding
    which daemon a relay connects a client to, and which daemon retires, "the client's wire"
    means every revision from `FIRST_STABLE_REVISION` (16) on under major 1, not one revision.
-   That is implemented with D2. This PR does not change the relay: it still routes by exact
-   revision until D2's routing lands.
+   That is implemented with D2 (PR #8): see *The revision's new role*. The wire lock stays per
+   revision (DESIGN §5.3, *Upgrades*).
 10. **The freeze starts now, and is final at the v1.0.0 tag.** The rest of the 1.0 work (D2,
     `-N`) follows the 1.x rules: it only adds. Until the tag, an in-place change is still
     possible if it is really needed: move `FIRST_STABLE_REVISION` to the new revision and run
@@ -53,8 +53,9 @@ This note is the contract. `DESIGN.md` §8.5 ("Versioning") points here and foll
 12. **D2's wire needs.**
     - `SessionSummary.daemon_version` and `OtherDaemon.version` (`FilVersion`,
       `[A-Za-z0-9.+-]{1,32}`) are in the 1.0 encoding. They sit inside lists, where nothing can
-      be appended once the wire is frozen. They are filled from `CARGO_PKG_VERSION` for now, and
-      #8 switches them to its `Paths::version`.
+      be appended once the wire is frozen. They are filled from the daemon's build version
+      (`Paths::version`, PR #8), and `fil ls` shows the first as its FIL column and the second
+      in its "also running" note.
     - Reaching a particular daemon and a kill pre-check need no 1.0 support (see *D2 under the
       frozen wire*).
 13. **List rows get room to grow.** `SessionSummary` and `OtherDaemon` end in a `RowExt`, a
@@ -229,8 +230,7 @@ sequenceDiagram
   and revisions 1 to 15.
 - Within 1.x, features gate behavior. A build never infers a capability from a revision number,
   because features can be backported or dropped, and numbers cannot.
-- **Routing and retiring daemons follow the 1.x family** (decision 9), with D2. #8's routing is
-  per revision as merged, and its follow-up makes it per family:
+- **Routing and retiring daemons follow the 1.x family** (decision 9), with D2 (PR #8):
   - the relay sends a client of any 1.x revision to the newest running daemon of the family,
     or else starts its own build's daemon;
   - an older 1.x daemon counts as superseded by a newer one of any 1.x revision.
@@ -338,7 +338,7 @@ log records only the type number, never the contents (§11.1).
 - **Real binaries** (`crates/fil/tests/revision.rs`):
   - the refusal tests use pre-1.0 revisions;
   - `two_1x_revisions_talk_both_ways` (revisions 16 and 17, through the relay, both ways) names
-    no socket, and is ignored until D2 routes by the 1.x family.
+    no socket, and runs since D2 routes by the 1.x family (PR #8).
 - **CI** (`compat` in `linux-check`, suites `extended` and `all`):
   - it checks the tag-anchored baseline;
   - it builds the bounded set of tags `--locked`, and runs `dropin --local --set quick` twice

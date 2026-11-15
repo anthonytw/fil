@@ -13,7 +13,7 @@ fil is a remote shell for development over SSH:
 - **`DESIGN.md` is the source of truth.**
   - Items marked **(decided)** are the owner's decisions. Build on them; don't reopen them.
   - Everything else is a proposal and can change. When one changes, update `DESIGN.md` in the same PR.
-- **Open questions** are in `DESIGN.md` §16. **Milestones** are in §15. Work goes riskiest first. M0 to M4 are done: M4's pre-release sweep closed before 0.1.0, M3 shipped in 0.2.0, with its follow-ups in 0.3.0 (`docs/m2/plan.md`, `docs/m3/plan.md` and `docs/m4/plan.md` are historical work orders). The 1.0 work is merged and its sweep is in progress.
+- **Open questions** are in `DESIGN.md` §16. **Milestones** are in §15. Work goes riskiest first. M0 to M4 are done: M4's pre-release sweep closed before 0.1.0, M3 shipped in 0.2.0, with its follow-ups in 0.3.0 (`docs/m2/plan.md`, `docs/m3/plan.md` and `docs/m4/plan.md` are historical work orders). The 1.0 work and its sweep are done (fixes in #9, #11 to #13; the baseline security audit is `docs/audits/2026-11-15-full-1.0.0.md`), and 1.0.0 is being released: the 1.x wire is frozen from here (`docs/v1/wire.md`).
 - **Ask before starting unrequested work.** Propose it and wait for the owner's OK. A question like "how hard would X be?" wants a feasibility answer, not an implementation.
 
 ## Conventions

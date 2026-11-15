@@ -86,5 +86,4 @@ A path in two rows runs both lanes. Every source file under `crates/*/src/` maps
 
 | Report | Kind | Code audited |
 | --- | --- | --- |
-
-None yet: the baseline full audit is the security and privacy part of the sweep before 1.0.
+| [2026-11-15, full, 1.0.0](2026-11-15-full-1.0.0.md) (the baseline) | full | `bcd8460`, the 1.0 candidate; fixes in 1.0.0 |

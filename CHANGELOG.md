@@ -4,6 +4,10 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+### Changed
+
+- **The wire is now the 1.x wire (`wire 1.16`), and the last one that needs both ends upgraded together.** From `wire 1.16` on, any two fil builds of the same major talk to each other, whichever is newer: a newer build uses a new feature only when the other side has it too, and skips what it does not know. Builds of `wire 1.15` and older still talk only to their own wire, so upgrade both ends to this version once.
+
 ## [0.3.0] - 2026-11-14
 
 Ask before taking over a session, and predictive echo that recovers after an interruption.

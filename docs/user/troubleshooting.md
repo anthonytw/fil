@@ -25,7 +25,7 @@ With `remote = "plain"` in your [config](config.md), only `fil server --stdio` r
 
 ## "Wire version mismatch", or "the fil on the remote host is older"
 
-Two fil builds talk only when their wire numbers (`wire 1.12` in `fil --version`) are equal. The message says which side is newer and which to upgrade. By default fil runs its install command first, which never starts a fil of another wire: it starts a copy of the right version if the host has one, and otherwise offers to install it. You see this message with `remote = "plain"`, behind a forced command, or when the copy it started is of another wire. Then upgrade the older side: [install](install.md) the same version on the host.
+Two fil builds of `wire 1.16` or later (in `fil --version`) always talk to each other. Older builds talk only when their wire numbers are equal, and builds of different majors (`wire 1.x` and `wire 2.x`) never do. The message says which side is newer and which to upgrade. By default fil runs its install command first, which never starts a fil of another wire: it starts a copy of the right version if the host has one, and otherwise offers to install it. You see this message with `remote = "plain"`, behind a forced command, or when the copy it started is of another wire. Then upgrade the older side: [install](install.md) the same version on the host.
 
 Daemons of different wires coexist on a host, so an upgrade breaks no running session. Sessions of the old daemon keep running there; the new fil does not list them, and the old fil still reaches them.
 

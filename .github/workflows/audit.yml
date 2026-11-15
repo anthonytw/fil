@@ -1,0 +1,51 @@
+# Weekly advisory scan (SECURITY.md "Audits"; docs/audits/README.md "Checks and audits"): the locked
+# dependencies of the workspace and of the terminal exporter against the RustSec database (cargo
+# deny) and the OSV database (osv-scanner), so that an advisory published between pull requests is
+# seen within a week. Fail-only: a red run is the signal; it opens no issue and no PR, and writes
+# nothing anywhere.
+#
+# Triggers: a schedule and a dispatch, nothing else; read-only permissions; no secret (it uses
+# none, and reads only public databases); every action pinned by full commit SHA and every tool by
+# version. tests/release/lint-workflow.sh --scheduled enforces this profile (the release-test recipe
+# and release.yml's prepare job run it). GitHub disables a scheduled workflow after 60 days without
+# repository activity: a full audit checks that it is still enabled (docs/audits/README.md).
+name: audit
+
+on:
+  schedule:
+    # Mondays at 06:17 UTC (01:17 or 02:17 ET), off the top of the hour, when GitHub's scheduler is busiest.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit
+  cancel-in-progress: false
+
+jobs:
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-deny@0.20.2,osv-scanner@2.7.0
+      # The steps after the first run even when an earlier one failed, so one run shows every
+      # advisory; the job is red if any step is.
+      - name: RustSec, the workspace (cargo deny, a fresh advisory database)
+        run: cargo deny --locked check advisories
+      - name: RustSec, the terminal exporter's lock
+        if: ${{ !cancelled() }}
+        run: cargo deny --locked --manifest-path tests/terminals/exporter/Cargo.toml --config deny.toml check advisories
+      - name: OSV, both lockfiles (osv-scanner)
+        if: ${{ !cancelled() }}
+        run: osv-scanner scan source --lockfile Cargo.lock --lockfile tests/terminals/exporter/Cargo.lock

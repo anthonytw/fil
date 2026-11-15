@@ -42,7 +42,7 @@ M4 in `DESIGN.md` §15: install or upload, config, docs, packaging, license; the
 
 - **Windows**, as a client or a remote (decided, §2 of DESIGN). WSL counts as Linux.
 - **Runtime downloads.** fil never fetches anything from the internet, not even its own binary for a remote (§11.1.1, decided). Whatever the client uploads, it already has on disk.
-- **A `curl | sh` installer.** It would run code the user has not seen. Install instructions are a download, a checksum check and a copy.
+- ~~**A `curl | sh` installer.** It would run code the user has not seen. Install instructions are a download, a checksum check and a copy.~~ **Reversed for 1.0** (decided, owner 2026-11-11, D5): a release carries `fil-install.sh`, which only downloads, verifies the signed `SHA256SUMS` against its pinned release key and copies `fil` into `~/.local/bin`; the docs show the download-read-run form beside the one-liner (`docs/m4/packaging.md` §8).
 - ~~**Distro packages** (Debian, RPM, AUR, Nix) and **crates.io** in v1~~ are **no longer non-goals**: they are in scope for v1, with the names reserved and packages prepared everywhere (OQ-3; decided, owner 2026-11-04). The channel list is goal 3 (PKG).
 - **`-N` tunnel-only mode** (M2 OD-12) and **desktop notifications for new listeners** (§7.4 of DESIGN, moved out of M2). Both are features, and adding them now would put new code in front of the sweep. They move to after v0.1.0, unless the owner pulls them in. R0 updates DESIGN §7.4's notification sentence and points it at OD-12, so that DESIGN says "after v0.1.0".
 - **The two items M3 hands to M4** (M3 plan §1, PC-11), both after v0.1.0:
@@ -845,7 +845,7 @@ Only the questions that are truly the owner's: accounts, identity, the site, and
 - the versioning rule (§2.1; the first version, 0.1.0, is decided, owner 2026-11-04);
 - the targets, with the universal macOS binary (§2.2);
 - macOS supported as a remote, with `fil ports` showing forwards only (§16.9);
-- no runtime downloads, and no `curl | sh`;
+- no runtime downloads (and no `curl | sh`, reversed for 1.0 by the owner: `docs/m4/packaging.md` §8);
 - `-N`, notifications and M3's two hand-offs deferred until after v0.1.0;
 - `remote = "auto"` and `install = "ask"` as defaults (OQ-1 is yes, so they stand; U1's, not CFG's);
 - TMP's refresh-and-lock remedy;

@@ -341,25 +341,24 @@ async fn registered_public_key_without_its_private_key_is_rejected() {
     assert!(matches!(f.server.seen.recv().await.unwrap(), Seen::Failed));
 }
 
-/// A client of another wire revision is refused by the handshake itself: the ALPN names the
-/// revision (`fil/<major>.<revision>`), so no stream is opened and no message decoded. The
-/// matching client still works against the same server.
+/// A client of another major, or a development build from before 1.0 (whose ALPN named its
+/// revision, `fil/1.<rev>`), is refused by the handshake itself: the ALPN names the major
+/// (`fil/<major>`, frozen for 1.x, so every 1.x revision connects), so no stream is opened and no
+/// message decoded. The matching client still works against the same server.
 #[tokio::test(start_paused = true)]
-async fn another_wire_revision_fails_the_handshake() {
+async fn another_wire_fails_the_handshake() {
     let mut f = fixture();
     let key = ClientKey::generate().unwrap();
     f.registry.register(key.public_key().clone());
 
-    let ours = fil_proto::version::wire_revision();
-    assert_eq!(auth::alpn(), auth::alpn_for(ours));
-    assert_ne!(auth::alpn_for(ours), auth::alpn_for(ours + 1));
-
+    assert_eq!(auth::alpn(), b"fil/1");
+    // The ALPN does not depend on the revision, so a 1.x build of any revision connects.
     let mut tls = auth::client_tls(
         Arc::new(PinnedServerVerifier::new(f.identity.fingerprint())),
         Some(&key),
     )
     .unwrap();
-    tls.alpn_protocols = vec![auth::alpn_for(ours + 1)];
+    tls.alpn_protocols = vec![b"fil/1.15".to_vec()];
     let cfg = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
     ));
@@ -371,7 +370,7 @@ async fn another_wire_revision_fails_the_handshake() {
         .map(|_| ())
         .unwrap_err();
     // TLS alert no_application_protocol (120) as a QUIC crypto error (0x100 + 120): the code
-    // `QuicLink::connect_on` turns into "the daemon speaks a different wire revision".
+    // `QuicLink::connect_on` turns into "the daemon speaks a wire of fil this one cannot talk to".
     assert!(
         matches!(&err, quinn::ConnectionError::ConnectionClosed(c) if u64::from(c.error_code) == 0x178),
         "expected a no-application-protocol failure, got: {err:?}"

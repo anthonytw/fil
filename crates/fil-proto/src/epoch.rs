@@ -157,6 +157,7 @@ impl SessionEpoch {
         let allowed = match req.take_over {
             TakeOver::Any => true,
             TakeOver::Epoch(e) => e == self.epoch,
+            TakeOver::EpochIfDisconnected(e) => e == self.epoch && !req.holder_connected,
             TakeOver::No => false,
         };
         if !allowed && let Some(cur) = &self.current {
@@ -432,6 +433,36 @@ mod tests {
             ..input(4, "laptop", None, 50)
         };
         assert_eq!(accepted(s.attach(late)).0, 5);
+    }
+
+    /// `TakeOver::EpochIfDisconnected` (`fil -N`): the compare and swap of `Epoch`, and only
+    /// while the holder's link is down, so a holder that reconnected (same epoch) keeps it.
+    #[test]
+    fn an_if_disconnected_grant_leaves_a_connected_holder_alone() {
+        let mut s = SessionEpoch::new(INC);
+        accepted(s.attach(input(1, "laptop", None, 10)));
+        let connected = AttachInput {
+            take_over: TakeOver::EpochIfDisconnected(1),
+            holder_connected: true,
+            ..input(2, "tunnel", None, 20)
+        };
+        assert!(matches!(
+            s.attach(connected),
+            AttachOutcome::Refused(AttachRefusal::Attached {
+                epoch: 1,
+                connected: true,
+                ..
+            })
+        ));
+        assert!(s.key_authorized(&key(1)));
+        let away = AttachInput {
+            take_over: TakeOver::EpochIfDisconnected(1),
+            holder_connected: false,
+            ..input(2, "tunnel", None, 30)
+        };
+        let (e, _, _, fx) = accepted(s.attach(away));
+        assert_eq!(e, 2);
+        assert!(fx.contains(&Effect::RevokeKey(key(1))));
     }
 
     #[test]

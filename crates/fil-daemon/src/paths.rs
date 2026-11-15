@@ -1080,6 +1080,8 @@ pub fn other_daemons(paths: &Paths) -> Vec<OtherDaemon> {
         .map(|d| OtherDaemon {
             major: d.major,
             revision: d.revision,
+            version: None,
+            ext: fil_proto::ext::RowExt::default(),
         })
         .take(MAX_OTHER_DAEMONS)
         .collect()

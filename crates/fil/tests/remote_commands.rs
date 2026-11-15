@@ -84,14 +84,15 @@ enum Remote {
 }
 
 /// A `fil` of another wire: one that answers with another major's preamble, or this build run
-/// as another wire revision (the test hook `FIL_TEST_WIRE_REVISION`).
+/// as an incompatible wire revision, a development build's from before the 1.0 wire (the test
+/// hook `FIL_TEST_WIRE_REVISION`; every 1.x revision talks to every other).
 fn other_wire_fil(major: bool) -> String {
     if major {
         "#!/bin/sh\nprintf '\\033FIL-CONNECT 99\\n'\nexec cat >/dev/null\n".to_string()
     } else {
         format!(
             "#!/bin/sh\nexec env FIL_TEST_WIRE_REVISION={} {FIL} \"$@\"\n",
-            fil_proto::version::wire_revision() + 1
+            fil_proto::limits::FIRST_STABLE_REVISION - 1
         )
     }
 }

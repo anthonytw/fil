@@ -1233,6 +1233,8 @@ mod tests {
             }),
             forwards,
             agent,
+            daemon_version: fil_proto::msg::FilVersion::ours(),
+            ext: fil_proto::ext::RowExt::default(),
         };
         let table = fil::mgmt::format_sessions(
             &[

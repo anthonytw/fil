@@ -3,6 +3,8 @@
 //! Everything here works on bytes and values. There is no IO, no async runtime, no clock and no
 //! crypto: callers pass in the time and the bytes, and act on the values returned.
 //!
+//! - [`ext`]: what makes the 1.x wire extensible: unknown types skipped, appended fields,
+//!   negotiated features.
 //! - [`frame`]: length-prefixed frames and the incremental [`frame::FrameDecoder`].
 //! - [`input`]: in-band records on the terminal channel (the resize that stays in order with the
 //!   keystrokes).
@@ -21,6 +23,7 @@
 
 pub mod chan;
 pub mod epoch;
+pub mod ext;
 pub mod frame;
 pub mod input;
 pub mod limits;

@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use crate::limits::{PROTOCOL_MAJOR, PROTOCOL_REVISION};
+use crate::limits::{FIRST_STABLE_REVISION, PROTOCOL_MAJOR, PROTOCOL_REVISION};
 
 /// The environment variable that overrides the revision this process speaks, in builds with the
 /// `test-hooks` feature. A release build (without the feature) does not read it at all.
@@ -43,6 +43,18 @@ impl WireVersion {
             major: PROTOCOL_MAJOR,
             revision: wire_revision(),
         }
+    }
+}
+
+impl WireVersion {
+    /// Whether two builds talk: the same major, and the same revision or both of the 1.x wire
+    /// (from [`FIRST_STABLE_REVISION`] on), whose differences are negotiated as features
+    /// (DESIGN.md section 8.5). Revision 0 and the pre-1.0 revisions match only themselves.
+    pub fn compatible(&self, other: &WireVersion) -> bool {
+        self.major == other.major
+            && (self.revision == other.revision
+                || (self.revision >= FIRST_STABLE_REVISION
+                    && other.revision >= FIRST_STABLE_REVISION))
     }
 }
 
@@ -129,6 +141,18 @@ mod tests {
                 revision: peer_rev,
             },
         }
+    }
+
+    #[test]
+    fn the_1x_wire_is_compatible_and_pre_1_0_revisions_are_not() {
+        let v = |major, revision| WireVersion { major, revision };
+        let s = FIRST_STABLE_REVISION;
+        assert!(v(1, s).compatible(&v(1, s + 1)));
+        assert!(v(1, s + 7).compatible(&v(1, s)));
+        assert!(v(1, s - 2).compatible(&v(1, s - 2)));
+        assert!(!v(1, s - 1).compatible(&v(1, s)));
+        assert!(!v(1, 0).compatible(&v(1, s)));
+        assert!(!v(2, s).compatible(&v(1, s)));
     }
 
     #[test]

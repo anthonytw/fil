@@ -23,10 +23,7 @@ set -euo pipefail
 # shellcheck source=tests/release/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-# The distributions, pinned by the digest of their multi-architecture index (bump like Cross.toml's).
-# Not the -slim image: it excludes /usr/share/doc from every package it installs.
-DEBIAN_IMAGE=docker.io/library/debian:13@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8fde837fe3d7d34a0e7f1
-FEDORA_IMAGE=docker.io/library/fedora:45@sha256:a7d72ba2745b100a3351087472e5ee7b2450af7cf331e7673007e3817612839c
+# The distributions: DEBIAN_IMAGE and FEDORA_IMAGE in common.sh (repos.sh's install test uses them too).
 
 arch='' dir='' key=''
 while [ $# -gt 0 ]; do

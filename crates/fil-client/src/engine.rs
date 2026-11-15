@@ -43,6 +43,7 @@ use bytes::Bytes;
 use fil_predict::{InputKind, LinkView, WithdrawReason};
 use fil_proto::ChannelId;
 use fil_proto::chan::{RecvChannel, SendChannel};
+use fil_proto::ext::FeatureSet;
 use fil_proto::frame::DataSegment;
 use fil_proto::input::InputRecord;
 use fil_proto::limits::{ACK_AFTER_BYTES, ACK_DELAY};
@@ -262,11 +263,20 @@ struct Conn {
     /// While a mid-stream snapshot is held: what it last progressed to (its `at`, the terminal
     /// position, its bytes received) and when ([`SNAPSHOT_PATIENCE`]).
     snap_progress: Option<((u64, u64, u64), Instant)>,
+    /// The optional features in use on this link: ours and the daemon's (its `Features`, sent
+    /// right after its hello; none until it arrives). 1.0 defines none, so nothing reads it yet:
+    /// a 1.x feature checks it before sending what the daemon must understand (DESIGN.md
+    /// section 8.5).
+    features: FeatureSet,
+    /// The daemon's `Features` arrived (it counts once).
+    features_seen: bool,
 }
 
 impl Conn {
     fn new(kind: LinkKind, resumed: bool) -> Self {
         Self {
+            features: FeatureSet::none(),
+            features_seen: false,
             kind,
             awaiting_reply: true,
             resumed,
@@ -340,6 +350,9 @@ enum Grant {
     /// This client held the session at this epoch (after `BadResume`, or a first snapshot cut
     /// short). One attach only.
     Own(u64),
+    /// A tunnel takes the session from the holder of this epoch only while that holder is still
+    /// disconnected (`TakeOver::EpochIfDisconnected`): one that resumed meanwhile keeps it.
+    IfDisconnected(u64),
 }
 
 /// What a link's service ended with.
@@ -591,7 +604,11 @@ fn candidate_step(m: Option<Result<(ChannelId, Bytes), LinkError>>) -> CandStep 
                 }
                 Ok(ControlMsg::AttachReply(r)) => CandStep::Promote(r),
                 Ok(ControlMsg::AttachRefused(r)) => CandStep::Refused(r),
+                // The daemon's features: for the link once it is promoted.
+                Ok(ControlMsg::Features(_)) => CandStep::Hold(chan, payload),
                 Ok(_) => CandStep::Keep,
+                // A later 1.x daemon's message: skipped (DESIGN.md section 8.5).
+                Err(e) if e.is_unknown() => CandStep::Keep,
                 Err(e) => {
                     CandStep::Fail(SwapError::LinkFailed(format!("bad control message: {e}")))
                 }
@@ -913,7 +930,16 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 Served::Refused(prompt) => {
                     let replaced = matches!(prompt, Prompt::Replaced);
                     // A yes to these is a yes to taking the session from the holder named in the
-                    // question, and from nobody who comes after it (compare and swap).
+                    // question, and from nobody who comes after it (compare and swap). A tunnel's
+                    // take of a disconnected holder also requires it to be still disconnected.
+                    let if_disconnected = self.cfg.tunnel.is_some()
+                        && matches!(
+                            prompt,
+                            Prompt::TakeOver {
+                                connected: false,
+                                ..
+                            }
+                        );
                     let takes = match &prompt {
                         Prompt::TakeBack(t) => Some(t.epoch),
                         Prompt::TakeOver { epoch, .. } => Some(*epoch),
@@ -936,7 +962,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             }
                             purpose = DialPurpose::Attach;
                             if let Some(epoch) = takes {
-                                self.grant = Grant::User(epoch);
+                                self.grant = if if_disconnected {
+                                    Grant::IfDisconnected(epoch)
+                                } else {
+                                    Grant::User(epoch)
+                                };
                             }
                         }
                         Err(outcome) => return Ok(outcome),
@@ -1550,6 +1580,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         let agent = Agent::new(format!("fil-client {}", env!("CARGO_PKG_VERSION")))
             .expect("agent string is valid");
         send_on(tx, &ControlMsg::Hello(Hello::ours(agent)));
+        // Right after the hello, always (DESIGN.md section 8.5). The attach follows at once, so
+        // it uses only what every 1.x daemon reads.
+        send_on(tx, &ControlMsg::Features(FeatureSet::ours()));
         send_on(
             tx,
             &ControlMsg::Attach(Attach {
@@ -1583,6 +1616,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         match self.grant {
             Grant::None => TakeOver::No,
             Grant::User(e) => TakeOver::Epoch(e),
+            Grant::IfDisconnected(e) => TakeOver::EpochIfDisconnected(e),
             Grant::Own(e) => {
                 self.grant = Grant::None;
                 TakeOver::Epoch(e)
@@ -1612,8 +1646,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         payload: Bytes,
     ) -> Result<Flow, ClientError> {
         if chan == ChannelId::CONTROL {
-            let msg = ControlMsg::decode(&payload)
-                .map_err(|e| ClientError::Protocol(format!("bad control message: {e}")))?;
+            let msg = match ControlMsg::decode(&payload) {
+                Ok(msg) => msg,
+                // A later 1.x daemon's message: skipped (DESIGN.md section 8.5).
+                Err(fil_proto::msg::MsgError::Unknown(kind)) => {
+                    tracing::debug!(kind, "skipped a control message of unknown type");
+                    return Ok(Flow::Continue);
+                }
+                Err(e) => return Err(ClientError::Protocol(format!("bad control message: {e}"))),
+            };
             return self.on_control(conn, msg);
         }
         if chan == ChannelId::TERMINAL || chan == ChannelId::SNAPSHOT {
@@ -1728,6 +1769,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     "the daemon sent a management message during an attach".into(),
                 ));
             }
+            // At most once per link (the daemon sends it right after its hello; on a swap's
+            // candidate link it is replayed after the reply): a second one is ignored, as the
+            // daemon refuses a second one of ours.
+            ControlMsg::Features(theirs) if !conn.features_seen => {
+                conn.features_seen = true;
+                conn.features = FeatureSet::ours().common(&theirs);
+            }
+            ControlMsg::Features(_) => tracing::debug!("ignored a late or second Features"),
             ControlMsg::Heartbeat { .. }
             | ControlMsg::Ack { .. }
             | ControlMsg::Resume { .. }

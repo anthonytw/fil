@@ -331,6 +331,21 @@ impl FakeDaemon {
         tokio::spawn(async move {
             let hello = ControlMsg::Hello(Hello::ours(Agent::new("fake daemon").unwrap()));
             let _ = send(&link, &hello).await;
+            // As a later 1.x daemon (docs/v1/wire.md), so every test here covers it: features
+            // this client does not know, and a control message of a type it does not know, which
+            // it must skip.
+            let features = fil_proto::ext::FeatureSet::from_bytes(&[0x81, 0, 0xff]).unwrap();
+            let _ = send(&link, &ControlMsg::Features(features)).await;
+            let _ = link
+                .send(
+                    ChannelId::CONTROL,
+                    bytes::Bytes::from_static(&[0xC8, 0x01, 1, 2, 3]),
+                )
+                .await;
+            // And data on a channel 1.0 does not use (a later build's, behind a feature).
+            let _ = link
+                .send(ChannelId(7), bytes::Bytes::from_static(&[0, b'x']))
+                .await;
             // After an attach the reply is out but the resent output is not: like the real
             // daemon's outbound half, it goes once the inbound messages already queued have been
             // handled.
@@ -469,6 +484,7 @@ impl FakeDaemon {
                             }
                             continue;
                         }
+                        TerminalInput::Unknown(_) => continue,
                         TerminalInput::Keys(seg) => seg,
                     };
                     let before = st.input_rx.received();

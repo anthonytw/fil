@@ -7,9 +7,12 @@
 //! The MUX channel carries ordinary data segments; its byte stream is a sequence of records that
 //! may be cut anywhere by the segment boundaries. [`RecordDecoder`] reassembles them across
 //! segments. A length that is zero, above the limit, longer than two bytes or not in its shortest
-//! form, or a body that does not decode as exactly one `MuxMsg`, poisons the decoder: the MUX
-//! stream has no resynchronisation, so the connection is a protocol error.
+//! form, or a body of a known kind that does not decode as a `MuxMsg`, poisons the decoder: the
+//! MUX stream has no resynchronisation, so the connection is a protocol error. A body of a kind
+//! this build does not know (a later 1.x build's record) is skipped whole, and bytes after a
+//! known message are fields a later build appended, ignored (DESIGN.md section 8.5).
 
+use crate::ext;
 use crate::limits::MAX_MUX_RECORD;
 use crate::mux::wire::MuxMsg;
 
@@ -39,17 +42,24 @@ pub fn encode_record(msg: &MuxMsg) -> Result<Vec<u8>, RecordError> {
     Ok(out)
 }
 
-/// Decode one record body (without its length).
-pub fn decode_body(body: &[u8]) -> Result<MuxMsg, RecordError> {
+/// How many variants [`MuxMsg`] has: an index at or past it is a later build's record. Kept by
+/// hand; `tests/wire_golden.rs` decodes every record it pins, so a variant added without raising
+/// it fails there.
+pub const MUX_KINDS: u32 = 13;
+
+/// Decode one record body (without its length). `None` is a record of a kind from a later build,
+/// to skip.
+pub fn decode_body(body: &[u8]) -> Result<Option<MuxMsg>, RecordError> {
     if body.is_empty() || body.len() > MAX_MUX_RECORD {
         return Err(RecordError::BadLength(body.len()));
     }
-    let (msg, rest) =
-        postcard::take_from_bytes::<MuxMsg>(body).map_err(|_| RecordError::Malformed)?;
-    if !rest.is_empty() {
-        return Err(RecordError::Malformed);
+    match ext::classify(body, MUX_KINDS) {
+        ext::Kind::Known => ext::decode_prefix::<MuxMsg>(body)
+            .map(|(msg, _appended)| Some(msg))
+            .ok_or(RecordError::Malformed),
+        ext::Kind::Unknown(_) => Ok(None),
+        ext::Kind::Malformed => Err(RecordError::Malformed),
     }
-    Ok(msg)
 }
 
 enum State {
@@ -156,7 +166,11 @@ impl RecordDecoder {
                     }
                     let body = std::mem::take(buf);
                     self.state = State::Len { value: 0, have: 0 };
-                    return decode_body(&body).map(Some);
+                    match decode_body(&body)? {
+                        Some(msg) => return Ok(Some(msg)),
+                        // A later build's record: skipped whole, on to the next.
+                        None => continue,
+                    }
                 }
             }
         }
@@ -243,17 +257,43 @@ mod tests {
         refuse(&[0x80, 0x80, 0x01], RecordError::BadVarint);
         // 1 written in two bytes.
         refuse(&[0x81, 0x00], RecordError::BadVarint);
-        // A body that is not one message, or one with a trailing byte.
+        // A body that is not a message, or a known kind cut short.
         refuse(&[1, 0xFF], RecordError::Malformed);
-        let mut trailing = postcard::to_allocvec(&msgs()[0]).unwrap();
-        trailing.push(0);
-        let mut w = vec![trailing.len() as u8];
-        w.extend(trailing);
+        let whole = postcard::to_allocvec(&msgs()[0]).unwrap();
+        let mut w = vec![(whole.len() - 1) as u8];
+        w.extend(&whole[..whole.len() - 1]);
         refuse(&w, RecordError::Malformed);
         // The largest length is accepted as a length (the body then decides).
         let mut dec = RecordDecoder::new();
         assert_eq!(decode_all(&mut dec, &[0x80, 0x08]), Ok(vec![]));
         assert!(!dec.at_boundary());
+    }
+
+    /// A later build's records: an unknown kind is skipped whole, fields appended to a known one
+    /// are ignored, and the stream goes on (DESIGN.md section 8.5).
+    #[test]
+    fn a_later_builds_records_are_skipped() {
+        let mut wire = vec![4, MUX_KINDS as u8, 1, 2, 3];
+        let mut longer = postcard::to_allocvec(&msgs()[0]).unwrap();
+        longer.extend_from_slice(&[0xAA, 0xBB]);
+        wire.push(longer.len() as u8);
+        wire.extend(longer);
+        wire.extend(encode_record(&msgs()[2]).unwrap());
+        let mut dec = RecordDecoder::new();
+        assert_eq!(
+            decode_all(&mut dec, &wire),
+            Ok(vec![msgs()[0].clone(), msgs()[2].clone()])
+        );
+        assert!(dec.at_boundary());
+        // MUX_KINDS is the count: the last variant's index is one below it.
+        let last = MuxMsg::Window {
+            channel: ChannelId(16),
+            window: Window::DEFAULT,
+        };
+        assert_eq!(
+            u32::from(postcard::to_allocvec(&last).unwrap()[0]) + 1,
+            MUX_KINDS
+        );
     }
 
     #[test]

@@ -83,7 +83,7 @@ jobs:
           persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0,cargo-deny@0.20.2,cargo-about@0.9.3
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -91,6 +91,7 @@ jobs:
           # Restore always; save only from main's own run (the extended set after each push of main):
           # a run on any other ref must not seed a cache that a later run of main restores.
           save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
+          cache-on-failure: true
       - name: Drop-in tools (htop; top, git and ssh-add come with the image)
         run: sudo apt-get update && sudo apt-get install -y htop vim less
       # The steps after the first run even when an earlier one failed, so one run shows every red
@@ -134,7 +135,7 @@ jobs:
           persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0,cargo-nextest@0.9.149
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -142,6 +143,7 @@ jobs:
           # full-scale restores this job's cache (`shared-key: check` there is this job's own key).
           # Restore always, save only from main's own run (see lint).
           save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
+          cache-on-failure: true
       - name: just test (logic and OS tests at smoke size, no soaks, no wall-clock tests)
         run: just test
       # Feature unification, which the profile does not change: release.yml checks the shipped
@@ -192,14 +194,14 @@ jobs:
       - name: Toolchain (from rust-toolchain.toml)
         if: steps.relpaths.outputs.run == 'true'
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         if: steps.relpaths.outputs.run == 'true'
         with:
           tool: just@1.59.0
       - name: Lint the release scripts (as release.yml does, so a warning shows up before a release)
         if: steps.relpaths.outputs.run == 'true'
         # --norc: no .shellcheckrc of the tree turns a check off; ubuntu-24.04's shellcheck is release.yml's
-        run: shellcheck --norc -x -S warning tests/release/*.sh tests/ci/release-paths.sh
+        run: shellcheck --norc -x -S warning tests/release/*.sh tests/ci/release-paths.sh tests/ci/test_release_paths.sh
       - name: The release scripts' own tests
         if: steps.relpaths.outputs.run == 'true'
         run: tests/release/just.sh release-test
@@ -267,7 +269,7 @@ jobs:
           persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0,cargo-nextest@0.9.149
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -324,13 +326,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools conntrack ethtool iproute2 iptables openssh-server vim less strace
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Restore always, save only from main's own run (see lint).
-          save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
+          # Restore always, save only from main's own run (see lint), and from one leg: every part
+          # shares this key, so the others would only lose the race to reserve it.
+          save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') && matrix.part == 'ssh' }}
+          cache-on-failure: true
       - name: Lint the harness scripts
         run: shellcheck -x -S warning tests/realnet/*.sh tests/realnet/docker/entrypoint.sh
       - name: Real-network suite (${{ matrix.part }})
@@ -373,7 +377,7 @@ jobs:
           persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           # Pinned, with the image in Cross.toml pinned by digest: the same commit builds the same
           # binary. Bump both together.
@@ -439,7 +443,7 @@ jobs:
           path: remote-bin
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -447,6 +451,7 @@ jobs:
           # The client builds only; the remote binary comes from the uncached aarch64 job.
           # Restore always, save only from main's own run (see lint).
           save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
+          cache-on-failure: true
       - name: The fil-test account behind the gate (throwaway runner)
         run: |
           uname -m
@@ -526,7 +531,8 @@ jobs:
           # only from main's own run (see lint).
           workspaces: tests/terminals/exporter
           save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+          cache-on-failure: true
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-deny@0.20.2
       - name: Lint the harness (the exporter is outside the workspace, so `just ci` never sees it)

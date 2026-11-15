@@ -98,9 +98,11 @@ shipped-no-test-hooks:
     "{{target_dir}}/release/fil" --version
 
 # The cases of the Gitea workflow's push-to-main skip decision (tests/ci/push_skip.py, issue #38):
-# offline fakes of git and the API, under a second. Part of `ci`; needs python3.
+# offline fakes of git and the API, under a second; and of the release-test jobs' path filter
+# (tests/ci/release-paths.sh: Linux's list and macOS's `--mac`). Part of `ci`; needs python3 and git.
 ci-workflow-test:
     python3 -I -B tests/ci/test_push_skip.py
+    tests/ci/test_release_paths.sh
 
 fmt-check:
     cargo fmt --all --check
@@ -433,11 +435,13 @@ local transport="pipe" session=("local-" + transport):
 # client in a pseudo-terminal against `fil server --stdio` on each Pi. The Pi binary must be
 # installed first (docs/m1/pi.md). Flags: --hosts pi1,pi2, --only NAME, --verbose, --list.
 # Targets: FIL_PI_TARGETS="pi1=fil-test@HOST,pi2=fil-test@HOST" (required; the keys are the hosts it may touch). Never part of `ci`.
+# The client builds with the `ci` profile (Cargo.toml), as the drop-in suite's does: it tests
+# behavior, not the shipped bytes, and shares the drop-in suite's build in the arm64 shards.
 pi-e2e *args:
-    cargo build --release -p fil-shell --bins
-    cargo build --release -p fil-shell --example pi_e2e
-    just no-test-hooks "{{target_dir}}/release/fil"
-    "{{target_dir}}/release/examples/pi_e2e" {{args}}
+    cargo build --profile ci -p fil-shell --bins
+    cargo build --profile ci -p fil-shell --example pi_e2e
+    just no-test-hooks "{{target_dir}}/ci/fil"
+    "{{target_dir}}/ci/examples/pi_e2e" --fil "{{target_dir}}/ci/fil" {{args}}
 
 # The drop-in suite (docs/m1/dropin.md): everyday ssh, et and mosh work (vim, less, top, history,
 # floods, unicode, resizes, detach, takeover, a killed ssh or client, a sleeping client) through the

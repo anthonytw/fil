@@ -9,7 +9,8 @@
 #   check     the PR gate, about 10 min (21 on the release paths), Apple silicon only: `check (arm64)` (clippy, the OS tests
 #             `just test-os` (pure logic runs on Linux), a cross `cargo check` of the Intel build,
 #             the PTY tests) and `release-test (arm64)` (the release scripts' own tests, when the
-#             change touches the release paths, tests/ci/release-paths.sh).
+#             change touches macOS's release paths, `tests/ci/release-paths.sh --mac`:
+#             tests/release/, packaging/ and release.yml).
 #   extended  once per merge batch on `main` (the run of each push of main,
 #             which also saves the rust-cache every other run restores; save-if below), about 15 min:
 #             the gate's jobs, with the prediction harness and the drop-in quick set against a
@@ -124,7 +125,7 @@ jobs:
           persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0,cargo-nextest@0.9.149
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -134,6 +135,7 @@ jobs:
           # Restore always; save only from main's own run (the extended set after each push of
           # main): a run on any other ref must not seed a cache that a later run of main restores.
           save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
+          cache-on-failure: true
       - name: Machine
         run: |
           sw_vers
@@ -210,7 +212,7 @@ jobs:
           persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -258,8 +260,10 @@ jobs:
     # The release scripts' own tests on macOS (`tests/release/just.sh release-test`): the BSD
     # userland of the scripts the owner runs on a Mac, and the macOS signing fakes. A job of its
     # own, beside `check`, so that it neither lengthens nor eats into `check`'s limit; only when
-    # the change touches the release paths (otherwise the job ends after the paths step, which on
-    # main's own run is always). Not in suite=all: linux-check's release-test runs there once.
+    # the change touches tests/release/, packaging/ or release.yml (`release-paths.sh --mac`; the
+    # wider list, the justfile, the check workflows and the manifests among it, is linux-check's
+    # alone, and macOS sees such a change on the next release-path PR). Otherwise the job ends
+    # after the paths step, which on main's own run is always. Not in suite=all: linux-check's release-test runs there once.
     # The job always exists in the gate, so a ruleset can require it.
     if: contains(fromJSON('["check","extended"]'), (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')))
     name: release-test (arm64)
@@ -276,11 +280,13 @@ jobs:
           persist-credentials: false
       - name: Does the change touch the release paths?
         id: relpaths
-        run: tests/ci/release-paths.sh
+        # --mac: only tests/release/, packaging/ and release.yml, what this run adds over Linux's
+        # (the job still runs and ends here otherwise, so the required check reports).
+        run: tests/ci/release-paths.sh --mac
       - name: Toolchain (from rust-toolchain.toml)
         if: steps.relpaths.outputs.run == 'true'
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         if: steps.relpaths.outputs.run == 'true'
         with:
           tool: just@1.59.0
@@ -308,13 +314,15 @@ jobs:
           persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Restore always, save only from main's own run (see check).
-          save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') }}
+          # Restore always, save only from main's own run (see check), and from the user-sshd leg:
+          # both legs share this key, so the other would only lose the race to reserve it.
+          save-if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.ref == 'main') && matrix.sshd == 'user' }}
+          cache-on-failure: true
       - name: Machine
         run: |
           sw_vers

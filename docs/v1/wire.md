@@ -72,7 +72,13 @@ This note is the contract. `DESIGN.md` §8.5 ("Versioning") points here and foll
 15. **Non-canonical varints stay accepted, frozen so for 1.x.** An example is a variant index
     written in more bytes than it needs (`85 00` is `Detach`). No honest sender writes one, and
     the skip decision and the decoder read the same varint, so no misparse follows. A golden
-    probe pins the behavior.
+    probe pins the behavior. The one reader that does not take them is the relay's hello reader
+    (`opening::hello_of`), which is byte-exact by design: it matches the frozen `Hello` line,
+    variant index `00`, so a hello written as `80 00 …` is "not a hello" to the relay and takes
+    the documented fallback for an unknown opening (`Want::Own`: the relay's own build's
+    daemon, with no `Route` read), while that daemon's decoder accepts it as a `Hello`. Only
+    the user's own client writes there, no honest sender writes it, and nothing after it is
+    misparsed, so this is accepted for 1.x.
 16. **Old-against-new CI.** A `compat` job runs in `linux-check`'s `extended` and `all` suites,
     with a bounded set of tags: `v1.0.0`, plus the newest patch of each of the two newest
     minors listed in `tests/compat/tags.txt`, so at most three tags. Each one is built
@@ -196,7 +202,8 @@ sequenceDiagram
     D-->>C: AttachReply / Response …
 ```
 
-- `ControlMsg::Features(FeatureSet)` is the last variant. A `FeatureSet` is a byte string of 0
+- `ControlMsg::Features(FeatureSet)` is index 17; since revision 17, `ControlMsg::Route`
+  (index 18) is the last variant. A `FeatureSet` is a byte string of 0
   to 32 bytes, where bit `n` is feature `n`, least significant bit first. A longer one does not
   decode.
 - Each side sends it once per connection, right after its `Hello` by convention, on every hop

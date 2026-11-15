@@ -39,14 +39,14 @@ or for one run, `fil devbox --predict off`. `predict = "always"` shows guesses a
 
 **Password prompts.** Nothing is predicted while the host's terminal is at a password prompt (the mode `sudo`, `ssh`, `passwd`, `read -s` and `getpass` use: canonical, with echo off), and anything already drawn is taken back when fil learns of the prompt. Four rare cases can still draw keys you type; they were accepted as the price of predicting in shells, whose line editors turn echo off too:
 
-1. A raw-mode program that starts reading a secret on an ordinary key, without changing the terminal mode or drawing a prompt first. The keys typed before fil sees that they are not echoed are drawn: about one round trip and 50 ms.
+1. A raw-mode program that starts reading a secret on an ordinary key, without changing the terminal mode or drawing a prompt first. The keys typed before fil sees that they are not echoed are drawn: about one round trip and 50 ms. A short paste that your terminal does not mark as one counts as typing (see Pasting, below), so it can be drawn whole.
 2. A password typed ahead of its prompt, such as `sleep 3; read -s` with the password typed during the `sleep`. The keys typed in the round trip before fil learns of the prompt are drawn.
 3. Output that equals the typed keys, such as an asterisk mask's `*` when you type `*`, or a PIN prompt that echoes `1` for a typed `1`: fil takes it as an echo.
 4. A secret prompt drawn only to the right of the cursor, or only by changing colors or other attributes, or drawn and erased again before fil looks.
 
 A guess once drawn has reached your terminal, its scrollback and anything recording or sharing your screen, even if fil erases it at once. If that matters on a host, set `predict = "off"` for it. The [security and privacy](security-privacy.md) page has the rest.
 
-**Pasting.** Pasted text is never predicted: it goes to the host as is, and you see it when the host echoes it. fil recognizes a paste by your terminal's bracketed-paste markers, or, when the program on the host has not turned bracketed paste on, by its size (a read of 64 bytes or more, and what follows it within a few milliseconds). After a paste, as after Enter, fil waits for the host to echo the first key you type before it shows guesses again.
+**Pasting.** Pasted text that fil recognizes as a paste is not predicted: it goes to the host as is, and you see it when the host echoes it. fil recognizes a paste by your terminal's bracketed-paste markers, or, when the program on the host has not turned bracketed paste on, by its size (a read of 64 bytes or more, and what follows it within a few milliseconds). Without the markers, a paste under 64 bytes looks like typing and can be predicted like typing. After a paste, as after Enter, fil waits for the host to echo the first key you type before it shows guesses again.
 
 ## Configuration
 

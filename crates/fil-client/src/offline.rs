@@ -276,6 +276,12 @@ impl LogDir {
         if md.uid() != me && md.uid() != 0 {
             return Err(format!("its directory {} is not yours", parent.display()));
         }
+        // A group- or world-writable directory is refused unless it is sticky (`/tmp`): the rule
+        // is that nobody else can *replace* the file. In a sticky directory others cannot rename
+        // or remove a file of ours, and opening the log refuses a planted file or symlink
+        // (`O_NOFOLLOW`, owner, link count, mode). They can still see its size and mtime, as in
+        // any directory they can search, and block its creation with a planted name, which only
+        // stops the log. Accepted and documented (docs/user/security-privacy.md, privacy 3).
         if md.mode() & 0o022 != 0 && md.mode() & 0o1000 == 0 {
             return Err(format!(
                 "its directory {} (mode {:o}) lets other users replace files in it; the log can hold passwords (chmod go-w it)",

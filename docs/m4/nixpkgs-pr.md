@@ -1,6 +1,6 @@
 # Draft: the nixpkgs PR for fil-shell
 
-> **Status: a draft for after the 0.1.0 release (M4 PKG, `docs/m4/packaging.md` §5).** Nothing here is submitted. The PR is opened from a fork of nixpkgs by whoever maintains the package (owner question: who is listed in `maintainers`, which needs an entry in nixpkgs' `maintainers/maintainer-list.nix`, with a GitHub handle and a contact the owner chooses). The `hash` and `cargoHash` are filled in from a real build of the tag.
+> **Status: a draft, not submitted (M4 PKG, `docs/m4/packaging.md` §5 and §9).** It was written for after 0.1.0; by the owner's 1.0 decision D5 the owner submits it from their own account, from 1.0 on (`docs/m4/packaging.md` §9). Nothing has been submitted for 0.1.0, 0.2.0 or 0.3.0. The PR is opened from a fork of nixpkgs by whoever maintains the package (owner question: who is listed in `maintainers`, which needs an entry in nixpkgs' `maintainers/maintainer-list.nix`, with a GitHub handle and a contact the owner chooses). The `hash` and `cargoHash` are filled in from a real build of the tag.
 
 ## Before opening it
 

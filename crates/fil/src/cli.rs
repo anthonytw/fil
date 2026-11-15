@@ -7,6 +7,7 @@
 //! fil -N HOST [SESSION] -L|-R|-D SPEC... [-A]    tunnel only (default session: tunnel)
 //! fil ls HOST                                    list sessions
 //! fil kill HOST SESSION                          end a session
+//! fil kill --outdated [--yes] HOST               end the sessions on daemons older than this fil
 //! fil detach [HOST SESSION]                      detach whoever is attached (no arguments: inside a session)
 //! fil forward [HOST [SESSION]] -L|-R|-D SPEC     add a forward to a running session
 //! fil forward [HOST [SESSION]] --rm [-L|-R|-D] PORT   remove one
@@ -235,12 +236,25 @@ pub enum Command {
         #[arg(value_name = "HOST")]
         host: String,
     },
-    /// End a session: its shell and everything it started are killed
+    /// End a session: its shell and everything it started are killed. With --outdated: every
+    /// session on a daemon older than this fil, after showing them with their jobs and asking
     Kill {
+        /// End every session on HOST whose daemon is an older fil than this one (after an
+        /// upgrade, say a security fix), after listing them with the jobs left in them and asking
+        #[arg(long)]
+        outdated: bool,
+        /// With --outdated: do not ask (needed when stdin is not a terminal)
+        #[arg(long, short = 'y', requires = "outdated")]
+        yes: bool,
         #[arg(value_name = "HOST")]
         host: String,
-        #[arg(value_name = "SESSION", value_parser = SessionParser)]
-        session: SessionName,
+        #[arg(
+            value_name = "SESSION",
+            value_parser = SessionParser,
+            required_unless_present = "outdated",
+            conflicts_with = "outdated"
+        )]
+        session: Option<SessionName>,
     },
     /// Detach whoever is attached to a session; it keeps running (inside a session, with no
     /// arguments: this one)
@@ -561,6 +575,11 @@ pub enum Action {
         host: String,
         session: SessionName,
     },
+    /// `fil kill --outdated HOST`: the sessions on daemons older than this fil. `yes`: do not ask.
+    KillOutdated {
+        host: String,
+        yes: bool,
+    },
     Detach {
         host: String,
         session: SessionName,
@@ -684,7 +703,26 @@ impl Cli {
     pub fn action(self) -> Result<Action, clap::Error> {
         match self.command {
             Some(Command::Ls { host }) => Ok(Action::List { host }),
-            Some(Command::Kill { host, session }) => Ok(Action::Kill { host, session }),
+            Some(Command::Kill {
+                yes: true,
+                outdated: false,
+                ..
+            }) => Err(usage_error(
+                "kill",
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "--yes goes with --outdated (`fil kill --outdated --yes HOST`); `fil kill HOST SESSION` does not ask",
+            )),
+            Some(Command::Kill {
+                host,
+                session: Some(session),
+                ..
+            }) => Ok(Action::Kill { host, session }),
+            Some(Command::Kill {
+                host,
+                session: None,
+                yes,
+                ..
+            }) => Ok(Action::KillOutdated { host, yes }),
             Some(Command::Detach { host, session }) => match (host, session) {
                 (Some(host), Some(session)) => Ok(Action::Detach { host, session }),
                 (None, _) => Ok(Action::DetachHere),
@@ -978,6 +1016,36 @@ mod tests {
                 session: name("build")
             }
         );
+        assert_eq!(
+            action(&["kill", "--outdated", "devbox"]),
+            Action::KillOutdated {
+                host: "devbox".into(),
+                yes: false
+            }
+        );
+        assert_eq!(
+            action(&["kill", "--outdated", "--yes", "devbox"]),
+            Action::KillOutdated {
+                host: "devbox".into(),
+                yes: true
+            }
+        );
+        assert_eq!(
+            action(&["kill", "devbox", "--outdated", "-y"]),
+            Action::KillOutdated {
+                host: "devbox".into(),
+                yes: true
+            }
+        );
+        // A session and --outdated together, --yes without --outdated, and a bare kill HOST are
+        // usage errors.
+        assert!(parse(&["kill", "--outdated", "devbox", "build"]).is_err());
+        assert!(
+            parse(&["kill", "--yes", "devbox", "build"])
+                .and_then(Cli::action)
+                .is_err()
+        );
+        assert!(parse(&["kill", "devbox"]).is_err());
     }
 
     #[test]

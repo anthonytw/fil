@@ -107,6 +107,7 @@ fn variant_name(r: &Response) -> &'static str {
         Response::NoSuchSession => "NoSuchSession",
         Response::Forward(_) => "Forward",
         Response::Ports { .. } => "Ports",
+        Response::Jobs { .. } => "Jobs",
     }
 }
 

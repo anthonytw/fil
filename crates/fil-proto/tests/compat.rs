@@ -140,7 +140,7 @@ fn every_message_takes_a_tail_but_the_hello() {
 #[test]
 fn a_later_builds_new_types_are_skipped() {
     // A control message of a type past the last: unknown, for the caller to skip.
-    for index in [18u32, 100, 16_000] {
+    for index in [fil_proto::msg::CONTROL_VARIANTS, 100, 16_000] {
         let mut v = postcard::to_allocvec(&index).unwrap();
         v.extend_from_slice(b"anything at all");
         assert_eq!(ControlMsg::decode(&v), Err(MsgError::Unknown(index)));
@@ -200,7 +200,7 @@ fn unknown_variants_inside_a_message_are_still_errors() {
 fn features_in_use_are_the_ones_both_sides_have() {
     let a_1_1 = FeatureSet::of(&[Feature(0), Feature(3)]);
     let b_1_2 = FeatureSet::of(&[Feature(0), Feature(3), Feature(7), Feature(250)]);
-    let c_1_0 = FeatureSet::ours();
+    let c_1_0 = FeatureSet::none();
     assert_eq!(a_1_1.common(&b_1_2), a_1_1);
     assert_eq!(b_1_2.common(&a_1_1), a_1_1);
     assert!(c_1_0.common(&b_1_2).is_empty());

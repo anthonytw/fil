@@ -711,6 +711,14 @@ pub enum Request {
         session: Option<SessionName>,
         probe_other: bool,
     },
+    /// The jobs still running inside one session, or every session (`None`), without touching
+    /// any: `fil kill --outdated`'s pre-check (decision D2). Answered with [`Response::Jobs`].
+    /// Wire revision 17, behind [`crate::ext::Feature::JOBS`]: sent only to a daemon that
+    /// advertised it (a 1.0 daemon cannot decode it). Not a flag on `KillSession`, which a 1.0
+    /// daemon would ignore and kill (docs/v1/wire.md, *D2 under the frozen wire*).
+    Jobs {
+        session: Option<SessionName>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -800,6 +808,26 @@ pub enum Response {
     Killed {
         unchecked: bool,
     },
+    /// The answer to [`Request::Jobs`]: one row per session asked about (none for a session that
+    /// is not here), cut to fit one control message and then marked `truncated`, as
+    /// [`Response::Sessions`] is. Wire revision 17, behind [`crate::ext::Feature::JOBS`].
+    Jobs {
+        list: Vec<JobsRow>,
+        truncated: bool,
+    },
+}
+
+/// One session's jobs, as `fil kill --outdated` shows them before it asks: what is still running
+/// inside it besides its shell. A count only (no process names, no pids): enough to decide, and
+/// nothing a later row needs cannot go in its [`RowExt`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobsRow {
+    pub name: SessionName,
+    /// Processes started in the session that are still running, its shell not counted. `None`
+    /// when the daemon could not read the process table.
+    pub jobs: Option<u16>,
+    /// Fields a later 1.x release adds to the row (empty in revision 17; `crate::ext::RowExt`).
+    pub ext: RowExt,
 }
 
 /// Rows of a `fil ports` answer (DESIGN.md section 7.4). A part is at most one control message
@@ -1046,6 +1074,23 @@ fn capped_others<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<OtherDaemon>, D:
 }
 
 impl Response {
+    /// A `Jobs` response holding as many of `list` as fit in one control message (in order, cut
+    /// at the end).
+    pub fn jobs(mut list: Vec<JobsRow>) -> Self {
+        let mut truncated = false;
+        loop {
+            let r = Response::Jobs {
+                list: list.clone(),
+                truncated,
+            };
+            if ControlMsg::Response(r.clone()).encode().is_ok() || list.is_empty() {
+                return r;
+            }
+            list.pop();
+            truncated = true;
+        }
+    }
+
     /// A `Sessions` response holding as many of `list` as fit in one control message (the list is
     /// kept in order and cut at the end).
     pub fn sessions(mut list: Vec<SessionSummary>, mut others: Vec<OtherDaemon>) -> Self {
@@ -1212,13 +1257,46 @@ pub enum ControlMsg {
     /// (`crate::ext`). Those in use are the ones both sides sent. A peer whose next message
     /// after its hello is anything else has none.
     Features(FeatureSet),
+    /// Client to its relay, between its `Hello` and its `Features`: which daemon on the host to
+    /// connect it to (decision D2; docs/v1/wire.md, *D2 under the frozen wire*). The relay reads
+    /// it and does not pass it on. A relay too old to know it passes it on, and the daemon skips
+    /// it (an unknown type to a 1.0 daemon; a later daemon, which knows it, ignores it too), so
+    /// the client reaches that relay's default daemon. Wire revision 17; no feature, since nothing
+    /// that skips it misreads anything.
+    Route(Route),
 }
 
 /// How many variants [`ControlMsg`] has: an index at or past it is a type from a later build.
 /// Kept by hand; `tests/wire_golden.rs` ties it to its exhaustive match and decodes every
 /// instance it pins, so a variant added without raising it fails there (it would otherwise be
 /// skipped by its own build).
-pub const CONTROL_VARIANTS: u32 = 18;
+pub const CONTROL_VARIANTS: u32 = 19;
+
+/// The variant index of [`ControlMsg::Route`], which the relay reads by number (it routes clients
+/// of any 1.x build) before it decodes the rest.
+pub const ROUTE_INDEX: u32 = 18;
+
+/// [`ControlMsg::Route`]: the daemon a client wants. Fields a later 1.x release adds go at the
+/// end, as for any message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    pub to: RouteTo,
+}
+
+/// Which daemon a [`Route`] names. A relay that cannot decode a `Route` (a variant from a later
+/// release) routes as if there were none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteTo {
+    /// The newest daemon of the client's family: what the relay does without a `Route`.
+    Newest,
+    /// The daemon of this build (its version and wire revision), if it is running; otherwise as
+    /// without a `Route`. Nothing is started for it.
+    Build { version: FilVersion, revision: u16 },
+    /// The daemon that holds this session, newest first, if one of the running daemons of the
+    /// client's family does; otherwise as without a `Route` (an attach then creates the session
+    /// on the newest daemon).
+    Session(SessionName),
+}
 
 impl ControlMsg {
     /// Encode as the payload of a control frame.
@@ -1267,8 +1345,13 @@ mod tests {
     /// `CONTROL_VARIANTS` is what tells a known type from a later build's: it must be the count.
     #[test]
     fn the_variant_count_is_the_last_index_plus_one() {
-        let last = ControlMsg::Features(FeatureSet::none()).encode().unwrap();
+        let last = ControlMsg::Route(Route {
+            to: RouteTo::Newest,
+        })
+        .encode()
+        .unwrap();
         assert_eq!(u32::from(last[0]) + 1, CONTROL_VARIANTS);
+        assert_eq!(u32::from(last[0]), ROUTE_INDEX);
     }
 
     /// A later build's type is unknown, not malformed; its appended fields are ignored; a hello

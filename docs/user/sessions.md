@@ -22,9 +22,30 @@ flowchart LR
 ```sh
 fil ls devbox                 # NAME, TERM, FORWARDS, ATTACHED, LAST OUTPUT, CREATED, FIL
 fil kill devbox build         # end "build"
+fil kill --outdated devbox    # end the sessions on daemons older than this fil, after asking
 ```
 
 `fil kill` hangs up the session's shell and everything it started, as closing a terminal would, then kills whatever is left after a short grace. The client attached to it sees the session end.
+
+## After an upgrade: daemons of several versions
+
+Each version of fil runs its own daemon on a host. After you upgrade, your next connection starts the new version's daemon beside the old one, and the old daemon keeps its sessions until they end, then exits. Nothing is lost, and nothing has to be ended first:
+
+- `fil ls devbox` lists the sessions of every daemon, in one table; the FIL column says which version's daemon holds each. (It asks each daemon over a connection of its own, so an older daemon costs one more ssh connection while it runs.)
+- `fil devbox build`, and `fil kill`, `fil detach`, `fil forward` and `fil ports` with a session name, reach that session on whichever daemon holds it. A name no daemon has is a new session on the newest daemon.
+- `fil kill --outdated devbox` ends the sessions on daemons older than your fil, for when the new version fixes something in the daemon (a security fix, say) and the old sessions should not wait to end on their own. It lists them first, with the jobs still running in each, then asks:
+
+  ```text
+  sessions on devbox whose daemon is older than this fil (1.1.0):
+    SESSION  FIL    JOBS
+    main     1.0.2  2 running
+    notes    1.0.2  none
+  fil: end these 2 sessions and everything running in them? [y/N]
+  ```
+
+  `y` ends them, each on its own daemon; anything else ends nothing (status 1). With stdin not a terminal it ends nothing unless you pass `--yes` (`-y`). A daemon from 1.0.0 has no jobs check: its sessions are listed with `not checked (fil 1.0.0 cannot report them)` and are still ended on `y`.
+
+This works when the fil that runs on the host is this version or later, which the install command makes sure of (it runs your own version there). With `remote = "plain"` and an older fil installed on the host, connections go where that fil sends them: the newest daemon.
 
 ## Detach
 

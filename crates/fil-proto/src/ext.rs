@@ -64,11 +64,14 @@ pub struct Feature(pub u16);
 impl Feature {
     /// The highest bit a set can carry.
     pub const MAX: u16 = (MAX_FEATURE_BYTES * 8 - 1) as u16;
+    /// Bit 0 (wire revision 17): the daemon answers `Request::Jobs` with `Response::Jobs`, the
+    /// jobs pre-check of `fil kill --outdated` (decision D2).
+    pub const JOBS: Feature = Feature(0);
 }
 
-/// The features this build has. 1.0 defines none: everything in it is the baseline every 1.x
+/// The features this build has. 1.0 defined none: everything in it is the baseline every 1.x
 /// peer speaks. Add a feature here, with its number, when a 1.x release adds one.
-pub const OURS: &[Feature] = &[];
+pub const OURS: &[Feature] = &[Feature::JOBS];
 
 /// A set of features: a bitmap of up to [`MAX_FEATURE_BYTES`] bytes, bit `n` (least significant
 /// first) for feature `n`. A longer one does not decode; bits a build does not know are kept on
@@ -211,7 +214,9 @@ mod tests {
         assert!(c.has(Feature(9)) && !c.has(Feature(0)) && !c.has(Feature(200)));
         assert_eq!(c.as_bytes(), &[0, 2]);
         assert!(FeatureSet::none().common(&a).is_empty());
-        assert!(FeatureSet::ours().is_empty(), "1.0 defines no feature");
+        // Revision 17's only feature is the jobs pre-check, bit 0.
+        assert_eq!(FeatureSet::ours().as_bytes(), &[1]);
+        assert!(FeatureSet::ours().has(Feature::JOBS));
     }
 
     #[test]

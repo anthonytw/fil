@@ -79,9 +79,15 @@ List the sessions on HOST
 .PP
 Usage: \fBfil ls [OPTIONS] <HOST>\fR
 .SS "fil kill"
-End a session: its shell and everything it started are killed
+End a session: its shell and everything it started are killed. With \-\-outdated: every session on a daemon older than this fil, after showing them with their jobs and asking
 .PP
-Usage: \fBfil kill [OPTIONS] <HOST> <SESSION>\fR
+Usage: \fBfil kill [OPTIONS] <HOST> [SESSION]\fR
+.TP
+\fB\-\-outdated\fR
+End every session on HOST whose daemon is an older fil than this one (after an upgrade, say a security fix), after listing them with the jobs left in them and asking
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+With \-\-outdated: do not ask (needed when stdin is not a terminal)
 .SS "fil detach"
 Detach whoever is attached to a session; it keeps running (inside a session, with no arguments: this one)
 .PP

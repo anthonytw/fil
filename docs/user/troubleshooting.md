@@ -27,11 +27,11 @@ With `remote = "plain"` in your [config](config.md), only `fil server --stdio` r
 
 Two fil builds of `wire 1.16` or later (in `fil --version`) always talk to each other. Older builds talk only when their wire numbers are equal, and builds of different majors (`wire 1.x` and `wire 2.x`) never do. The message says which side is newer and which to upgrade. By default fil runs its install command first, which never starts a fil of another wire: it starts a copy of the right version if the host has one, and otherwise offers to install it. You see this message with `remote = "plain"`, behind a forced command, or when the copy it started is of another wire. Then upgrade the older side: [install](install.md) the same version on the host.
 
-Daemons of different wires coexist on a host, so an upgrade breaks no running session. Sessions of the old daemon keep running there; the new fil does not list them, and the old fil still reaches them.
+Daemons of different wires coexist on a host, so an upgrade breaks no running session. Sessions of a daemon of an older, incompatible wire (`wire 1.15` and before) keep running there; a `wire 1.16` or later fil does not list them, and the old fil still reaches them.
 
 ## A patch release, and daemons that are still running
 
-A patch (for example 0.1.0 to 0.1.1) keeps the wire. Each version runs its own daemon, so the new version's first connection starts a daemon of its own beside the one already running, new sessions go to it, and the old daemon exits as soon as its last session ends. Until fil can address an older daemon of the same wire (planned for 1.0), the old daemon's sessions are not listed or reachable once the new one runs, so end them (`fil kill`) before you upgrade the host. (Before this change a patch release reused the running daemon, and its fixes waited until that daemon exited.)
+Each version runs its own daemon, so the new version's first connection starts a daemon of its own beside the one already running, new sessions go to it, and the old daemon exits as soon as its last session ends. From `wire 1.17` on, `fil ls` lists the old daemon's sessions too (its FIL column names the version), and `fil HOST SESSION` and `fil kill` reach them there. If an old session does not show up or is not reached, the fil that runs on the host is older than `wire 1.17` (with `remote = "plain"`, it is the one installed there): `fil ls` then names the other daemon in an "also running" line with the reason, and upgrading the host's fil fixes it. To end every session of the older daemons at once, `fil kill --outdated HOST`. (Before 1.0 a patch release reused the running daemon, and its fixes waited until that daemon exited.)
 
 ## "This host kills a user's processes when the last login ends"
 

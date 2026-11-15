@@ -210,6 +210,10 @@ fn requests() -> Vec<Request> {
             session: Some(name("main")),
             probe_other: true,
         },
+        Request::Jobs { session: None },
+        Request::Jobs {
+            session: Some(name("main")),
+        },
     ];
     for c in &all {
         match c {
@@ -217,7 +221,8 @@ fn requests() -> Vec<Request> {
             | Request::KillSession { .. }
             | Request::DetachSession { .. }
             | Request::Forward { .. }
-            | Request::Ports { .. } => {}
+            | Request::Ports { .. }
+            | Request::Jobs { .. } => {}
         }
     }
     all
@@ -1229,11 +1234,31 @@ fn responses() -> Vec<Response> {
     }
     all.push(Response::Killed { unchecked: false });
     all.push(Response::Killed { unchecked: true });
+    all.push(Response::Jobs {
+        list: vec![
+            JobsRow {
+                name: name("main"),
+                jobs: Some(2),
+                ext: fil_proto::ext::RowExt::default(),
+            },
+            JobsRow {
+                name: name("build"),
+                jobs: None,
+                ext: fil_proto::ext::RowExt::default(),
+            },
+        ],
+        truncated: false,
+    });
+    all.push(Response::Jobs {
+        list: Vec::new(),
+        truncated: true,
+    });
     for c in &all {
         match c {
             Response::Sessions { .. }
             | Response::Done
             | Response::Killed { .. }
+            | Response::Jobs { .. }
             | Response::NoSuchSession
             | Response::Ports { .. } => {}
             Response::Forward(r) => match r {
@@ -1636,6 +1661,59 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
             ],
         }),
     );
+    add(
+        "max/request-jobs",
+        ControlMsg::Request(Request::Jobs {
+            session: Some(name(&longest('n', MAX_SESSION_NAME))),
+        }),
+    );
+    add(
+        "max/response-jobs",
+        ControlMsg::Response(Response::Jobs {
+            list: vec![JobsRow {
+                name: name(&longest('n', MAX_SESSION_NAME)),
+                jobs: Some(u16::MAX),
+                ext: fil_proto::ext::RowExt::from_bytes(&[0xee; MAX_ROW_EXT]).unwrap(),
+            }],
+            truncated: true,
+        }),
+    );
+    add(
+        "route-newest",
+        ControlMsg::Route(Route {
+            to: RouteTo::Newest,
+        }),
+    );
+    add(
+        "route-build",
+        ControlMsg::Route(Route {
+            to: RouteTo::Build {
+                version: FilVersion::new("1.0.0").unwrap(),
+                revision: 16,
+            },
+        }),
+    );
+    add(
+        "route-session",
+        ControlMsg::Route(Route {
+            to: RouteTo::Session(name("main")),
+        }),
+    );
+    add(
+        "max/route-build",
+        ControlMsg::Route(Route {
+            to: RouteTo::Build {
+                version: FilVersion::new(longest('9', MAX_FIL_VERSION)).unwrap(),
+                revision: u16::MAX,
+            },
+        }),
+    );
+    add(
+        "max/route-session",
+        ControlMsg::Route(Route {
+            to: RouteTo::Session(name(&longest('n', MAX_SESSION_NAME))),
+        }),
+    );
     v.push((
         "features/none".into(),
         ControlMsg::Features(fil_proto::ext::FeatureSet::none()),
@@ -1695,7 +1773,7 @@ fn input_records() -> Vec<(String, InputRecord)> {
 }
 
 /// How many `ControlMsg` variants there are. Extend it with the match below.
-const VARIANTS: usize = 18;
+const VARIANTS: usize = 19;
 /// Retired slots (`ControlMsg::Retired`): no instance can exist.
 const RETIRED: [usize; 1] = [10];
 
@@ -1720,6 +1798,7 @@ fn variant_index(m: &ControlMsg) -> usize {
         ControlMsg::Request(_) => 15,
         ControlMsg::Response(_) => 16,
         ControlMsg::Features(_) => 17,
+        ControlMsg::Route(_) => 18,
     }
 }
 
@@ -2349,11 +2428,17 @@ fn revisioned() -> Entries {
     // `Ports { session: None, probe_other: false }`.
     e.push(("decode/request-4".into(), outcome::<Request>(&[4, 0, 0])));
     e.push(("decode/request-5".into(), outcome::<Request>(&[5, 0])));
+    // Revision 17: `Jobs` took index 5; the first kind past it.
+    e.push(("decode/request-6".into(), outcome::<Request>(&[6, 0])));
     e.push(("decode/response-2".into(), outcome::<Response>(&past(2))));
     e.push(("decode/response-3".into(), outcome::<Response>(&[3, 0, 1])));
     // `Killed { unchecked: false }`, then the first kind past it.
     e.push(("decode/response-5".into(), outcome::<Response>(&[5, 0, 0])));
     e.push(("decode/response-6".into(), outcome::<Response>(&[6, 0, 0])));
+    // Revision 17: `Jobs` took index 6; the first kind past it.
+    e.push(("decode/response-7".into(), outcome::<Response>(&[7, 0, 0])));
+    // `Route`: the first kind past its last.
+    e.push(("decode/route-to-3".into(), outcome::<RouteTo>(&past(3))));
     // Index 10 was `Reset`: retired, and nothing decodes there.
     e.push((
         "decode/control-10-retired".into(),
@@ -2398,7 +2483,12 @@ fn revisioned() -> Entries {
         control_outcome(&[0x85, 0x00]),
     ));
     // Features: the longest set, and one byte past it.
-    let feature_index = VARIANTS as u8 - 1;
+    // `Features` is index 17 (it was the last until `Route`, revision 17).
+    let feature_index = 17u8;
+    assert!(matches!(
+        ControlMsg::decode(&[feature_index, 0]),
+        Ok(ControlMsg::Features(_))
+    ));
     e.push((
         format!("decode/features-{MAX_FEATURE_BYTES}"),
         control_outcome(&raw_msg(feature_index, &[counted(MAX_FEATURE_BYTES, 0xff)])),
@@ -3609,7 +3699,7 @@ fn the_golden_covers_the_whole_wire() {
         "decode/spec-local-port-0 = err",
         "decode/mux-record-len-1025 = err bad-length",
         "decode/control-10-retired = err",
-        "decode/control-18-unknown = unknown",
+        "decode/control-19-unknown = unknown",
         "decode/features-33 = err",
         "control/features/widest ",
     ] {

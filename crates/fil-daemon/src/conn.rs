@@ -3,8 +3,10 @@
 //! A pipe connection comes through the relay's Unix socket; a direct one is an authenticated
 //! QUIC connection. Both speak this:
 //!
-//! 1. The daemon sends `Hello` at once. The client sends `Hello` and then, without waiting,
-//!    either an `Attach` or a `Request`.
+//! 1. The daemon sends `Hello` (its agent `fil-daemon <build version>`) and `Features` at once.
+//!    The client sends `Hello`, `Features` and then, without waiting, either an `Attach` or a
+//!    `Request` (or, for a request behind a feature, waits for the daemon's `Features` first). A
+//!    `Route` for the relay that reaches the daemon is skipped like an unknown type.
 //! 2. A different protocol major **or wire revision** gets `Error(VersionMismatch)` and the
 //!    connection is closed, before the request is read (it may not decode). The daemon's `Hello`
 //!    went first, so the client already knows both numbers and says what to do about them.
@@ -19,9 +21,9 @@
 //!      section 8.5, resume rules), or the connection is closed with `Error(Protocol)`; and the
 //!      key must still be registered (a takeover that revoked it closes the connection anyway).
 //!      Keys are never registered on QUIC: only the pipe, the root of trust, registers.
-//! 4. **`Request`** (pipe only): `ListSessions`, `KillSession`, `DetachSession` and `Forward`
-//!    are answered with one `Response`, `Ports` with one or more parts, and the connection
-//!    closes.
+//! 4. **`Request`** (pipe only): `ListSessions`, `KillSession`, `DetachSession`, `Forward` and
+//!    `Jobs` (`fil kill --outdated`'s pre-check, behind `Feature::JOBS`) are answered with one
+//!    `Response`, `Ports` with one or more parts, and the connection closes.
 //!
 //! A connection that does not get through step 1 and the first request within the handshake
 //! timeout is dropped.
@@ -73,11 +75,26 @@ enum Fail {
     Drop(&'static str),
 }
 
-/// The daemon's hello: the wire revision in its paths, which is also the one in its socket's name.
-fn our_hello(revision: u16) -> Hello {
-    let agent = Agent::new(format!("fil-daemon {}", env!("CARGO_PKG_VERSION")))
+/// The daemon's hello: the wire revision in its paths, which is also the one in its socket's name,
+/// and its build's version (`Paths::version`, the one in its file names) in the agent, which a
+/// client that routed to a particular build reads to check where it got before it sends anything
+/// that build must receive (`fil kill --outdated`).
+fn our_hello(revision: u16, version: &str) -> Hello {
+    let agent = Agent::new(format!("fil-daemon {version}"))
+        .or_else(|_| Agent::new(format!("fil-daemon {}", env!("CARGO_PKG_VERSION"))))
         .expect("the agent string is valid");
     Hello::with_revision(agent, revision)
+}
+
+/// The features this daemon advertises: [`FeatureSet::ours`]. **Test only** (`test-hooks`):
+/// `FIL_TEST_NO_FEATURES` makes it advertise none, as a 1.0 daemon, so a real-binary test can
+/// show a newer client working with one.
+fn our_features() -> FeatureSet {
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("FIL_TEST_NO_FEATURES").is_some() {
+        return FeatureSet::none();
+    }
+    FeatureSet::ours()
 }
 
 async fn send_ctl<L: Link>(link: &L, msg: &ControlMsg) -> Result<(), Fail> {
@@ -163,7 +180,7 @@ impl Inner {
     pub(crate) async fn handle<L: Link>(self: &Arc<Self>, link: L, origin: Origin) {
         let negotiated = tokio::time::timeout(
             self.cfg.handshake_timeout,
-            negotiate(&link, self.paths.revision),
+            negotiate(&link, self.paths.revision, &self.paths.version),
         )
         .await;
         let next = match negotiated {
@@ -419,6 +436,30 @@ impl Inner {
                     }
                 }
             },
+            // `fil kill --outdated`'s pre-check: what still runs in each session, killing nothing.
+            Request::Jobs { session } => {
+                let handles: Vec<SessionHandle> = match &session {
+                    Some(name) => self.session(name).into_iter().collect(),
+                    None => self.sessions(),
+                };
+                let rows = tokio::task::spawn_blocking(move || {
+                    let table = fil_session::proc::scan_processes();
+                    handles
+                        .iter()
+                        .map(|h| fil_proto::msg::JobsRow {
+                            name: h.name().clone(),
+                            jobs: table.as_ref().map(|rows| {
+                                let n = fil_session::proc::jobs_in(h.pid(), &h.pids(), rows);
+                                u16::try_from(n).unwrap_or(u16::MAX)
+                            }),
+                            ext: fil_proto::ext::RowExt::default(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+                Response::jobs(rows)
+            }
             Request::DetachSession { name } => match self.session(&name) {
                 None => Response::NoSuchSession,
                 Some(h) => {
@@ -542,10 +583,14 @@ async fn summary(
 ///
 /// Returns the request and the features in use (ours and the client's). 1.0 defines none, so
 /// nothing reads them yet; a 1.x feature passes them on to what it governs.
-async fn negotiate<L: Link>(link: &L, revision: u16) -> Result<(Next, FeatureSet), Fail> {
-    let ours = our_hello(revision);
+async fn negotiate<L: Link>(
+    link: &L,
+    revision: u16,
+    version: &str,
+) -> Result<(Next, FeatureSet), Fail> {
+    let ours = our_hello(revision, version);
     send_ctl(link, &ControlMsg::Hello(ours.clone())).await?;
-    send_ctl(link, &ControlMsg::Features(FeatureSet::ours())).await?;
+    send_ctl(link, &ControlMsg::Features(our_features())).await?;
     let Some(ControlMsg::Hello(theirs)) = recv_ctl(link).await? else {
         return Err(Fail::Tell(ErrorCode::Protocol));
     };
@@ -557,7 +602,10 @@ async fn negotiate<L: Link>(link: &L, revision: u16) -> Result<(Next, FeatureSet
     let mut skipped = 0;
     loop {
         match recv_ctl(link).await? {
-            None => {
+            // A `Route` is for the relay, which does not pass it on; one reaches a daemon only
+            // through a relay too old to know it (or a client that talks to the socket itself),
+            // and is skipped like a type this daemon does not know, within the same budget.
+            None | Some(ControlMsg::Route(_)) => {
                 skipped += 1;
                 if skipped > MAX_SKIPPED_HANDSHAKE {
                     return Err(Fail::Tell(ErrorCode::Protocol));

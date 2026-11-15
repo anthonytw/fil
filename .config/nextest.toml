@@ -66,7 +66,7 @@ default-filter = """
     or binary_id(fil-client::tunnel)
     or binary_id(fil-client::predict_e2e) or binary_id(fil-client::predict_stack)
     or binary_id(fil-client::predict_suites)
-    or binary_id(fil-shell::binary) or binary_id(fil-shell::install)
+    or binary_id(fil-shell::binary) or binary_id(fil-shell::builds) or binary_id(fil-shell::install)
     or binary_id(fil-shell::install_finish) or binary_id(fil-shell::install_gc)
     or binary_id(fil-shell::install_shells) or binary_id(fil-shell::remote_commands)
     or binary_id(fil-shell::resize_e2e) or binary_id(fil-shell::revision)

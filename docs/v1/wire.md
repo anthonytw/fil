@@ -215,7 +215,8 @@ sequenceDiagram
   appended fields (decision 8). A 1.x client that wants to send a message gated on a feature,
   such as a new `Request` kind, waits for the daemon's `Hello` and `Features` first. Only that
   request pays the round trip.
-- 1.0 defines no feature. `FeatureSet::ours()` is empty. Tests use bits that no build defines.
+- 1.0 defines no feature. Revision 17 defines bit 0, `Feature::JOBS` (the `fil kill --outdated`
+  pre-check, *D2 under the frozen wire*). Tests use bits that no build defines.
 - There is no way to *require* a feature. A daemon that must refuse a peer without one does so
   with a 1.0 `ErrorCode` after reading its `Features`.
 
@@ -270,7 +271,9 @@ making an unknown type fatal. Each of these needs 2.0.
 ## D2 under the frozen wire
 
 D2 (daemons of several versions on one host, `fil kill --outdated`) needs three things from the
-wire:
+wire. All three are in (the last two as revision 17, a 1.x addition: the 1.0 baseline is untouched,
+and the golden only gains lines and the past-the-end probes of `Request` and `Response`; DESIGN §5.3
+*Reaching a particular daemon* has the behavior):
 
 - **Each daemon's version.** `SessionSummary.daemon_version` (the daemon that holds the
   session) and `OtherDaemon.version` (`None` for a daemon known only by its revision) are in the
@@ -294,6 +297,22 @@ wire:
   It must not be an appended field on `KillSession` (such as a "check only" flag): a 1.0 daemon
   would ignore the flag and kill the session, which is exactly the kind of field the sender's
   rule forbids sending without a feature.
+
+As built in revision 17:
+
+- `ControlMsg::Route(Route { to: RouteTo })` is index 18 (`CONTROL_VARIANTS` is 19), with
+  `RouteTo::Newest`, `RouteTo::Build { version, revision }` and `RouteTo::Session(name)`. It needs
+  no feature: nothing that skips it misreads anything. The relay reads it only from a client whose
+  hello names a 1.x revision of its own family, takes it out of the stream whether or not it can
+  decode it (a `RouteTo` variant of a later release routes as if there were none), and starts
+  nothing for it. A daemon that receives one (behind an older relay, or on QUIC) skips it within
+  `MAX_SKIPPED_HANDSHAKE`.
+- `Request::Jobs { session: Option<SessionName> }` (index 5) and
+  `Response::Jobs { list: Vec<JobsRow>, truncated }` (index 6), with
+  `JobsRow { name, jobs: Option<u16>, ext: RowExt }`, behind `Feature::JOBS` (bit 0).
+- The daemon's `Hello` agent carries its build's version (`fil-daemon <version>`), which a client
+  that routed to a build reads before it sends a kill there. The agent is free-form and was
+  already the package version; nothing in the encoding changed.
 
 ## Limits for skipped data
 

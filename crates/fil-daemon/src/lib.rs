@@ -22,6 +22,7 @@
 //! - [`paths`] has `/tmp/fil-$UID/` and the files in it, with the owner and mode checks.
 //! - [`start`] has [`ensure_daemon`], the start lock and the detached launch.
 //! - [`relay`] is the stdio relay.
+//! - [`route`] picks the daemon a client's `Route` names (decision D2).
 //! - [`daemon`] has [`Daemon`] (the library object tests and embedders use) and [`run_daemon`] (the
 //!   process).
 //! - [`logging`] is the log the daemon and the client both write: private, rotated, bounded in age.
@@ -42,6 +43,7 @@ pub mod logging;
 pub mod paths;
 pub mod ports;
 pub mod relay;
+pub mod route;
 pub mod start;
 
 mod conn;

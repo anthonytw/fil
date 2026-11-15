@@ -55,6 +55,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -136,6 +137,9 @@ pub fn run_relay(opts: &RelayOptions) -> ExitCode {
     // Everything the pipe carries passes through this process: no core dump of it. Without a core
     // limit (on Linux): the relay starts the daemon, and a limit would pass to its sessions.
     let _ = crate::hardening::disable_core_dumps(false);
+    if let (Ok(exe), Some(home)) = (std::env::current_exe(), crate::paths::home_dir()) {
+        keep_own_copy(exe, home);
+    }
     // Raw descriptors, not `std::io::stdout()`, whose line buffering would hold frames back.
     use std::os::fd::AsFd;
     let dup = |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned().map(std::fs::File::from);
@@ -160,6 +164,24 @@ pub fn run_relay(opts: &RelayOptions) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Refreshes the modification time of the `fil install` version directory this relay runs from
+/// (`~/.local/share/fil/<ver>-w<major>.<rev>/fil`), by the checks of a daemon's hourly refresh
+/// ([`crate::paths::refresh_install_dir`]: a canonical path, a real directory of ours with a
+/// version directory's name, the file still the one running); anything else is left alone.
+///
+/// Under the 1.x family a relay may only pass bytes to a newer daemon of another revision, and no
+/// daemon then runs from (or refreshes) the copy the client's bootstrap started: this keeps that
+/// copy within the install's "recently used" window (docs/m4/release.md section 6.3, rule 2.5)
+/// for as long as clients connect through it, an added reason to keep, which section 6.4.1
+/// allows. On a thread of its own, never waited for: the home directory may be a network mount
+/// that hangs, and the relay must not.
+pub fn keep_own_copy(exe: PathBuf, home: PathBuf) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
+        let id = crate::paths::file_identity(&exe);
+        crate::paths::refresh_install_dir(&exe, &home, id)
+    })
 }
 
 /// How often a relay whose input is a socket looks again for an end it was not woken for.
@@ -639,6 +661,40 @@ mod tests {
         assert!(blocking_socket(a.as_fd()).is_none());
         let (r, _w) = std::io::pipe().unwrap();
         assert!(blocking_socket(r.as_fd()).is_none());
+    }
+
+    /// The relay keeps the version directory it runs from fresh (it may only pass bytes to a
+    /// daemon of another revision, which refreshes nothing of this copy), and touches nothing
+    /// when it runs from anywhere else.
+    #[test]
+    fn the_relay_refreshes_the_install_directory_it_runs_from() {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let dir = home.join(".local/share/fil/1.0.0-w1.16");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .unwrap();
+        let exe = dir.join("fil");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::open(&dir)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(keep_own_copy(exe.clone(), home.clone()).join().unwrap());
+        assert!(std::fs::metadata(&dir).unwrap().mtime() > 1_500_000_000);
+        // Not a `fil install` copy: nothing is touched.
+        let elsewhere = tmp.path().join("fil");
+        std::fs::write(&elsewhere, b"#!/bin/sh\n").unwrap();
+        std::fs::File::open(&dir)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(!keep_own_copy(elsewhere, home).join().unwrap());
+        assert_eq!(std::fs::metadata(&dir).unwrap().mtime(), 1_000_000_000);
     }
 
     /// A first connection after an upgrade starts a daemon beside the old one: the relay says the

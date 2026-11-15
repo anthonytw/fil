@@ -43,9 +43,24 @@ expect_fail() {
     sed 's/^/       | /' "$tmp/out.log"
   else pass "$name"; fi
 }
+# section NAME: the `== NAME` header; each section's wall time (bash's SECONDS) is printed when the
+# next one starts and listed again at the end, to see where the time goes (the planned
+# `--sections` split, docs/dev/timing-tests.md).
+sec_name='' sec_start=$SECONDS sec_times=()
+section_end() {
+  if [ -n "$sec_name" ]; then
+    echo "  ($((SECONDS - sec_start)) s)"
+    sec_times+=("$(printf '%5d s  %s' "$((SECONDS - sec_start))" "$sec_name")")
+  fi
+}
+section() {
+  section_end
+  sec_name=$1 sec_start=$SECONDS
+  echo "== $1"
+}
 
 # ============================================================== 1. the pins in the tree itself
-echo "== the tree"
+section "the tree"
 expect_pass "rust-version is the pinned toolchain" test "$(cargo_rust_version)" = "$(toolchain_channel)"
 expect_pass "crates/fil inherits rust-version" grep -q '^rust-version.workspace = true' "$REPO_ROOT/crates/fil/Cargo.toml"
 expect_pass "Cross.toml pins the x86_64 image by digest" grep -Eq '^image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:[0-9a-f]{64}"' "$REPO_ROOT/Cross.toml"
@@ -62,7 +77,7 @@ for k in 'codegen-units = 1' 'lto = "fat"' 'strip = "symbols"' 'debug = 0'; do
 done
 
 # ============================================================== 2. the workflow lint, and mutations
-echo "== workflow lint"
+section "workflow lint"
 wf=$REPO_ROOT/.github/workflows/release.yml
 expect_pass "the release workflow passes the lint" "$RELEASE_DIR/lint-workflow.sh" "$wf"
 # mutate_wf NAME PERL_EXPR: the lint must reject the workflow after the substitution.
@@ -188,7 +203,7 @@ perl -pi -e 's/cross build --locked/cross build/' "$tmp/scripts/build-binary.sh"
 expect_fail "mutation: cross build without --locked" env FIL_LINT_SCRIPTS="$tmp/scripts" "$RELEASE_DIR/lint-workflow.sh" "$wf"
 
 # ============================================================== 3. tag signers (verify-tag.sh)
-echo "== tag verification: the signers come from main, never from the tag"
+section "tag verification: the signers come from main, never from the tag"
 keys=$tmp/keys
 mkdir -p "$keys"
 ssh-keygen -q -t ed25519 -N '' -C release-key -f "$keys/release"
@@ -304,7 +319,7 @@ expect_fail "rebuild.sh refuses a short ref" bash "$RELEASE_DIR/rebuild.sh" /non
 grep -q '40-hex commit SHA' "$tmp/out.log" && pass "...before touching Docker or the repo" || { flunk "...before touching Docker or the repo"; sed "s/^/       | /" "$tmp/out.log"; }
 
 # the draft release's attestation commands are the narrow ones
-echo "== release notes (notes.sh)"
+section "release notes (notes.sh)"
 sha=$(printf 'b%.0s' {1..40})
 "$RELEASE_DIR/notes.sh" 9.9.9 o/r "$sha" > "$tmp/notes.md"
 for flag in '--repo o/r' '--cert-identity https://github.com/o/r/.github/workflows/release.yml@refs/tags/v9.9.9' '--source-ref refs/tags/v9.9.9' "--source-digest $sha" "--signer-digest $sha" '--deny-self-hosted-runners'; do
@@ -319,7 +334,7 @@ main"
 
 # the files that decide what a release is, or who signs it, need the owner's review, and only those
 # (narrowed on 2026-11-11, owner)
-echo "== CODEOWNERS"
+section "CODEOWNERS"
 for path in /Cargo.toml /deny.toml /about.toml /about.hbs /.cargo/ /.gitattributes '/packaging/**' /flake.nix /flake.lock '/docs/man/**' /.github/CODEOWNERS /.github/macos-team-id /.github/package-signing-key.asc /.github/release-signers '/.github/workflows/**' '/tests/release/**' /Cross.toml /rust-toolchain.toml /rust-toolchain; do
   expect_pass "CODEOWNERS lists $path" grep -qxF "$path @anthonytw" "$REPO_ROOT/.github/CODEOWNERS"
 done
@@ -383,7 +398,7 @@ expect_pass "every CODEOWNERS path exists (but .cargo/, .gitattributes and rust-
 expect_pass "mutation: a CODEOWNERS path that does not exist is caught" test "$(codeowners_missing "$tmp/CODEOWNERS.mut")" = /no-such-file
 
 # the release path reads the owned release.just alone, never the unowned justfile
-echo "== release recipes (recipes.sh, just.sh, entry-check.sh)"
+section "release recipes (recipes.sh, just.sh, entry-check.sh)"
 expect_pass "recipes.sh passes on the tree" "$RELEASE_DIR/recipes.sh" "$REPO_ROOT"
 rt=$tmp/recipes
 # rt_tree NAME: a copy of the justfile and tests/release in $rt/NAME, to mutate
@@ -458,7 +473,7 @@ grep -q 'FIL_ENTRY_CHECK_STOP is set (a test-only override)' "$tmp/out.log" && p
 
 
 # ============================================================== 4. release-check on synthetic releases
-echo "== release-check"
+section "release-check"
 # A scratch tree (a git repository holding the files check.sh reads), stand-in binaries (shell
 # scripts that print the version line, so `--version` runs; a PATH shim answers file(1) for them),
 # and archives made with whatever tar the machine has.
@@ -1003,7 +1018,7 @@ printf '%s  f\n' "00000000000000000000000000000000000000000000000000000000000000
 expect_fail "mutation: a wrong digest passes sums_check" sums_check "$tmp/sc" wrong
 
 # ============================================================== 4b. the in-workflow tag checks (prepare.sh)
-echo "== prepare.sh (the tag checks that are NOT the gate)"
+section "prepare.sh (the tag checks that are NOT the gate)"
 new_case 0.9.0
 git -C "$tree" tag -a -m "fil 0.9.0" v0.9.0
 git -C "$tree" tag v0.9.0-light
@@ -1045,7 +1060,7 @@ expect_fail "a tag that now names another commit than the run's is refused" env 
 grep -q 'is now commit' "$tmp/out.log" && pass "...and says so" || { flunk "...and says so"; sed 's/^/       | /' "$tmp/out.log" | tail -3; }
 
 # ============================================================== 4b'. the crates-io job's gate (crates-io-gate.sh)
-echo "== crates-io-gate.sh"
+section "crates-io-gate.sh"
 gate=$RELEASE_DIR/crates-io-gate.sh
 gt=$tmp/gate
 mkdir -p "$gt/files"
@@ -1102,7 +1117,7 @@ cp "$gt/good.sig" "$gt/files/SHA256SUMS.sig"
 expect_pass "gate: (the good signature again passes)" g_run FAKE_ENV=owner FAKE_DRAFT=false
 
 # ============================================================== 4c. crates.io name reservation
-echo "== reserve-crate-names.sh"
+section "reserve-crate-names.sh"
 rc_script=$RELEASE_DIR/reserve-crate-names.sh
 expect_pass "reserve-crate-names: --help works" bash "$rc_script" --help
 rc_names=$(sed -n 's/^CRATES="\(.*\)"$/\1/p' "$rc_script")
@@ -1228,7 +1243,7 @@ expect_pass "reserve-crate-names: a bare 429 in the text is not a rate limit" te
 expect_pass "reserve-crate-names: a 429 that does not clear gives up" test "$(rc_retry 99 'status 429 Too Many Requests')" = "4 101"
 
 # ============================================================== 4d. the published crates (publish-crates.sh)
-echo "== publish-crates.sh"
+section "publish-crates.sh"
 pc=$RELEASE_DIR/publish-crates.sh
 pc_order=$("$pc" --list)
 expect_pass "publish-crates: the crates with publish = [\"crates-io\"] are the nine reserved names" \
@@ -1271,7 +1286,7 @@ expect_pass "publish-crates: ...after the crates before fil-forward" grep -qE ' 
 expect_fail "publish-crates: ...and before fil-forward and what depends on it" grep -qE ' (fil-forward|fil-client|fil-shell)$' "$tmp/pc/log"
 
 # ============================================================== 4e. the packaging templates (packaging/render.sh)
-echo "== packaging/render.sh (Homebrew formula, AUR PKGBUILD)"
+section "packaging/render.sh (Homebrew formula, AUR PKGBUILD)"
 render=$REPO_ROOT/packaging/render.sh
 mkdir -p "$tmp/render"
 h() { printf '%064d' "$1"; }
@@ -1294,7 +1309,7 @@ expect_fail "render: a version that is not a release version is refused" "$rende
 
 # ============================================================== 5. reproducible archives (Docker)
 if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
-  echo "== reproducible archives (Docker)"
+  section "reproducible archives (Docker)"
   rt=$tmp/repro
   mkdir -p "$rt/tree/crates/x/src" "$rt/bins"
   cp "$REPO_ROOT/Cross.toml" "$REPO_ROOT/rust-toolchain.toml" "$REPO_ROOT/LICENSE" "$REPO_ROOT/README.md" "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$rt/tree/"
@@ -1335,11 +1350,11 @@ if [ "${FIL_RELEASE_TEST_DOCKER:-0}" = 1 ]; then
   expect_pass "the mutant package builds ran (a broken mutant would pass the next check vacuously)" test -s "$tmp/p1/fil_0.9.0_amd64.deb" -a -s "$tmp/p2/fil_0.9.0_amd64.deb"
   expect_fail "mutation: packages without the fixed mtime, and two builds then differ" cmp "$tmp/p1/fil_0.9.0_amd64.deb" "$tmp/p2/fil_0.9.0_amd64.deb"
 else
-  echo "== reproducible archives: skipped (set FIL_RELEASE_TEST_DOCKER=1; needs Docker)"
+  section "reproducible archives: skipped (set FIL_RELEASE_TEST_DOCKER=1; needs Docker)"
 fi
 
 # ============================================================== macOS signing (sign-macos.sh, verify-macos.sh, macho_norm.py)
-echo "== macOS signing"
+section "macOS signing"
 # Synthetic fat Mach-O binaries with real signature structure (selftest_macho.py) are signed by a fake
 # codesign; sign-macos.sh runs on them with fake ditto, notarytool, gh, verifier and packer (python3
 # tarfile, no Docker). The keys are real (ssh-keygen). Nothing is uploaded anywhere: FIL_GH is a stub
@@ -1707,7 +1722,7 @@ unset MACSIGN_SCRIPT
 # ============================================================== the installer (packaging/install.sh)
 # A fake release directory laid out like GitHub's (file://), signed with a throwaway key, and a copy of
 # the real script that differs from it only in the pinned key. HOME is a scratch directory each time.
-echo "== the installer (packaging/install.sh)"
+section "the installer (packaging/install.sh)"
 it=$tmp/installer
 mkdir -p "$it/keys"
 ssh-keygen -q -t ed25519 -N '' -C it-release -f "$it/keys/release"
@@ -1848,7 +1863,7 @@ else
 fi
 
 # ============================================================== audit-age.sh (SECURITY.md "Audits")
-echo "== audit-age.sh"
+section "audit-age.sh"
 aa=$tmp/audits
 mkdir -p "$aa"
 touch "$aa/README.md" "$aa/LANES.md" "$aa/TEMPLATE.md"
@@ -1878,7 +1893,7 @@ expect_pass "preflight: the candidate step runs the audit check" sh -c '"$1" --l
 # ============================================================== the apt and dnf repositories (repos.sh)
 # Synthetic packages (selftest_pkg.py), real gpg with a throwaway key in a scratch GNUPGHOME, and a fake
 # docker for the install test: Docker's real run is the owner's (docs/m4/packaging.md section 7).
-echo "== release-repos (repos.sh)"
+section "release-repos (repos.sh)"
 if ! command -v gpg > /dev/null; then
   echo "  skip repos.sh: no gpg"
 else
@@ -1984,7 +1999,7 @@ fi
 # A real ssh-agent (started here, killed by its pid), real ssh-keygen keys and, when gpg is
 # installed, real gpg in a throwaway GNUPGHOME; the Apple tools are fakes. Never the caller's
 # agent or keyring: SSH_AUTH_SOCK and GNUPGHOME are always this block's own.
-echo "== release keys"
+section "release keys"
 rk=$tmp/rk
 mkdir -p "$rk/bin"
 RK_SCRIPT=$RELEASE_DIR/release-keys.sh
@@ -2240,7 +2255,7 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 # names that bare repo as the one stand-in the self-test may rewrite to (FIL_RELEASE_GITHUB_STANDIN). Gitea's `origin` is the remote the release no longer
 # reads: some cases make it unreachable. Nothing here reaches GitHub, Gitea, crates.io or Docker.
 # Each failure class must fail with its message.
-echo "== release-preflight.sh"
+section "release-preflight.sh"
 pf=$tmp/preflight
 PF=$RELEASE_DIR/release-preflight.sh
 mkdir -p "$pf/bin" "$pf/path"
@@ -2654,7 +2669,7 @@ expect_pass "preflight: every gh call was a read (no -X, -f, -F, --input; no rel
 # Steps 1-4 are done by the command's actions (failures injected at each, then the same command
 # again); for the later steps the test does each step's action by hand, then requires the command to
 # see it, and nothing more.
-echo "== release.sh"
+section "release.sh"
 rs=$tmp/rel
 # Gitea (origin here) unreachable throughout: the release never reads or writes it
 pg remote set-url origin "$pf/nosuch.git"
@@ -4496,7 +4511,10 @@ expect_pass "release: gh wrote only dispatches (the three workflows, on main), r
 expect_pass "release: ...and it did upload, delete, publish and approve (the log covers the later actions)" sh -c 'grep -q "^release upload " "$1" && grep -q "^api -X DELETE " "$1" && grep -q "^release edit " "$1" && grep -q "^api -X POST .*/pending_deployments " "$1"' sh "$rs/gh-all.log"
 expect_pass "release: ...and it did dispatch (the log covers the actions)" grep -q '^workflow run release.yml' "$pf/gh.log"
 
+section_end
 echo
+echo "== time per section ($SECONDS s in all)"
+printf '%s\n' "${sec_times[@]}"
 echo "release-test: $passed passed, $failed failed"
 [ "$failed" = 0 ]
 exit

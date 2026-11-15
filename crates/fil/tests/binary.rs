@@ -249,3 +249,193 @@ fn a_tunnel_with_a_missing_pipe_program_says_the_command_could_not_start() {
     assert!(!err.contains("not installed"), "{err}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// `fil -N` asks nothing, the install question included (DESIGN.md section 7.3): on a host with
+// no fil, `install = "ask"` declines with the `fil install HOST` advice and `"always"` goes
+// straight to the install, and stdin is never read, so a tunnel started in the background
+// (`fil -N HOST -L ... &`) is not stopped by `SIGTTIN`.
+//
+// The real `fil` binary, with `ssh` on `PATH` replaced by a script that runs the remote command
+// here with an empty remote `$HOME`, so the host has no fil and the bootstrap greets. The runs
+// need a controlling terminal, so the test runs itself under a pty (as the controlling terminal
+// of a new session) in a mode that starts `fil` there, in the foreground group or a group of its
+// own, and reports how it ended.
+mod tunnel_install {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use nix::sys::signal::{Signal, kill};
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    use nix::unistd::Pid;
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    use super::FIL;
+    const TEST: &str = "tunnel_install::a_tunnel_never_asks_to_install_and_never_reads_stdin";
+
+    /// The fake `ssh`: skips the options up to `--` and the host, and runs the rest as the remote
+    /// command, in a remote home with nothing in it.
+    const FAKE_SSH: &str = r#"#!/bin/sh
+    while [ $# -gt 0 ]; do a=$1; shift; [ "$a" = "--" ] && break; done
+    shift
+    HOME="$FIL_FAKE_REMOTE_HOME" exec sh -c "$*"
+    "#;
+
+    /// A scratch directory with the fake `ssh` in `bin/`, a local home whose config sets `install`,
+    /// and an empty remote home.
+    fn world(name: &str, install: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("fil-tunnel-install-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("home/.config/fil")).unwrap();
+        std::fs::create_dir_all(dir.join("remote")).unwrap();
+        let ssh = dir.join("bin/ssh");
+        std::fs::write(&ssh, FAKE_SSH).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            dir.join("home/.config/fil/config.toml"),
+            format!("[host.fakehost]\ninstall = \"{install}\"\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Inside the pty: starts `fil -N` with stdin on the terminal (in the foreground group, or a
+    /// group of its own as a shell's `&` does) and prints `RESULT exited N`, `RESULT stopped SIG`
+    /// or `RESULT hung`, then what it said on stderr.
+    fn child(dir: &Path, background: bool) {
+        let err = dir.join("stderr");
+        let mut cmd = Command::new(FIL);
+        cmd.args(["-N", "fakehost", "-L", &free_port().to_string()])
+            .env_clear()
+            .env("HOME", dir.join("home"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", dir.join("bin").display()),
+            )
+            .env("TERM", "xterm")
+            .env("FIL_FAKE_REMOTE_HOME", dir.join("remote"))
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&err).unwrap());
+        if background {
+            cmd.process_group(0);
+        }
+        // Reaped below with `waitpid`, which also sees a stop (std's `wait` does not).
+        #[allow(clippy::zombie_processes)]
+        let process = cmd.spawn().unwrap();
+        let pid = Pid::from_raw(process.id() as i32);
+        let end = Instant::now() + Duration::from_secs(30);
+        let result = loop {
+            match waitpid(pid, Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG)).unwrap() {
+                WaitStatus::Exited(_, code) => break format!("exited {code}"),
+                WaitStatus::Signaled(_, sig, _) => break format!("killed {sig:?}"),
+                WaitStatus::Stopped(_, sig) => {
+                    let _ = kill(pid, Signal::SIGKILL);
+                    let _ = waitpid(pid, None);
+                    break format!("stopped {sig:?}");
+                }
+                _ if Instant::now() > end => {
+                    let _ = kill(pid, Signal::SIGKILL);
+                    let _ = waitpid(pid, None);
+                    break "hung".to_string();
+                }
+                _ => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        println!("RESULT {result}");
+        println!(
+            "STDERR {}",
+            std::fs::read_to_string(&err).unwrap_or_default()
+        );
+        println!("END");
+    }
+
+    /// Runs this test under a pty in the child mode; returns what it printed. Nothing is typed.
+    fn run_under_a_pty(dir: &Path, background: bool) -> String {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", TEST, "--nocapture", "--test-threads=1"]);
+        cmd.env("FIL_TUNNEL_CHILD", if background { "bg" } else { "fg" });
+        cmd.env("FIL_TUNNEL_DIR", dir);
+        let mut process = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let output = Arc::new(Mutex::new(String::new()));
+        let sink = output.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        let end = Instant::now() + Duration::from_secs(60);
+        while process.try_wait().unwrap().is_none() {
+            if Instant::now() > end {
+                let _ = process.kill();
+                panic!("the child did not finish: {}", output.lock().unwrap());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The reader thread may still be draining the pty.
+        let end = Instant::now() + Duration::from_secs(5);
+        while !output.lock().unwrap().contains("END") && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let out = output.lock().unwrap().clone();
+        drop(pair.master);
+        out
+    }
+
+    #[test]
+    fn a_tunnel_never_asks_to_install_and_never_reads_stdin() {
+        if let (Ok(mode), Some(dir)) = (
+            std::env::var("FIL_TUNNEL_CHILD"),
+            std::env::var_os("FIL_TUNNEL_DIR"),
+        ) {
+            child(Path::new(&dir), mode == "bg");
+            return;
+        }
+        for (install, background) in [("ask", false), ("ask", true), ("always", true)] {
+            let dir = world(&format!("{install}-{background}"), install);
+            let out = run_under_a_pty(&dir, background);
+            let what = format!("install = {install}, background = {background}: {out}");
+            assert!(out.contains("RESULT exited 1"), "{what}");
+            assert!(!out.contains("[y/N]"), "it asked: {what}");
+            if install == "ask" {
+                assert!(out.contains("not asking (fil -N asks nothing"), "{what}");
+                assert!(out.contains("fil install fakehost"), "{what}");
+            } else {
+                // `always` goes to the install itself; this test's build is not a release, so the
+                // upload is refused there (an install from a release is `tests/install.rs`'s).
+                assert!(out.contains("not uploading fil to fakehost"), "{what}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}

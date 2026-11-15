@@ -112,21 +112,6 @@ impl Scheduler {
         self.control.is_empty() && self.interactive.is_empty() && self.turn.is_empty()
     }
 
-    /// Drop everything queued for `channel` (the channel closed).
-    ///
-    /// Nothing calls this yet outside the tests: the forwards (DESIGN.md section 7) close channels
-    /// one at a time and need it.
-    pub fn remove_channel(&mut self, channel: ChannelId) {
-        match channel.class() {
-            ChannelClass::Control => self.control.clear(),
-            ChannelClass::Interactive => self.interactive.retain(|f| f.channel != channel),
-            ChannelClass::Forward => {
-                self.forward.remove(&channel);
-                self.turn.retain(|c| *c != channel);
-            }
-        }
-    }
-
     /// Drop everything. After a reconnect the queues are rebuilt from the channels' send buffers,
     /// which still hold every unacknowledged byte.
     pub fn clear(&mut self) {
@@ -255,16 +240,14 @@ mod tests {
     }
 
     #[test]
-    fn has_queued_remove_and_clear() {
+    fn has_queued_and_clear() {
         let mut s = Scheduler::new();
         s.push(f(20, 0));
         s.push(f(1, 1));
         s.push(f(2, 2));
         assert!(s.has_queued(ChannelId(20)) && s.has_queued(ChannelId::TERMINAL));
         assert!(!s.has_queued(ChannelId(21)) && !s.has_queued(ChannelId::CONTROL));
-        s.remove_channel(ChannelId(20));
-        s.remove_channel(ChannelId::TERMINAL);
-        assert_eq!(drain(&mut s), vec![(2, 2)]);
+        assert_eq!(drain(&mut s), vec![(1, 1), (2, 2), (20, 0)]);
         s.push(f(20, 0));
         s.push(f(0, 0));
         s.clear();

@@ -72,34 +72,22 @@ pub fn parse_byte_size(s: &str) -> Result<usize, ParseError> {
     fil_forward::tunables::parse_byte_size(s).map_err(ParseError)
 }
 
-/// Parses the `confirm` setting: `"off"`, or `"after 10s"` / `"after 2m"` / `"after 1500ms"`.
+/// Parses the `confirm` setting: `"off"`, or `"after 10s"` / `"after 2m"` / `"after 1500ms"` /
+/// `"after 1h"` (the duration grammar of the rest of the config file,
+/// `fil_forward::tunables::parse_duration`).
 pub fn parse_confirm(s: &str) -> Result<Option<Duration>, ParseError> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("off") {
         return Ok(None);
     }
-    let rest = s
-        .strip_prefix("after")
-        .ok_or_else(|| {
-            ParseError(format!(
-                "expected \"off\" or \"after <duration>\", got {s:?}"
-            ))
-        })?
-        .trim();
-    let split = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    let (num, unit) = rest.split_at(split);
-    let n: u64 = num
-        .parse()
-        .map_err(|_| ParseError(format!("not a duration: {rest:?}")))?;
-    let d = match unit.trim() {
-        "ms" => Duration::from_millis(n),
-        "s" | "" => Duration::from_secs(n),
-        "m" => Duration::from_secs(n.saturating_mul(60)),
-        _ => return Err(ParseError(format!("unknown duration unit in {rest:?}"))),
-    };
-    Ok(Some(d))
+    let rest = s.strip_prefix("after").ok_or_else(|| {
+        ParseError(format!(
+            "expected \"off\" or \"after <duration>\", got {s:?}"
+        ))
+    })?;
+    fil_forward::tunables::parse_duration(rest)
+        .map(Some)
+        .map_err(ParseError)
 }
 
 /// Bytes typed while disconnected, capped.
@@ -1292,5 +1280,18 @@ mod tests {
         );
         assert!(parse_confirm("sometimes").is_err());
         assert!(parse_confirm("after ten").is_err());
+        // The config file's one duration grammar: hours too, and an overflow is an error
+        // instead of a saturated "never".
+        assert_eq!(
+            parse_confirm("after 1h").unwrap(),
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(
+            parse_confirm("after 5").unwrap(),
+            Some(Duration::from_secs(5))
+        );
+        let big = format!("after {}m", u64::MAX);
+        assert!(parse_confirm(&big).unwrap_err().0.contains("too large"));
+        assert!(parse_confirm("after 3 fortnights").is_err());
     }
 }

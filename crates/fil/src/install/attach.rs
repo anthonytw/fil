@@ -4,7 +4,8 @@
 //!
 //! - **The offer** is made only on an interactive first attach, before the terminal goes raw:
 //!   never in a background reconnect, never for the management commands (`fil ls` and the
-//!   others), and never when stdin is not a terminal. `install = "ask"` (the default) asks once;
+//!   others), never for a tunnel (`fil -N`, which reads no key, so it can run in the background),
+//!   and never when stdin is not a terminal. `install = "ask"` (the default) asks once;
 //!   `install = "never"` only says how to install; `install = "always"` installs without asking,
 //!   which is the user's own consent, written in their config.
 //! - **The upload** is the one of `fil install`: the binary is chosen and checked
@@ -34,6 +35,10 @@ pub enum Offer {
     /// An attach, with the host's `install` setting. The offer is still made only on the
     /// interactive first run.
     Attach(InstallMode),
+    /// A tunnel (`fil -N`), with the host's `install` setting. It never asks (it reads no key:
+    /// a question would stop a tunnel in the background with `SIGTTIN`), so `ask` declines;
+    /// `always` installs on the first run, as for an attach (with a terminal on stdin).
+    Tunnel(InstallMode),
 }
 
 /// The binary to send: the bundle beside this executable for the remote, or this executable if
@@ -89,15 +94,19 @@ pub enum Declined {
     Never,
     /// stdin is not a terminal: nobody to ask.
     NoTerminal,
+    /// A tunnel with `install = "ask"`: a tunnel asks nothing.
+    Tunnel,
 }
 
 /// The owner's guards on an install, as one decision (`docs/m4/plan.md` §3 U1, "The offer"):
 /// only an attach's interactive first run, with a terminal on stdin, may install; it asks
 /// unless the user's config says `always`. A reconnect and a management command never install,
-/// whatever the config says.
+/// whatever the config says. A tunnel's first run installs only with `always`, and never asks.
 pub fn decide(offer: Offer, interactive: bool, stdin_tty: bool) -> Decision {
-    let Offer::Attach(mode) = offer else {
-        return Decision::Decline(Declined::Management);
+    let (mode, tunnel) = match offer {
+        Offer::None => return Decision::Decline(Declined::Management),
+        Offer::Attach(mode) => (mode, false),
+        Offer::Tunnel(mode) => (mode, true),
     };
     if !interactive {
         return Decision::Decline(Declined::Reconnect);
@@ -109,6 +118,7 @@ pub fn decide(offer: Offer, interactive: bool, stdin_tty: bool) -> Decision {
         return Decision::Decline(Declined::NoTerminal);
     }
     match mode {
+        InstallMode::Ask if tunnel => Decision::Decline(Declined::Tunnel),
         InstallMode::Ask => Decision::Ask,
         InstallMode::Always => Decision::Install,
         InstallMode::Never => Decision::Decline(Declined::Never),
@@ -167,6 +177,15 @@ pub async fn greeted(
             return Err(
                 decline(g, format!("not asking (stdin is not a terminal). {manual}")).await,
             );
+        }
+        Decision::Decline(Declined::Tunnel) => {
+            return Err(decline(
+                g,
+                format!(
+                    "not asking (fil -N asks nothing; `install = \"always\"` installs). {manual}"
+                ),
+            )
+            .await);
         }
         Decision::Decline(Declined::Management | Declined::Never) => {
             return Err(decline(g, manual).await);
@@ -245,7 +264,7 @@ mod tests {
 
     /// Every combination: only an attach's interactive first run with a terminal installs,
     /// and only `always` installs without asking. A reconnect and a management command never
-    /// do, under any setting.
+    /// do, under any setting. A tunnel never asks: its first run installs with `always` only.
     #[test]
     fn only_an_interactive_first_attach_on_a_terminal_may_install() {
         let offers = [
@@ -253,6 +272,9 @@ mod tests {
             Offer::Attach(InstallMode::Ask),
             Offer::Attach(InstallMode::Never),
             Offer::Attach(InstallMode::Always),
+            Offer::Tunnel(InstallMode::Ask),
+            Offer::Tunnel(InstallMode::Never),
+            Offer::Tunnel(InstallMode::Always),
         ];
         for offer in offers {
             for interactive in [false, true] {
@@ -261,14 +283,23 @@ mod tests {
                     let want = match (offer, interactive, tty) {
                         (Offer::None, _, _) => Decision::Decline(Declined::Management),
                         (_, false, _) => Decision::Decline(Declined::Reconnect),
-                        (Offer::Attach(InstallMode::Never), _, _) => {
-                            Decision::Decline(Declined::Never)
+                        (
+                            Offer::Attach(InstallMode::Never) | Offer::Tunnel(InstallMode::Never),
+                            _,
+                            _,
+                        ) => Decision::Decline(Declined::Never),
+                        (Offer::Tunnel(InstallMode::Always), true, true) => Decision::Install,
+                        (Offer::Tunnel(InstallMode::Ask), true, true) => {
+                            Decision::Decline(Declined::Tunnel)
                         }
                         (_, _, false) => Decision::Decline(Declined::NoTerminal),
                         (Offer::Attach(InstallMode::Ask), true, true) => Decision::Ask,
                         (Offer::Attach(InstallMode::Always), true, true) => Decision::Install,
                     };
                     assert_eq!(d, want, "{offer:?} interactive={interactive} tty={tty}");
+                    if matches!(offer, Offer::Tunnel(_)) {
+                        assert_ne!(d, Decision::Ask, "a tunnel never asks");
+                    }
                     if !interactive || offer == Offer::None {
                         assert!(
                             matches!(d, Decision::Decline(_)),

@@ -241,7 +241,14 @@ async fn attach(
         LinkParams::default(),
     ) {
         Ok(c) => c
-            .with_run(run.clone(), Offer::Attach(settings.install))
+            .with_run(
+                run.clone(),
+                if mode == Mode::Tunnel {
+                    Offer::Tunnel(settings.install)
+                } else {
+                    Offer::Attach(settings.install)
+                },
+            )
             .for_tunnel(mode == Mode::Tunnel),
         Err(e) => {
             eprintln!("fil: {e}");

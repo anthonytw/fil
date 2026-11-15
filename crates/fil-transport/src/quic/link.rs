@@ -577,7 +577,10 @@ async fn write_stream(io: Arc<Io>, channel: ChannelId, mut rx: mpsc::Receiver<It
     /// The next payload to write, or `None` when the queue's senders are gone or the connection
     /// has ended.
     async fn next(io: &Io, rx: &mut mpsc::Receiver<Item>) -> Option<Item> {
+        // `rx` first: a ready payload needs no look at the connection's state, which is a
+        // lock in quinn. A closed connection still ends the wait when `rx` has nothing.
         tokio::select! {
+            biased;
             p = rx.recv() => p,
             _ = io.conn.closed() => None,
         }

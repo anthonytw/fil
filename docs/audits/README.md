@@ -18,6 +18,8 @@ A **check** has a yes/no answer a script can give cheaply; it runs on every PR, 
 
 Actions are pinned by hand: a full audit moves each pin to the current release of its action (resolve a tag with `gh api repos/OWNER/REPO/git/ref/tags/TAG`; for an annotated tag, read the commit it points at) and keeps the `# vX` comment. A full audit also confirms that the weekly workflow is still enabled (`gh workflow view audit.yml`): GitHub disables a scheduled workflow after 60 days without repository activity.
 
+Fuzzing follows the rule in `DESIGN.md` §12: before a release, each fuzz target for a parser of peer or remote-host input runs for 5 minutes, all in parallel, and the local config-file targets run only when their parser changes. An audit's report records the targets and durations it ran.
+
 ## The run
 
 ```mermaid

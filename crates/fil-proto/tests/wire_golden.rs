@@ -1276,10 +1276,18 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
         }),
     );
     add("attach", ControlMsg::Attach(attach(None, false)));
-    // Every `TakeOver`: `No` above, `Epoch` on the resume below, `Any` here.
+    // Every `TakeOver`: `No` above, `Epoch` on the resume below, `Any` and
+    // `EpochIfDisconnected` here.
     add(
         "attach-take-over-any",
         ControlMsg::Attach(attach(None, true)),
+    );
+    add(
+        "attach-take-over-if-disconnected",
+        ControlMsg::Attach(Attach {
+            take_over: TakeOver::EpochIfDisconnected(u64::MAX),
+            ..attach(None, false)
+        }),
     );
     add(
         "attach-resume-echo",
@@ -2304,6 +2312,7 @@ fn revisioned() -> Entries {
     ));
     e.push(("decode/take-over-2".into(), outcome::<TakeOver>(&past(2))));
     e.push(("decode/take-over-3".into(), outcome::<TakeOver>(&past(3))));
+    e.push(("decode/take-over-4".into(), outcome::<TakeOver>(&past(4))));
     e.push(("decode/request-0".into(), outcome::<Request>(&past(0))));
     // `Ports { session: None, probe_other: false }`.
     e.push(("decode/request-4".into(), outcome::<Request>(&[4, 0, 0])));

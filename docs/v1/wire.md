@@ -54,7 +54,13 @@ This note is the contract. `DESIGN.md` §8.5 ("Versioning") points here and foll
     `SessionSummary.daemon_version` and `OtherDaemon.version` (`FilVersion`,
     `[A-Za-z0-9.+-]{1,32}`), which sit inside lists, where nothing can be appended once the
     wire is frozen. The other two need no 1.0 support (below, *D2 under the frozen wire*).
-13. **Old-against-new CI**: a `compat` job in `linux-check`'s `extended` and `all` suites. It
+13. **`TakeOver::EpochIfDisconnected(epoch)` is in the 1.0 encoding** (for `fil -N`, from the
+    review of PR #5). It behaves like `Epoch`, but only while that holder's link is down, so a
+    holder that reconnects while the tunnel is re-dialing keeps its session. It is a variant of
+    an enum nested inside `Attach`, so a 1.x release could only have added it behind a feature,
+    with the tunnel waiting for the daemon's `Features` before it attaches. It costs nothing to
+    put in now.
+14. **Old-against-new CI**: a `compat` job in `linux-check`'s `extended` and `all` suites. It
     builds every tag listed in `tests/compat/tags.txt` and runs the drop-in quick set in both
     directions (old client against the new daemon, then new against old). The list is empty
     until 1.0 is tagged, and while it is empty the job reports that it skipped. Until then a

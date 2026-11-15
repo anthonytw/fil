@@ -613,7 +613,7 @@ The binding and the key end with the subscriber's hold on the session: on takeov
 - **Wire revision 15** added `Attach.take_over` and `AttachRefusal::Attached { holder, connected }`: a fresh attach takes a held session over only when it asks to (§5.2).
 - `ErrorCode::SessionStartFailed`: the daemon could not start the session; the reason is in its log.
 
-- **Wire revision 16** (1.0, D1) made the wire extensible and froze it for 1.x (*Compatibility*, above): `ControlMsg::Features`, unknown types skipped, appended fields ignored, the 1.x revisions compatible with each other, the ALPN `fil/<major>`.
+- **Wire revision 16** (1.0, D1) made the wire extensible and froze it for 1.x (*Compatibility*, above): `ControlMsg::Features`, unknown types skipped, appended fields ignored, the 1.x revisions compatible with each other, the ALPN `fil/<major>`. It also added `SessionSummary.daemon_version` and `OtherDaemon.version` (for D2) and `TakeOver::EpochIfDisconnected(epoch)`: the compare and swap of `Epoch`, and only while that holder's link is down, so a holder that reconnected (a resume keeps the epoch) keeps its session (for `fil -N`, which takes over only a session nobody is using).
 
 Before revision 16 these changes were made in place, with no compatibility kept; from it on a change only adds (*Compatibility*).
 

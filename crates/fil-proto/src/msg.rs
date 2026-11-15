@@ -501,6 +501,10 @@ pub enum TakeOver {
     Epoch(u64),
     /// Take it from whoever holds it (`--take-over`, `takeover = "always"`).
     Any,
+    /// As `Epoch`, and only while that subscriber's link is down: a holder that has reconnected
+    /// (a resume keeps the epoch) keeps the session, and the attach is refused with `Attached`
+    /// (`connected: true`). For `fil -N`, which takes over only a session nobody is using.
+    EpochIfDisconnected(u64),
 }
 
 /// How a session's shell ended, as in [`ControlMsg::SessionExited`]: exactly one field is set

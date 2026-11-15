@@ -350,6 +350,9 @@ enum Grant {
     /// This client held the session at this epoch (after `BadResume`, or a first snapshot cut
     /// short). One attach only.
     Own(u64),
+    /// A tunnel takes the session from the holder of this epoch only while that holder is still
+    /// disconnected (`TakeOver::EpochIfDisconnected`): one that resumed meanwhile keeps it.
+    IfDisconnected(u64),
 }
 
 /// What a link's service ended with.
@@ -927,7 +930,16 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 Served::Refused(prompt) => {
                     let replaced = matches!(prompt, Prompt::Replaced);
                     // A yes to these is a yes to taking the session from the holder named in the
-                    // question, and from nobody who comes after it (compare and swap).
+                    // question, and from nobody who comes after it (compare and swap). A tunnel's
+                    // take of a disconnected holder also requires it to be still disconnected.
+                    let if_disconnected = self.cfg.tunnel.is_some()
+                        && matches!(
+                            prompt,
+                            Prompt::TakeOver {
+                                connected: false,
+                                ..
+                            }
+                        );
                     let takes = match &prompt {
                         Prompt::TakeBack(t) => Some(t.epoch),
                         Prompt::TakeOver { epoch, .. } => Some(*epoch),
@@ -950,7 +962,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                             }
                             purpose = DialPurpose::Attach;
                             if let Some(epoch) = takes {
-                                self.grant = Grant::User(epoch);
+                                self.grant = if if_disconnected {
+                                    Grant::IfDisconnected(epoch)
+                                } else {
+                                    Grant::User(epoch)
+                                };
                             }
                         }
                         Err(outcome) => return Ok(outcome),
@@ -1600,6 +1616,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         match self.grant {
             Grant::None => TakeOver::No,
             Grant::User(e) => TakeOver::Epoch(e),
+            Grant::IfDisconnected(e) => TakeOver::EpochIfDisconnected(e),
             Grant::Own(e) => {
                 self.grant = Grant::None;
                 TakeOver::Epoch(e)

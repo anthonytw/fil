@@ -153,8 +153,8 @@ async fn a_tunnel_takes_a_session_only_from_a_disconnected_holder() {
     assert_eq!(a[0].take_over, TakeOver::No);
     assert_eq!(
         a[1].take_over,
-        TakeOver::Epoch(1),
-        "from the holder named only"
+        TakeOver::EpochIfDisconnected(1),
+        "from the holder named only, and only while it is still disconnected"
     );
 
     // A connected holder: a second tunnel on the same daemon leaves the first alone.

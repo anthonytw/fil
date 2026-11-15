@@ -262,6 +262,76 @@ pub fn from_fds(
     })
 }
 
+/// No terminal at all, for a tunnel-only run (`fil -N`, [`crate::ClientConfig::tunnel`]): the
+/// input is the stop signals only (SIGTERM, SIGHUP, SIGINT, SIGQUIT; stdin is never read, so a
+/// tunnel in the background is not stopped by `SIGTTIN`), and the output takes every write and
+/// keeps nothing, is never raw, and is 80x24. Works with no terminal on any descriptor. Must be
+/// called inside a tokio runtime (it starts the signal tasks).
+pub fn headless(local_term: Option<String>) -> io::Result<Terminal<SignalInput, NullOutput>> {
+    let (tx, rx) = mpsc::channel(4);
+    let mut tasks = Vec::new();
+    for (kind, num) in [
+        (SignalKind::terminate(), 15),
+        (SignalKind::hangup(), 1),
+        (SignalKind::interrupt(), 2),
+        (SignalKind::quit(), 3),
+    ] {
+        let mut s = signal(kind)?;
+        let txs = tx.clone();
+        tasks.push(tokio::spawn(async move {
+            if s.recv().await.is_some() {
+                let _ = txs.send(TermEvent::Signal(num)).await;
+            }
+        }));
+    }
+    Ok(Terminal {
+        input: SignalInput { rx, tasks },
+        output: NullOutput,
+        local_term,
+    })
+}
+
+/// The input of [`headless`]: signals only.
+pub struct SignalInput {
+    rx: mpsc::Receiver<TermEvent>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Drop for SignalInput {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+impl TermInput for SignalInput {
+    async fn next(&mut self) -> TermEvent {
+        match self.rx.recv().await {
+            Some(ev) => ev,
+            // Every signal task has ended (each sends once): nothing more will come.
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// The output of [`headless`]: a fixed 80x24 window that keeps nothing.
+pub struct NullOutput;
+
+impl TermOutput for NullOutput {
+    fn size(&mut self) -> io::Result<(u16, u16)> {
+        Ok((80, 24))
+    }
+
+    fn write_all(&mut self, _bytes: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_raw(&mut self, _raw: bool) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The window size, or an error when it cannot be read or reads as empty (no terminal size on
 /// the descriptor, a transient failure, a size of 0x0). There is no default here on purpose: a
 /// made-up 80x24 would look like the user resizing the window.

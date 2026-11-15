@@ -541,6 +541,7 @@ const SETS: &[(&str, &[&str])] = &[
             "fwd_inside_add_rm",
             "fwd_hostile_remote",
             "fwd_ports_view",
+            "fwd_tunnel_only",
             "detach_inside",
             "agent_list_sign",
             "agent_off_default",
@@ -626,6 +627,7 @@ fn scenarios() -> Vec<(&'static str, Scenario)> {
         ("disrupt_vim", disrupt::disrupt_vim),
         // M2: forwards (docs/m2/dropin.md).
         ("fwd_local_http", forward::fwd_local_http),
+        ("fwd_tunnel_only", forward::fwd_tunnel_only),
         ("fwd_cable_pull", forward::fwd_cable_pull),
         ("fwd_reconnect", forward::fwd_reconnect),
         ("fwd_swap", forward::fwd_swap),

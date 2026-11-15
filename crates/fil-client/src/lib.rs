@@ -43,8 +43,8 @@ pub mod tty;
 
 pub use agent::AgentRelay;
 pub use config::{
-    Backoff, ClientConfig, ClientError, ForwardFailure, ForwardSet, Outcome, Predict, Reconnect,
-    RemoteRequests,
+    Backoff, ClientConfig, ClientError, ForwardFailure, ForwardSet, LineSink, Outcome, Predict,
+    Reconnect, RemoteRequests,
 };
 pub use dialer::{AttachInfo, DialError, DialPurpose, Dialed, Dialer, SwapError};
 pub use display::{Display, NoPrediction, PredictorFactory, predictor_factory};

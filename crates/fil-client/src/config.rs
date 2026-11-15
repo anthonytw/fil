@@ -83,6 +83,14 @@ pub struct ClientConfig {
     /// default here: the `fil` binary maps the user's setting onto it (M3's E1b). A predictor
     /// passed to [`crate::run_with`] takes its place.
     pub predict: Predict,
+    /// Tunnel only (`fil -N`, DESIGN.md section 7.3): the run holds the session's forwards (and
+    /// its agent relay) with no terminal. Nothing is drawn and no key is read: the session's
+    /// output goes nowhere, questions are answered "no" without asking (a forward or signature the
+    /// host asks for is refused, a session held elsewhere is left alone), a stop signal detaches,
+    /// and what the user should know (attached, link lost, reconnected, notices, the ending) is
+    /// given to this sink as plain lines, one call per line, without a newline. `None` (the
+    /// default) is an ordinary attach.
+    pub tunnel: Option<LineSink>,
     /// **Test only** (`test-hooks`): the prediction core's guards, so a full-stack test can show
     /// that each one is needed. A build with it is not a release build: the feature compiles in
     /// the marker [`crate::display::TEST_GUARDS_MARKER`], which `just no-test-hooks` refuses.
@@ -95,6 +103,10 @@ pub struct ClientConfig {
     #[cfg(feature = "test-hooks")]
     pub flush_tap: Option<crate::display::FlushTap>,
 }
+
+/// Where a tunnel-only run's lines go ([`ClientConfig::tunnel`]): plain text, no newline, already
+/// safe to show (made from the client's own words and sanitized names).
+pub type LineSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Whether, and when, the client paints its guesses of the echo (DESIGN.md section 9).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -181,6 +193,7 @@ impl ClientConfig {
             max_held_output: 4 * 1024 * 1024,
             forwards: ForwardSet::default(),
             predict: Predict::Off,
+            tunnel: None,
             #[cfg(feature = "test-hooks")]
             predict_guards: None,
             #[cfg(feature = "test-hooks")]

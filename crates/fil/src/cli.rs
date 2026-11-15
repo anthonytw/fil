@@ -4,6 +4,7 @@
 //! fil HOST [SESSION] [-L SPEC]... [-R SPEC]... [-D SPEC]... [-A|-a]
 //!          [--transport auto|pipe|direct] [--predict off|adaptive|always] [--take-over]
 //!                                                attach (default session: main)
+//! fil -N HOST [SESSION] -L|-R|-D SPEC... [-A]    tunnel only (default session: tunnel)
 //! fil ls HOST                                    list sessions
 //! fil kill HOST SESSION                          end a session
 //! fil detach [HOST SESSION]                      detach whoever is attached (no arguments: inside a session)
@@ -33,6 +34,10 @@ use crate::forward_spec::{self, AgentFlag, CliForwards};
 
 /// The session `fil HOST` attaches to when none is named.
 pub const DEFAULT_SESSION: &str = "main";
+
+/// The session `fil -N HOST` holds when none is named: not `main`, so a tunnel started beside an
+/// attached shell does not ask to take that shell's session over (DESIGN.md section 7.3).
+pub const DEFAULT_TUNNEL_SESSION: &str = "tunnel";
 
 /// What `fil --version` prints after the name: the package version and the wire this build
 /// speaks (`wire <major>.<revision>`, DESIGN.md section 8.5). Two builds with the same wire talk
@@ -162,6 +167,12 @@ pub struct AttachArgs {
     /// config's takeover = "always" for this run). By default fil asks first
     #[arg(long)]
     pub take_over: bool,
+
+    /// Tunnel only, as ssh -N: hold the forwards (and the agent relay, with -A) with no terminal,
+    /// until interrupted. Needs a forward (-L, -R, -D, the config's) or -A. The session defaults
+    /// to "tunnel", not "main", so it never asks to take your shell's session
+    #[arg(short = 'N')]
+    pub tunnel: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -521,6 +532,8 @@ pub enum Action {
         take_over: bool,
         /// `-L`, `-R`, `-D`, `-A` and `-a`, parsed and checked, for the run's plan.
         forwards: CliForwards,
+        /// `-N`: tunnel only, no terminal.
+        tunnel: bool,
     },
     List {
         host: String,
@@ -622,6 +635,9 @@ impl Cli {
         if a.take_over {
             stray.push("--take-over".to_string());
         }
+        if a.tunnel {
+            stray.push("-N".to_string());
+        }
         if stray.is_empty() {
             return Ok(());
         }
@@ -720,11 +736,18 @@ impl Cli {
                     host: a
                         .host
                         .expect("clap requires a host when there is no subcommand"),
-                    session: a.session.unwrap_or_else(default_session),
+                    session: a.session.unwrap_or_else(|| {
+                        if a.tunnel {
+                            SessionName::new(DEFAULT_TUNNEL_SESSION).expect("valid")
+                        } else {
+                            default_session()
+                        }
+                    }),
                     transport: a.transport.map(Into::into),
                     predict: a.predict.map(Into::into),
                     take_over: a.take_over,
                     forwards,
+                    tunnel: a.tunnel,
                 })
             }
         }
@@ -750,6 +773,39 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_only_defaults_to_its_own_session() {
+        match action(&["-N", "devbox", "-L", "5432"]) {
+            Action::Attach {
+                session,
+                tunnel: true,
+                forwards,
+                ..
+            } => {
+                assert_eq!(session, name(DEFAULT_TUNNEL_SESSION));
+                assert_eq!(forwards.specs.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A named session is that session; -N goes anywhere on the line, like ssh's.
+        assert!(matches!(
+            action(&["devbox", "db", "-R", "9000", "-N"]),
+            Action::Attach { session, tunnel: true, .. } if session == name("db")
+        ));
+        // Without -N nothing changes.
+        assert!(matches!(
+            action(&["devbox", "-L", "5432"]),
+            Action::Attach { session, tunnel: false, .. } if session == name("main")
+        ));
+        // Before a command it would be ignored: a usage error, as the other attach flags.
+        let e = parse(&["-N", "ls", "devbox"])
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::ArgumentConflict);
+        assert!(e.to_string().contains("-N"), "{e}");
+    }
+
+    #[test]
     fn the_cli_definition_is_consistent() {
         Cli::command().debug_assert();
     }
@@ -764,7 +820,8 @@ mod tests {
                 transport: None,
                 predict: None,
                 take_over: false,
-                forwards: Default::default()
+                forwards: Default::default(),
+                tunnel: false
             }
         );
         assert_eq!(
@@ -775,7 +832,8 @@ mod tests {
                 transport: None,
                 predict: None,
                 take_over: false,
-                forwards: Default::default()
+                forwards: Default::default(),
+                tunnel: false
             }
         );
     }
@@ -795,7 +853,8 @@ mod tests {
                     transport: Some(want),
                     predict: None,
                     take_over: false,
-                    forwards: Default::default()
+                    forwards: Default::default(),
+                    tunnel: false
                 }
             );
         }
@@ -853,7 +912,8 @@ mod tests {
                     transport: None,
                     predict: Some(want),
                     take_over: false,
-                    forwards: Default::default()
+                    forwards: Default::default(),
+                    tunnel: false
                 }
             );
             // After the host too, like the other attach options.
@@ -1182,6 +1242,7 @@ mod tests {
                 predict: None,
                 take_over: false,
                 forwards: forwards(&["devbox", "-L", "80"]),
+                tunnel: false,
             }
         );
         assert_eq!(
@@ -1415,7 +1476,8 @@ mod tests {
                 transport: None,
                 predict: None,
                 take_over: false,
-                forwards: Default::default()
+                forwards: Default::default(),
+                tunnel: false
             }
         );
     }
@@ -1430,7 +1492,8 @@ mod tests {
                 transport: None,
                 predict: None,
                 take_over: false,
-                forwards: Default::default()
+                forwards: Default::default(),
+                tunnel: false
             }
         );
     }

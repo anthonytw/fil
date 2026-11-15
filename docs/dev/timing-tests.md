@@ -149,7 +149,7 @@ The sequential forward smoke stays above 1,024 (QUIC's stream credit, which a mi
 128, the failure that size exists to catch.
 
 Since the CI rework for 0.3.0 the GitHub checks have three suites, by what a run is for: the PR
-gate (`suite=check`, every PR head, about 10 min; about 21 on the release paths, macOS's release-test), the extended set (`suite=extended`, once per
+gate (`suite=check`, every PR head, about 10 min; about 21 on macOS's release paths, `tests/release/`, `packaging/` and `release.yml`, where macOS's release-test runs), the extended set (`suite=extended`, once per
 merge batch on `main`, about 15 min; it is also the run that saves the rust-cache) and the release
 candidate (`suite=all`, which `tests/release/just.sh release` dispatches, about 20 min on GitHub),
 with `just ci-release` (about 20 min) on a quiet Mac beside it. Each suite contains the one before.
@@ -165,7 +165,7 @@ ruleset requires:
 | Linux | `linux-check` `check` | `just test` (every test but `wallclock_` and `soak_` at smoke size, logic and OS, and the doctests); the `ci`-profile no-test-hooks check; fidelity `--no-perf`; the prediction guard sweep; the PTY prediction harness at 2 seeds; the client's PTY tests |
 | Linux | `linux-check` `release-test` | the release scripts' own tests, only when the change touches the release paths (`tests/ci/release-paths.sh`: what CODEOWNERS owns as deciding a release, the justfile, and the other files selftest.sh reads; `git diff --no-renames` against the merge base with main) |
 | macOS arm64 | `macos-check` `check (arm64)` | clippy; `just test-os` (the OS tests at smoke size); `cargo check --target x86_64-apple-darwin -p fil-shell`; the client's PTY tests |
-| macOS arm64 | `macos-check` `release-test (arm64)` | the release scripts' tests on the release paths (as Linux's): the BSD userland of the scripts the owner runs on a Mac, and the macOS signing fakes. The whole selftest (about 21 min; the design's Mac-sections-only run, `selftest.sh --sections`, is not built), so a PR on the release paths takes about 21 min, not 10 |
+| macOS arm64 | `macos-check` `release-test (arm64)` | the release scripts' tests, only when the change touches `tests/release/`, `packaging/` or `release.yml` (`tests/ci/release-paths.sh --mac`; the rest of Linux's list is covered by Linux's run, and macOS sees such a change on the next release-path PR): the BSD userland of the scripts the owner runs on a Mac, and the macOS signing fakes. The whole selftest (about 21 min; the design's Mac-sections-only run, `selftest.sh --sections`, is not built), so a PR on those paths takes about 21 min, not 10 (each section's time is printed, and listed at the end of the run) |
 
 **The extended set** (`suite=extended`): the gate's jobs, with the PTY prediction harness and the
 drop-in quick set in `check (arm64)`; realnet's functional parts (`ssh`, `udp`, `sysd`, `policy`,
@@ -211,7 +211,7 @@ prediction bar or the K1 P bound lost coverage; only duplicates went):
 | arm64 drop-in `fwd_cable_pull` (12.9 min), `fwd_reconnect`, `fwd_swap`, `fwd_sleep` | arm64-remote, all | dropped there: realnet's `fwd-cable` and `fwd-func` (a real `ip link down`, the stronger test); nothing in them is arch-specific |
 | arm64 drop-in, the rest, with prediction on | one 36 min step | two shards in all; the quick set in extended |
 | Intel macOS check (every test, harness, full drop-in, release-test, fat-LTO check) | suite=all, after queues of up to hours | dropped: arm64 covers the same kernel interfaces; the cross `cargo check` per PR; the x86_64 half runs in smoke-macos (Rosetta required) and brew Intel |
-| `release-test` on Mac arm64 and Intel in suite=all | 3 runs per candidate, plus release.yml | Linux once per candidate, release.yml; the Mac per PR on the release paths only (no macOS run in suite=all: a change of the macOS userland the runner image brings shows up only on the next release-path PR); per merge batch on main neither runs (no change against main) |
+| `release-test` on Mac arm64 and Intel in suite=all | 3 runs per candidate, plus release.yml | Linux once per candidate, release.yml; the Mac per PR on its narrower paths only (`--mac`; no macOS run in suite=all: a change of the macOS userland the runner image brings shows up only on the next release-path PR); per merge batch on main neither runs (no change against main) |
 | logic tests (`just test`) on both Macs in suite=all | both Macs | Linux only (`just test-os` on the Mac) |
 | `shipped-no-test-hooks` on both Macs | suite=all | release.yml's check of the shipped binaries; `ci-release-full` |
 | `full-scale` | one 29 min job | three partitions |
@@ -222,7 +222,7 @@ Where each step that left the per-PR gate in the test-suite sweep (2026-11-11) r
 
 | Test or step | Before (per PR) | Now |
 |---|---|---|
-| `release-test` | inside `just ci` on Linux, arm64 and Intel | per PR on the release paths only: linux-check's `release-test` and macos-check's `release-test (arm64)` (the whole selftest, about 21 min on the Mac); suite=all on Linux only (no macOS release-test there); release.yml; `ci-release-full` |
+| `release-test` | inside `just ci` on Linux, arm64 and Intel | per PR on the release paths only: linux-check's `release-test` and macos-check's `release-test (arm64)` (on the narrower `--mac` paths; the whole selftest, about 21 min on the Mac); suite=all on Linux only (no macOS release-test there); release.yml; `ci-release-full` |
 | pure-logic test binaries on macOS | `just ci` on arm64 and Intel | Linux only: per PR (`just test`), full size in suite=all's `full-scale`; `ci-release-full` on the Mac |
 | Intel macOS check | every PR (`just ci`, harnesses, drop-in) | arm64's cross `cargo check` per PR; no Intel test job (release.yml's smoke-macos runs the x86_64 half under Rosetta; brew's Intel job runs only with a `release_run`, which the release candidate's dispatch does not pass) |
 | deny, notices (and cargo-about), fmt, exporter lock, workflow test, release-deps on macOS | `just ci` on both Macs | Linux per PR only (identical on every platform) |

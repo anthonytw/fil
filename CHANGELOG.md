@@ -30,6 +30,10 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 - A daemon with nothing to do now exits after `idle_exit_secs` (five minutes by default). The idle wait started over at every 15-second file check, so with any idle time longer than 15 seconds the daemon never exited on its own.
 
+### Fixed
+
+- A daemon with nothing to do now exits after `idle_exit_secs` (five minutes by default). The idle wait started over at every 15-second file check, so with any idle time longer than 15 seconds the daemon never exited on its own.
+
 ## [0.3.0] - 2026-11-14
 
 Ask before taking over a session, and predictive echo that recovers after an interruption.

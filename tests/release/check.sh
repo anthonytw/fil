@@ -155,6 +155,10 @@ if [ ! -f "$inst" ]; then
 else
   if [ "$(head -n 1 "$inst")" = "#!/bin/sh" ]; then ok "$INSTALLER_NAME is a #!/bin/sh script"; else fail "$INSTALLER_NAME does not start with #!/bin/sh"; fi
   if sh -n "$inst" 2> "$work/installer-parse.log"; then ok "$INSTALLER_NAME parses (sh -n)"; else fail "$INSTALLER_NAME does not parse: $(head -n 3 "$work/installer-parse.log" | tr '\n' ' ')"; fi
+  pin_problems=$(installer_pin_problems "$inst")
+  if [ -z "$pin_problems" ]; then ok "$INSTALLER_NAME pins its key once, for its one principal, in its one verify call"; else
+    fail "$INSTALLER_NAME pins its key wrongly: $(printf '%s' "$pin_problems" | tr '\n' ';')"
+  fi
   pinned=$(installer_signers "$inst")
   want_signers=$(signers_release_lines "$ROOT/.github/release-signers")
   if [ -z "$want_signers" ]; then

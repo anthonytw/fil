@@ -22,7 +22,7 @@ sudo apt install ./fil_<version>_amd64.deb  # Debian, Ubuntu (from a GitHub Rele
 cargo install --locked fil-shell            # from source; the crate is fil-shell, the command is fil
 ```
 
-From 1.0 there is also an installer that checks the release's signature before it installs anything (`curl -fsSL https://github.com/anthonytw/fil/releases/latest/download/fil-install.sh | sh`, no root), and fil's own apt and dnf repositories. Fedora, Arch, Nix, the release archives and how to check them are in the [install guide](docs/user/install.md). fil goes on the host too: `fil install HOST` puts it there over your ssh login, or the first `fil HOST` offers to.
+From the release after 0.3.0 there is also an installer that checks the release's signature before it installs anything (`curl -fsSL https://github.com/anthonytw/fil/releases/latest/download/fil-install.sh | sh`, no root), and fil's own apt and dnf repositories. Fedora, Arch, Nix, the release archives and how to check them are in the [install guide](docs/user/install.md). fil goes on the host too: `fil install HOST` puts it there over your ssh login, or the first `fil HOST` offers to.
 
 ## Quick start
 

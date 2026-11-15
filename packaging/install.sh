@@ -6,24 +6,30 @@
 #   sh fil-install.sh [--version X.Y.Z] [--dir DIR] [--help]
 #
 # What it does, and nothing else:
-#   1. downloads SHA256SUMS and SHA256SUMS.sig of the latest release (or of --version) from GitHub;
+#   1. downloads SHA256SUMS and SHA256SUMS.sig of the latest release (or of --version) from GitHub,
+#      with curl, over HTTPS only (redirects included), TLS 1.2 or later;
 #   2. verifies SHA256SUMS.sig with `ssh-keygen -Y verify` against the release key written below,
 #      the `fil-release` key of the repository's .github/release-signers, and stops if it does not
 #      verify;
-#   3. picks this machine's archive from the verified SHA256SUMS, downloads it and checks its
-#      SHA-256 against that list, and stops if it differs;
-#   4. unpacks it in a temporary directory and copies bin/fil into ~/.local/bin (or --dir, or
-#      $FIL_INSTALL_DIR), and the Linux programs `fil install` uploads into ../libexec/fil/remote
-#      from there, then prints PATH advice if that directory is not on your PATH.
+#   3. picks this machine's archive from the verified SHA256SUMS, downloads it from that release's
+#      own directory (download/vVERSION, never "latest" a second time) and checks its SHA-256
+#      against that list, and stops if it differs;
+#   4. unpacks it in a temporary directory, stages bin/fil beside ~/.local/bin/fil (or --dir, or
+#      $FIL_INSTALL_DIR) and the Linux programs `fil install` uploads beside ../libexec/fil/remote
+#      (both resolved physically, as fil resolves its own path), then renames both into place, and
+#      prints PATH advice if that directory is not on your PATH.
 # No root, no sudo, no shell profile edited, nothing run from the download but the installed
-# `fil --version` at the end. Every failure stops before anything is installed.
+# `fil --version` at the end. Every failure stops with nothing installed: a failed rename puts the
+# old bundle back.
 #
 # Environment: FIL_VERSION (as --version), FIL_INSTALL_DIR (as --dir), FIL_RELEASE_URL (the
 # releases base, default https://github.com/anthonytw/fil/releases; a mirror or a local copy as
 # file:///path, laid out as GitHub's: latest/download/FILE and download/vX.Y.Z/FILE). Whatever the
 # URL, the signature is checked against the key below, which is the only thing trusted.
 #
-# Needs: sh, curl (or wget), ssh-keygen (OpenSSH 8.1 or later), tar, gzip, and sha256sum or shasum.
+# Needs: sh, curl, ssh-keygen (OpenSSH 8.1 or later, for -Y verify), tar, gzip, and sha256sum or
+# shasum. Each is checked before anything is downloaded. (No wget: GNU wget's --https-only does not
+# stop a redirect to plain HTTP, and busybox wget lacks it.)
 #
 # Everything is inside main(), called on the last line, so a download cut short runs nothing.
 set -eu
@@ -51,19 +57,11 @@ installs `fil` into ~/.local/bin (or DIR). No root needed. https://github.com/an
 EOF
 }
 
-# fetch URL FILE: download URL into FILE. https:// and file:// only; https is never downgraded on a
-# redirect.
+# fetch URL FILE: download URL into FILE. https:// (curl, HTTPS for every redirect too, TLS 1.2 or
+# later) and file:// only.
 fetch() {
   case $1 in
-    https://*)
-      if command -v curl > /dev/null 2>&1; then
-        curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 2 -o "$2" "$1"
-      elif command -v wget > /dev/null 2>&1; then
-        wget -q --https-only -O "$2" "$1"
-      else
-        die "needs curl or wget"
-      fi
-      ;;
+    https://*) curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 2 -o "$2" "$1" ;;
     file://*) cp "${1#file://}" "$2" ;;
     *) die "not an https:// or file:// URL: $1" ;;
   esac
@@ -114,18 +112,28 @@ main() {
   fi
   case $dir in /*) ;; *) dir=$(pwd)/$dir ;; esac
 
-  command -v ssh-keygen > /dev/null 2>&1 || die "needs ssh-keygen (OpenSSH) to check the release signature"
+  base=${FIL_RELEASE_URL:-https://github.com/anthonytw/fil/releases}
+  base=${base%/}
+  case $base in
+    https://*) command -v curl > /dev/null 2>&1 || die "needs curl (install it with your package manager, then run this again)" ;;
+    file://*) ;;
+    *) die "not an https:// or file:// URL: $base" ;;
+  esac
+  command -v ssh-keygen > /dev/null 2>&1 || die "needs ssh-keygen (OpenSSH 8.1 or later) to check the release signature"
+  # OpenSSH before 8.1 has no -Y: say so plainly, rather than as a signature that does not verify.
+  case $(ssh-keygen -Y verify < /dev/null 2>&1) in
+    *"illegal option"* | *"unknown option"* | *"invalid option"*) die "needs OpenSSH 8.1 or later: this ssh-keygen has no -Y, which checks the release signature" ;;
+  esac
+  command -v sha256sum > /dev/null 2>&1 || command -v shasum > /dev/null 2>&1 || die "needs sha256sum or shasum"
   command -v tar > /dev/null 2>&1 || die "needs tar"
   command -v gzip > /dev/null 2>&1 || die "needs gzip"
   label=$(target)
-
-  base=${FIL_RELEASE_URL:-https://github.com/anthonytw/fil/releases}
-  base=${base%/}
   if [ -n "$version" ]; then from=$base/download/v$version; else from=$base/latest/download; fi
 
   tmp=$(mktemp -d 2> /dev/null || mktemp -d -t fil-install)
   [ -n "$tmp" ] && [ -d "$tmp" ] || die "could not make a temporary directory"
-  trap 'rm -rf "$tmp"' EXIT
+  newbin='' newlib='' oldlib=''
+  trap 'rm -rf "$tmp"; [ -z "$newbin" ] || rm -f "$newbin"; [ -z "$newlib" ] || rm -rf "$newlib"' EXIT
   trap 'exit 1' HUP INT TERM
 
   say "downloading SHA256SUMS and its signature from $from"
@@ -153,6 +161,8 @@ main() {
     die "the signed SHA256SUMS at $from is for fil $got_version, not $version"
   fi
 
+  # The archive comes from that release's own directory: "latest" could move between two downloads.
+  from=$base/download/v$got_version
   say "downloading $archive"
   fetch "$from/$archive" "$tmp/$archive" || die "could not download $from/$archive"
   got=$(sha256 "$tmp/$archive")
@@ -165,27 +175,49 @@ main() {
   [ -f "$top/bin/fil" ] && [ ! -h "$top/bin/fil" ] || die "$archive has no bin/fil"
 
   # Install: bin/fil into DIR and the remote bundle into DIR/../libexec/fil/remote, where fil looks
-  # for it (docs/m4/release.md section 4.3), each through a temporary name and a rename, so a
-  # running fil is never overwritten in place. Never a symbolic link (docs/m4/install.md).
+  # for it: fil resolves its own path physically (docs/m4/release.md section 4.3), so DIR and its
+  # parent are resolved with pwd -P (a symbolic link ~/.local/bin -> ~/dotfiles/bin puts the bundle
+  # in ~/dotfiles/libexec). Both are staged under temporary names (mktemp) in their directories,
+  # then renamed into place, the bundle first; a running fil is never overwritten in place. Never a
+  # symbolic link (docs/m4/install.md).
   mkdir -p "$dir" || die "could not make $dir"
-  [ -h "$dir/fil" ] && die "$dir/fil is a symbolic link; remove it first (fil must be a real file)"
-  cp "$top/bin/fil" "$dir/.fil.new.$$" && chmod 755 "$dir/.fil.new.$$" && mv -f "$dir/.fil.new.$$" "$dir/fil" \
-    || { rm -f "$dir/.fil.new.$$"; die "could not install $dir/fil"; }
+  pdir=$(cd "$dir" && pwd -P) || die "could not resolve $dir"
+  if [ -h "$pdir/fil" ]; then die "$pdir/fil is a symbolic link; remove it first (fil must be a real file)"; fi
+  if [ -e "$pdir/fil" ] && [ ! -f "$pdir/fil" ]; then die "$pdir/fil exists and is not a regular file; remove it first"; fi
+  newbin=$(mktemp "$pdir/.fil.new.XXXXXX") || die "could not write in $pdir"
+  cp "$top/bin/fil" "$newbin" && chmod 755 "$newbin" || die "could not stage $pdir/fil"
+  lib=''
   if [ -d "$top/libexec/fil/remote" ]; then
-    lib=$(cd "$dir/.." && pwd)/libexec/fil
+    lib=$(cd "$pdir/.." && pwd -P)/libexec/fil
     mkdir -p "$lib" || die "could not make $lib"
-    rm -rf "$lib/.remote.new.$$"
-    cp -R "$top/libexec/fil/remote" "$lib/.remote.new.$$" || die "could not copy the remote bundle to $lib"
-    rm -rf "$lib/remote.old.$$"
-    if [ -d "$lib/remote" ]; then mv "$lib/remote" "$lib/remote.old.$$"; fi
-    mv "$lib/.remote.new.$$" "$lib/remote" || die "could not install $lib/remote"
-    rm -rf "$lib/remote.old.$$"
+    newlib=$(mktemp -d "$lib/.remote.new.XXXXXX") || die "could not write in $lib"
+    cp -R "$top/libexec/fil/remote/." "$newlib/" && chmod 755 "$newlib" || die "could not stage the remote bundle in $lib"
+    if [ -e "$lib/remote" ] || [ -h "$lib/remote" ]; then
+      oldlib=$(mktemp -d "$lib/.remote.old.XXXXXX") || die "could not write in $lib"
+      mv "$lib/remote" "$oldlib/remote" || { rm -rf "$oldlib"; die "could not move the old bundle aside"; }
+    fi
+    if ! mv "$newlib" "$lib/remote"; then
+      [ -z "$oldlib" ] || mv "$oldlib/remote" "$lib/remote"
+      [ -z "$oldlib" ] || rm -rf "$oldlib"
+      die "could not install $lib/remote (the old bundle is back)"
+    fi
+    newlib=''
   fi
-  say "installed fil $got_version: $dir/fil"
-  "$dir/fil" --version < /dev/null || say "note: $dir/fil --version failed"
+  if ! mv -f "$newbin" "$pdir/fil"; then
+    if [ -n "$lib" ]; then
+      rm -rf "$lib/remote"
+      [ -z "$oldlib" ] || mv "$oldlib/remote" "$lib/remote"
+    fi
+    [ -z "$oldlib" ] || rm -rf "$oldlib"
+    die "could not install $pdir/fil (the old bundle is back)"
+  fi
+  newbin=''
+  [ -z "$oldlib" ] || rm -rf "$oldlib"
+  say "installed fil $got_version: $pdir/fil"
+  "$pdir/fil" --version < /dev/null || say "note: $pdir/fil --version failed"
 
   case :${PATH:-}: in
-    *:"$dir":*) ;;
+    *:"$dir":* | *:"$pdir":*) ;;
     *)
       say "$dir is not on your PATH. Add it, for example:"
       say "  bash: echo 'export PATH=\"$dir:\$PATH\"' >> ~/.bashrc"

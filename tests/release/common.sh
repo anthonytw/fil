@@ -196,6 +196,39 @@ installer_signers() {
     on { line = $0; if (sub(/\047[ \t]*$/, "", line)) { print line; on = 0; exit } print line }
   ' "$1" | LC_ALL=C sort
 }
+# installer_pin_problems FILE: what is wrong with how an installer script pins its key, one problem a
+# line (nothing when it is right): exactly one FIL_RELEASE_SIGNERS= and one FIL_RELEASE_PRINCIPAL=
+# assignment (a second one could replace the pinned key after release-check read the first), a
+# principal of plain characters that every pinned line names first (ssh-keygen -I matches it), the
+# fil-release namespace, and the one verify call reading exactly those (-f the file the pinned lines
+# are written to, -I the principal, -n the namespace).
+installer_pin_problems() {
+  local f=$1 n principal line
+  n=$(grep -c 'FIL_RELEASE_SIGNERS=' "$f" || true)
+  [ "$n" = 1 ] || echo "FIL_RELEASE_SIGNERS= appears $n times, not once"
+  n=$(grep -c 'FIL_RELEASE_PRINCIPAL=' "$f" || true)
+  [ "$n" = 1 ] || echo "FIL_RELEASE_PRINCIPAL= appears $n times, not once"
+  n=$(grep -c 'FIL_RELEASE_NAMESPACE=' "$f" || true)
+  [ "$n" = 1 ] && grep -qx 'FIL_RELEASE_NAMESPACE=fil-release' "$f" || echo "FIL_RELEASE_NAMESPACE is not set once, to fil-release"
+  principal=$(sed -n 's/^FIL_RELEASE_PRINCIPAL=\([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$f")
+  if [ -z "$principal" ]; then
+    echo "no FIL_RELEASE_PRINCIPAL=NAME line (NAME of [A-Za-z0-9._-])"
+  else
+    while IFS= read -r line; do
+      [ "${line%% *}" = "$principal" ] || echo "a pinned line does not name the principal '$principal' first: ${line%% *}"
+    done <<EOF
+$(installer_signers "$f")
+EOF
+  fi
+  # shellcheck disable=SC2016 # the installer's own text, matched literally
+  n=$(grep -cF 'printf '\''%s\n'\'' "$FIL_RELEASE_SIGNERS" > "$tmp/signers"' "$f" || true)
+  [ "$n" = 1 ] || echo "the pinned lines are not written to \$tmp/signers exactly once"
+  # shellcheck disable=SC2016
+  n=$(grep -cF 'ssh-keygen -Y verify -f "$tmp/signers" -I "$FIL_RELEASE_PRINCIPAL" -n "$FIL_RELEASE_NAMESPACE"' "$f" || true)
+  [ "$n" = 1 ] || echo "the verify call is not exactly once ssh-keygen -Y verify -f \"\$tmp/signers\" -I \"\$FIL_RELEASE_PRINCIPAL\" -n \"\$FIL_RELEASE_NAMESPACE\""
+  n=$(grep -v '^[[:space:]]*#' "$f" | grep -c 'ssh-keygen -Y verify' || true)
+  [ "$n" = 2 ] || echo "ssh-keygen -Y verify appears $n times (the probe for -Y and the one verify call)"
+}
 # signers_release_lines FILE: the `fil-release` lines of an allowed-signers file (.github/release-signers),
 # sorted: what the installer must pin.
 signers_release_lines() { grep -E '^[^#[:space:]]+[[:space:]]+namespaces="fil-release"[[:space:]]' "$1" | LC_ALL=C sort || true; }

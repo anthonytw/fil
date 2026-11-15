@@ -652,6 +652,11 @@ mutated_msg "the installer is missing" "no fil-install.sh" "touch .no-installer"
 mutated_msg "the installer pins another key" "pins other keys" "sed 's|AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]*|AAAAC3NzaC1lZDI1NTE5AAAAIOTHERKEY|' \"\$tree/$INSTALLER_SRC\" > .installer"
 mutated_msg "the installer is not a #!/bin/sh script" "does not start with #!/bin/sh" "printf '#!/bin/bash\\necho\\n' > .installer"
 mutated_msg "the installer does not parse" "does not parse" "printf '#!/bin/sh\\nif then\\n' > .installer"
+mutated_msg "the installer assigns its key twice" "FIL_RELEASE_SIGNERS= appears 2 times" "{ cat \"\$tree/$INSTALLER_SRC\"; echo 'FIL_RELEASE_SIGNERS=\$FIL_RELEASE_SIGNERS'; } > .installer"
+mutated_msg "the installer's pinned line names another principal" "does not name the principal" "sed 's/^FIL_RELEASE_PRINCIPAL=release\$/FIL_RELEASE_PRINCIPAL=owner/' \"\$tree/$INSTALLER_SRC\" > .installer"
+mutated_msg "the installer verifies against another file" "the verify call is not exactly once" "sed 's|-Y verify -f \"\$tmp/signers\"|-Y verify -f \"\$tmp/other\"|' \"\$tree/$INSTALLER_SRC\" > .installer"
+mutated_msg "the installer's namespace is not fil-release" "FIL_RELEASE_NAMESPACE is not set once" "sed 's/^FIL_RELEASE_NAMESPACE=fil-release\$/FIL_RELEASE_NAMESPACE=git/' \"\$tree/$INSTALLER_SRC\" > .installer"
+expect_pass "installer: the tree's script pins its key correctly (installer_pin_problems)" test -z "$(installer_pin_problems "$REPO_ROOT/$INSTALLER_SRC")"
 new_case 0.9.0 # the cases below start from a clean release
 expect_pass "a clean tag run passes (changelog, tag, wire)" check --tag v0.9.0 --no-tree "$rel"
 expect_pass "a clean complete run passes" check --tag v0.9.0 --complete --no-tree "$rel"
@@ -1795,8 +1800,13 @@ else
   echo "0000000000000000000000000000000000000000000000000000000000000000  extra" >> "$it/r2/latest/download/SHA256SUMS"
   it_refused "SHA256SUMS changed after signing" "not a valid signature" "file://$it/r2"
   it_release "$it/r3" 9.9.9 "$it/keys/release"
-  printf 'x' >> "$it/r3/latest/download/fil-9.9.9-$IL.tar.gz"
+  printf 'x' >> "$it/r3/download/v9.9.9/fil-9.9.9-$IL.tar.gz"
   it_refused "a changed archive" "but the signed SHA256SUMS says" "file://$it/r3"
+  # once SHA256SUMS is verified, the archive comes from download/vVERSION, not "latest" again
+  it_release "$it/r7" 9.9.9 "$it/keys/release"
+  printf 'x' >> "$it/r7/latest/download/fil-9.9.9-$IL.tar.gz"
+  mkdir -p "$it/hr7"
+  expect_pass "installer: the archive comes from the verified release's own directory" itr "$it/hr7" "file://$it/r7"
   it_release "$it/r4" 9.9.9 "$it/keys/release"
   rm "$it/r4/latest/download/SHA256SUMS.sig"
   it_refused "no signature" "could not download" "file://$it/r4"
@@ -1810,6 +1820,31 @@ else
   ln -s "$it/elsewhere" "$it/hl/.local/bin/fil"
   expect_fail "installer: a symbolic link at the target is refused" itr "$it/hl" "file://$it/rel"
   expect_pass "installer: ...and left alone" test -h "$it/hl/.local/bin/fil"
+  mkdir -p "$it/hd/.local/bin/fil"
+  expect_fail "installer: a directory at the target is refused" itr "$it/hd" "file://$it/rel"
+  expect_pass "installer: ...and nothing is left staged" sh -c 'test -z "$(ls -A "$1/.local/bin/fil")" && test -z "$(ls -A "$1/.local/bin" | grep -v "^fil$")" && test ! -e "$1/.local/libexec"' sh "$it/hd"
+  # a symbolic link for the directory (a dotfile manager's ~/.local/bin -> ~/dot/bin): the bundle
+  # goes where fil looks, ../libexec of the resolved directory
+  mkdir -p "$it/hs/dot/bin" "$it/hs/.local"
+  ln -s ../dot/bin "$it/hs/.local/bin"
+  expect_pass "installer: a symbolically linked install directory" itr "$it/hs" "file://$it/rel"
+  expect_pass "installer: ...fil is in the resolved directory" test -x "$it/hs/dot/bin/fil"
+  expect_pass "installer: ...the bundle is at ../libexec of the resolved directory, where fil looks" test -f "$it/hs/dot/libexec/fil/remote/SHA256SUMS"
+  expect_pass "installer: ...and not beside the link" test ! -e "$it/hs/.local/libexec"
+  expect_pass "installer: a reinstall leaves no staging or old copies" sh -c 'sh -c "$2" > /dev/null 2>&1; test -z "$(ls -A "$1/dot/bin" | grep -v "^fil$")" && test "$(ls -A "$1/dot/libexec/fil")" = remote' sh "$it/hs" "env HOME=$it/hs FIL_RELEASE_URL=file://$it/rel sh $it/install.sh"
+  # the tools: curl (https), and an ssh-keygen with -Y
+  mkdir -p "$it/empty"
+  it_n=$((it_n + 1))
+  if env -i HOME="$it/h$it_n" PATH="$it/empty" FIL_RELEASE_URL=https://example.invalid/releases /bin/sh "$it/install.sh" > "$it/tools.log" 2>&1; then flunk "installer: no curl for an https URL (it should have failed)"
+  else expect_pass "installer: no curl for an https URL: refused, naming curl" grep -q 'needs curl' "$it/tools.log"; fi
+  mkdir -p "$it/oldssh"
+  printf '#!/bin/sh\necho "ssh-keygen: illegal option -- Y" >&2\nexit 1\n' > "$it/oldssh/ssh-keygen"
+  chmod 755 "$it/oldssh/ssh-keygen"
+  it_n=$((it_n + 1))
+  mkdir -p "$it/h$it_n"
+  if env HOME="$it/h$it_n" PATH="$it/oldssh:$PATH" FIL_RELEASE_URL="file://$it/rel" sh "$it/install.sh" > "$it/tools.log" 2>&1; then flunk "installer: an ssh-keygen without -Y (it should have failed)"
+  else expect_pass "installer: an ssh-keygen without -Y: refused, naming OpenSSH 8.1" grep -q 'needs OpenSSH 8.1 or later' "$it/tools.log"; fi
+  expect_pass "installer: ...before anything was installed" test ! -e "$it/h$it_n/.local"
 fi
 
 # ============================================================== audit-age.sh (SECURITY.md "Audits")

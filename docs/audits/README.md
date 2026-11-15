@@ -70,15 +70,15 @@ After the last embargoed fix has shipped (an audit that finds nothing publishes 
 
 | Changed path | Lane |
 | --- | --- |
-| `crates/fil-proto/`, `crates/fil-term/`, `crates/fil-transport/src/pipe/answer.rs`, `crates/fil/src/install/probe.rs`, every `crates/*/fuzz/`, `crates/fil-proto/tests/golden/` | A |
+| `crates/fil-proto/`, `crates/fil-term/`, `crates/fil-transport/src/pipe/answer.rs`, `crates/fil/src/install/probe.rs`, every `crates/*/fuzz/`, `crates/fil-proto/tests/golden/`; the config parsers and what the client writes to the terminal: `crates/fil/src/config.rs`, `crates/fil-client/src/{config,escape,text,terminal,display}.rs` | A |
 | `crates/fil-transport/`, `crates/fil/src/{connect,dialer,link}.rs`, `crates/fil-client/src/{dialer,consent}.rs`, `docs/m1/quic-auth.md`, `docs/m1/quic-link.md`, `docs/user/transports.md` | B |
-| `crates/fil-daemon/` (but `ports/`), `crates/fil-session/` (but `agent.rs`, `forward.rs`, `echo.rs`), `crates/fil/src/install/`, `crates/fil/src/{server,mgmt}.rs`, `crates/fil-transport/src/pipe/remote-commands.txt`, `docs/m4/install.md`, `docs/user/{policy,daemon,sessions}.md` | C |
+| `crates/fil-daemon/` (but `ports/`), `crates/fil-session/` (but `agent.rs`, `forward.rs`, `echo.rs`), `crates/fil/src/install/`, `crates/fil/src/{server,mgmt,cli,cmds,app,main,netwatch,ports_view,localtime,upgrade}.rs`, `crates/fil-client/src/{tty,status,offline}.rs`, and any other `crates/*/src/` path no row names, `crates/fil-transport/src/pipe/remote-commands.txt`, `docs/m4/install.md`, `docs/user/{policy,daemon,sessions}.md` | C |
 | `crates/fil-forward/`, `crates/fil-daemon/src/ports/`, `crates/fil-session/src/{agent,forward}.rs`, `crates/fil-client/src/{agent,forward}.rs`, `crates/fil/src/forward_spec.rs`, `docs/user/{forwards,agent}.md` | D |
 | `crates/fil-predict/`, `crates/fil-client/src/engine.rs`, `crates/fil-client/src/engine/`, `crates/fil-session/src/echo.rs`, `docs/m3/plan.md` | E |
 | `Cargo.toml`, `Cargo.lock`, `deny.toml`, `about.toml`, `about.hbs`, `Cross.toml`, `rust-toolchain.toml`, `flake.nix`, `flake.lock`, `.github/`, `tests/release/`, `tests/ci/`, `packaging/`, `docs/m4/release.md`, `docs/m4/packaging.md` | F |
-| every audit; also `SECURITY.md`, `DESIGN.md` §11, `docs/user/security-privacy.md`, `README.md`, every `logging.rs`, and anything that opens a connection or writes a file or a log line | G |
+| every audit; also `SECURITY.md`, `DESIGN.md` §11, `docs/user/security-privacy.md`, `README.md`, every `logging.rs`, `crates/fil-client/src/offline.rs` (the offline-input log), and anything that opens a connection or writes a file or a log line | G |
 
-A path in two rows runs both lanes. A path in none (documentation, tests, harnesses) runs none; lane G still runs.
+A path in two rows runs both lanes. Every source file under `crates/*/src/` maps to at least one lane (C catches any that no other row names, so a new module is never silently out of scope). A path in none (documentation, tests, harnesses) runs none; lane G still runs.
 
 ## Reports
 

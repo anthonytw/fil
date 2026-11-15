@@ -52,6 +52,15 @@ pub enum MgmtError {
 /// daemon that never says `more: false` costs a bounded amount of memory and ends in an error,
 /// and one that sends too many rows is cut off at the protocol's cap (the caller notes that).
 pub async fn ask<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, MgmtError> {
+    ask_peer(link, request).await.map(|(parts, _)| parts)
+}
+
+/// [`ask`], with the `agent` of the daemon's `Hello` (free-form and untrusted: for
+/// [`crate::upgrade::newer_daemon`], which reads only its known shape).
+pub async fn ask_peer<L: Link>(
+    link: &L,
+    request: Request,
+) -> Result<(Vec<Response>, Option<Agent>), MgmtError> {
     let result = tokio::time::timeout(ANSWER_TIMEOUT, exchange(link, request)).await;
     link.close();
     result.unwrap_or(Err(MgmtError::Timeout(ANSWER_TIMEOUT)))
@@ -59,9 +68,17 @@ pub async fn ask<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, M
 
 /// [`ask`] for a request with a one-response answer.
 pub async fn ask_one<L: Link>(link: &L, request: Request) -> Result<Response, MgmtError> {
-    let mut parts = ask(link, request).await?;
+    ask_one_peer(link, request).await.map(|(r, _)| r)
+}
+
+/// [`ask_one`], with the daemon's `agent` as [`ask_peer`] gives it.
+pub async fn ask_one_peer<L: Link>(
+    link: &L,
+    request: Request,
+) -> Result<(Response, Option<Agent>), MgmtError> {
+    let (mut parts, peer) = ask_peer(link, request).await?;
     match (parts.pop(), parts.is_empty()) {
-        (Some(r), true) => Ok(r),
+        (Some(r), true) => Ok((r, peer)),
         _ => Err(MgmtError::Protocol(
             "the daemon answered in parts to a request with one answer".into(),
         )),
@@ -77,7 +94,10 @@ async fn send<L: Link>(link: &L, msg: &ControlMsg) -> Result<(), MgmtError> {
         .map_err(MgmtError::Lost)
 }
 
-async fn exchange<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, MgmtError> {
+async fn exchange<L: Link>(
+    link: &L,
+    request: Request,
+) -> Result<(Vec<Response>, Option<Agent>), MgmtError> {
     let agent = Agent::new(format!("fil {}", env!("CARGO_PKG_VERSION")))
         .map_err(|e| MgmtError::Protocol(e.to_string()))?;
     let ours = Hello::ours(agent);
@@ -100,6 +120,7 @@ async fn exchange<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, 
     };
     let mut parts: Vec<Response> = Vec::new();
     let mut rows = 0usize;
+    let mut peer_agent = None;
     loop {
         let (channel, payload) = link.recv().await.map_err(MgmtError::Lost)?;
         if channel != ChannelId::CONTROL {
@@ -108,6 +129,7 @@ async fn exchange<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, 
         match ControlMsg::decode(&payload).map_err(|e| MgmtError::Protocol(e.to_string()))? {
             ControlMsg::Hello(peer) => {
                 ours.check(&peer).map_err(MgmtError::Version)?;
+                peer_agent = Some(peer.agent);
             }
             ControlMsg::Response(_) if unsent.is_some() => {
                 return Err(MgmtError::Lost(unsent.take().expect("checked")));
@@ -120,7 +142,7 @@ async fn exchange<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, 
                 // protocol. Rows beyond the cap are dropped by the view and said so; a stream of
                 // empty parts is an error.
                 if !more || rows > MAX_PORTS_ROWS {
-                    return Ok(parts);
+                    return Ok((parts, peer_agent));
                 }
                 if parts.len() > MAX_PORTS_ROWS {
                     return Err(MgmtError::Protocol(
@@ -128,7 +150,7 @@ async fn exchange<L: Link>(link: &L, request: Request) -> Result<Vec<Response>, 
                     ));
                 }
             }
-            ControlMsg::Response(r) if parts.is_empty() => return Ok(vec![r]),
+            ControlMsg::Response(r) if parts.is_empty() => return Ok((vec![r], peer_agent)),
             ControlMsg::Response(_) => {
                 return Err(MgmtError::Protocol(
                     "a different answer came in the middle of a `fil ports` answer".into(),
@@ -536,7 +558,7 @@ mod tests {
             others: vec![],
         });
         let d = tokio::spawn(daemon_answers(daemon, Some(reply)));
-        let got = ask_one(&client, Request::ListSessions).await.unwrap();
+        let (got, peer) = ask_one_peer(&client, Request::ListSessions).await.unwrap();
         assert_eq!(
             got,
             Response::Sessions {
@@ -544,6 +566,11 @@ mod tests {
                 truncated: false,
                 others: vec![]
             }
+        );
+        // The daemon's `Hello` names it (the newer-daemon note of `fil ls` reads this).
+        assert_eq!(
+            peer.map(|a| a.as_str().to_string()).as_deref(),
+            Some("test-daemon")
         );
         d.await.unwrap();
     }

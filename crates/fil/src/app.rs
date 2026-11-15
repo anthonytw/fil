@@ -3,7 +3,9 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use fil_client::{Backoff, ClientConfig, ClientError, OfflineLog, Outcome, Predict};
+use fil_client::{
+    Backoff, ClientConfig, ClientError, LineSink, OfflineInput, OfflineLog, Outcome, Predict,
+};
 use fil_proto::limits::MAX_HOST_LABEL;
 use fil_proto::msg::{HostLabel, Request, SessionName};
 use fil_transport::LinkParams;
@@ -30,16 +32,26 @@ const POST_RUN_WRITE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Exit status of a normal end.
 const OK: u8 = 0;
 /// Exit status when a forward cannot be set up and `forward_failure = "exit"`, as ssh's
-/// `ExitOnForwardFailure`.
+/// `ExitOnForwardFailure`; also of a `-N` stopped before its first attach, as `ssh -N`.
 const FORWARD_FAILED: u8 = 255;
 
 /// Exit status of an error, and of a session that was taken, replaced or detached from elsewhere.
 const FAILED: u8 = 1;
 
+/// Exit status of a usage error (clap's, and `-N` with nothing to hold).
+const USAGE: u8 = 2;
+
 pub fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(e) => e.exit(), // 0 for --help and --version, 2 for a usage error
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayVersion => {
+            // clap's text with the upgrade line after the first (1.0 decision 6).
+            let text = crate::cli::version_text(&crate::upgrade::detect(&crate::upgrade::System));
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            return ExitCode::from(OK);
+        }
+        Err(e) => e.exit(), // 0 for --help, 2 for a usage error
     };
     if let Err(e) = cli.validate() {
         e.exit(); // 2, like any usage error
@@ -119,6 +131,7 @@ async fn run(action: Action, config: &Config) -> u8 {
             predict,
             take_over,
             forwards,
+            tunnel,
         } => {
             let mut settings = attach_settings(config, &host, predict);
             // `--take-over` over the config's `takeover`, for this run.
@@ -126,7 +139,8 @@ async fn run(action: Action, config: &Config) -> u8 {
                 settings.takeover = config::TakeoverMode::Always;
             }
             let run = Run::new(settings.remote, settings.pipe.is_some());
-            attach(&host, session, transport, forwards, settings, run).await
+            let mode = if tunnel { Mode::Tunnel } else { Mode::Attach };
+            attach(&host, session, transport, forwards, settings, run, mode).await
         }
         Action::List { host } => cmds::manage(&host, Request::ListSessions, config).await,
         Action::Kill { host, session } => {
@@ -153,13 +167,32 @@ async fn run(action: Action, config: &Config) -> u8 {
     }
 }
 
+/// What an attach does with the terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// The session on this terminal.
+    Attach,
+    /// `-N`: the forwards and the agent relay only, no terminal (DESIGN.md section 7.3).
+    Tunnel,
+}
+
+/// Why `-N` refuses to start: nothing to hold. `None` when the plan has a forward or the agent.
+/// ssh -N without a forward holds a connection that a ControlMaster can share; fil has no such
+/// thing, so a tunnel with nothing in it would only start an idle shell on the host and wait.
+fn tunnel_refusal(plan: &ForwardPlan) -> Option<&'static str> {
+    (plan.specs.is_empty() && plan.agent == crate::config::AgentMode::Off).then_some(
+        "-N needs something to hold: a forward (-L, -R, -D, or the config's `forward`) or the agent (-A)",
+    )
+}
+
 async fn attach(
     host: &str,
     session: SessionName,
     transport: Option<TransportSetting>,
     forwards: CliForwards,
-    settings: HostSettings,
+    mut settings: HostSettings,
     run: Run,
+    mode: Mode,
 ) -> u8 {
     tidy_offline_log(&settings);
     let plan = match ForwardPlan::resolve(&settings, &forwards) {
@@ -169,6 +202,15 @@ async fn attach(
             return FAILED;
         }
     };
+    if mode == Mode::Tunnel {
+        if let Some(why) = tunnel_refusal(&plan) {
+            eprintln!("fil: {why}");
+            return USAGE;
+        }
+        // Nothing is typed, so nothing is buffered or logged offline, and nothing is predicted.
+        settings.offline = OfflineInput::default();
+        settings.predict = Predict::Off;
+    }
     // The agent relay (DESIGN.md section 10): the local agent as it is now, never a path the
     // host names. Without one the session's socket still exists and refuses, as ssh -A does.
     let agent_socket = local_agent_socket();
@@ -197,7 +239,9 @@ async fn attach(
         settings.direct_address.clone(),
         LinkParams::default(),
     ) {
-        Ok(c) => c.with_run(run.clone(), Offer::Attach(settings.install)),
+        Ok(c) => c
+            .with_run(run.clone(), Offer::Attach(settings.install))
+            .for_tunnel(mode == Mode::Tunnel),
         Err(e) => {
             eprintln!("fil: {e}");
             return FAILED;
@@ -211,28 +255,53 @@ async fn attach(
             return FAILED;
         }
     };
-    let term = match fil_client::tty::stdio() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("fil: cannot use the terminal: {e}");
-            return FAILED;
-        }
+    let result = match mode {
+        Mode::Attach => match fil_client::tty::stdio() {
+            Ok(term) => {
+                run_client(
+                    host,
+                    &session,
+                    setting,
+                    &settings,
+                    forward_set,
+                    dialer,
+                    term,
+                    None,
+                )
+                .await
+            }
+            Err(e) => {
+                eprintln!("fil: cannot use the terminal: {e}");
+                return FAILED;
+            }
+        },
+        Mode::Tunnel => match fil_client::tty::headless(
+            std::env::var("TERM").ok(),
+            // An inherited SIG_IGN (`nohup`, a script's `&` job) stays: no handler for it.
+            fil_session::proc::ignored_signals(std::process::id()).unwrap_or(0),
+        ) {
+            Ok(term) => {
+                let sink: LineSink = std::sync::Arc::new(|line: &str| {
+                    fil_client::tty::write_stderr_within(&format!("fil: {line}\n"), POST_RUN_WRITE);
+                });
+                run_client(
+                    host,
+                    &session,
+                    setting,
+                    &settings,
+                    forward_set,
+                    dialer,
+                    term,
+                    Some(sink),
+                )
+                .await
+            }
+            Err(e) => {
+                eprintln!("fil: cannot watch for signals: {e}");
+                return FAILED;
+            }
+        },
     };
-    logging::init_client();
-    // Which host and which session is a record of the user's habits: debug, not the default.
-    tracing::info!(?setting, "starting");
-    tracing::debug!(host, %session, "starting for");
-
-    let mut cfg = client_config(session.clone(), &settings);
-    cfg.forwards = forward_set;
-    // Counts the mode, never anything typed (`docs/m3/plan.md` §4.3).
-    match cfg.predict {
-        Predict::Off => tracing::debug!(echo_ack = false, "prediction off"),
-        Predict::Adaptive => tracing::info!("prediction on (adaptive)"),
-        Predict::Always => tracing::info!("prediction on (always)"),
-    }
-
-    let result = fil_client::run(dialer, term, cfg).await;
     // The client has restored the terminal and printed how it ended; an error still needs saying.
     // Through a bounded write: a terminal that stopped reading would hold `eprintln!` for good,
     // and the shell would not get the terminal back.
@@ -249,7 +318,48 @@ async fn attach(
         };
         fil_client::tty::write_stderr_within(&line, POST_RUN_WRITE);
     }
-    exit_code(&result)
+    mode_exit_code(mode, &result)
+}
+
+/// [`exit_code`] for a run in `mode`. A tunnel is stopped by a signal, which detaches it
+/// (`ClientConfig::tunnel`): 0, as any detach. Stopped before its first attach it detached
+/// nothing (the engine ends it as `Signalled`): 255, as `ssh -N` exits when interrupted during
+/// its login. Everything else ends as an attach does.
+fn mode_exit_code(mode: Mode, result: &Result<Outcome, ClientError>) -> u8 {
+    match (mode, result) {
+        (Mode::Tunnel, Ok(Outcome::Signalled(_))) => FORWARD_FAILED,
+        _ => exit_code(result),
+    }
+}
+
+/// One run of the client on `term`; `tunnel` makes it a tunnel-only run.
+#[allow(clippy::too_many_arguments)]
+async fn run_client<I: fil_client::TermInput, O: fil_client::TermOutput>(
+    host: &str,
+    session: &SessionName,
+    setting: TransportSetting,
+    settings: &HostSettings,
+    forward_set: fil_client::ForwardSet,
+    dialer: PathDialer<Connect>,
+    term: fil_client::Terminal<I, O>,
+    tunnel: Option<LineSink>,
+) -> Result<Outcome, ClientError> {
+    logging::init_client();
+    // Which host and which session is a record of the user's habits: debug, not the default.
+    tracing::info!(?setting, tunnel = tunnel.is_some(), "starting");
+    tracing::debug!(host, %session, "starting for");
+
+    let mut cfg = client_config(session.clone(), settings);
+    cfg.forwards = forward_set;
+    cfg.tunnel = tunnel;
+    // Counts the mode, never anything typed (`docs/m3/plan.md` §4.3).
+    match cfg.predict {
+        Predict::Off => tracing::debug!(echo_ack = false, "prediction off"),
+        Predict::Adaptive => tracing::info!("prediction on (adaptive)"),
+        Predict::Always => tracing::info!("prediction on (always)"),
+    }
+
+    fil_client::run(dialer, term, cfg).await
 }
 
 /// The settings an attach to `host` runs with: the config's for the host, with what the command
@@ -407,6 +517,70 @@ mod tests {
         assert_eq!(short_name(".hidden"), ".hidden");
         assert_eq!(short_name("192.0.2.7"), "192.0.2.7");
         assert_eq!(short_name("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn a_tunnel_needs_something_to_hold() {
+        use crate::cli::Cli;
+        use clap::Parser;
+        let plan = |args: &[&str], config: &str| {
+            let cli =
+                Cli::try_parse_from(std::iter::once("fil").chain(args.iter().copied())).unwrap();
+            let Action::Attach { host, forwards, .. } = cli.action().unwrap() else {
+                panic!("not an attach");
+            };
+            let config = Config::parse(config, "test").unwrap();
+            ForwardPlan::resolve(&config.for_host(&host), &forwards).unwrap()
+        };
+        assert!(tunnel_refusal(&plan(&["-N", "devbox"], "")).is_some());
+        // -a says no agent, whatever the config: still nothing.
+        assert!(
+            tunnel_refusal(&plan(
+                &["-N", "-a", "devbox"],
+                "[defaults]\nagent = \"on\"\n"
+            ))
+            .is_some()
+        );
+        for args in [
+            &["-N", "devbox", "-L", "5432"][..],
+            &["-N", "devbox", "-R", "9000"],
+            &["-N", "devbox", "-D", "1080"],
+            &["-N", "devbox", "-A"],
+        ] {
+            assert_eq!(tunnel_refusal(&plan(args, "")), None, "{args:?}");
+        }
+        // The config's forwards and agent count as much as the flags.
+        assert_eq!(
+            tunnel_refusal(&plan(
+                &["-N", "devbox"],
+                "[host.devbox]\nforward = [\"-L 5173\"]\n"
+            )),
+            None
+        );
+        assert_eq!(
+            tunnel_refusal(&plan(&["-N", "devbox"], "[defaults]\nagent = \"on\"\n")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tunnel_stopped_before_its_first_attach_exits_255() {
+        assert_eq!(
+            mode_exit_code(Mode::Tunnel, &Ok(Outcome::Signalled(2))),
+            255
+        );
+        assert_eq!(
+            mode_exit_code(Mode::Attach, &Ok(Outcome::Signalled(2))),
+            130
+        );
+        // After it: a detach, 0; the rest as an attach.
+        assert_eq!(mode_exit_code(Mode::Tunnel, &Ok(Outcome::Detached)), 0);
+        let held = Ok(Outcome::Attached {
+            by: "x".into(),
+            since_unix_ms: 0,
+            connected: true,
+        });
+        assert_eq!(mode_exit_code(Mode::Tunnel, &held), 1);
     }
 
     #[test]

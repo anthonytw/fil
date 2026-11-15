@@ -60,7 +60,7 @@ fwdprobe connect 127.0.0.1:18080 recv      # IN_SHA256= must equal: fwdprobe dig
 
 | Scenario (plan §5.2, §5.3) | Session side | Client side |
 |---|---|---|
-| `fwd_local_http`, `fwd_local_kill_ssh`, `fwd_local_sleep`, `f_fwd_cable_pull` | `serve ... source N --rate R` | `connect ... recv` (no `--timeout`: it must outlast the stop or the outage; the 45 s sleep and the 5 min cable pull end in a result, not a timeout); compare `IN_SHA256` with `digest`; `grep -c ^ACCEPT=` on the log is 1 |
+| `fwd_local_http`, `fwd_tunnel_only`, `fwd_local_kill_ssh`, `fwd_local_sleep`, `f_fwd_cable_pull` | `serve ... source N --rate R` | `connect ... recv` (no `--timeout`: it must outlast the stop or the outage; the 45 s sleep and the 5 min cable pull end in a result, not a timeout); compare `IN_SHA256` with `digest`; `grep -c ^ACCEPT=` on the log is 1 |
 | `fwd_many_short`, `fwd_parallel` | `serve ... echo` | `connect ... burst --count 10000` / `--count 200 --parallel 200`; `FAILED=0` |
 | `fwd_halfclose` | `serve ... halfclose --response N` | `connect ... send M`: the request is shut down, the response must still arrive in full |
 | `fwd_rst` | `serve ... rst` (or `--after-read N`) | `connect ... recv`: `IN_END=reset`, not `eof` |

@@ -322,7 +322,7 @@ pub enum ClientError {
     VersionMismatch(fil_proto::version::VersionMismatch),
     /// The daemon refused this client's version (`Error(VersionMismatch)`) without the numbers.
     #[error(
-        "the fil on the remote host refused this fil's version (a different wire revision): upgrade whichever fil is older"
+        "the fil on the remote host speaks a wire this fil can use but did not connect it to a daemon (its relay routes by exact wire revision, as development builds before 1.0 did): upgrade the fil on the remote host"
     )]
     VersionRefused,
     #[error(

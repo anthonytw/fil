@@ -319,12 +319,12 @@ fn lock_names(dir: &Path) -> Vec<String> {
     v
 }
 
-/// Two builds of different revisions use one socket directory: each starts its own daemon beside
-/// the other's, and `fil ls` of each notes the other and says what to do about it.
+/// Two builds of different (pre-1.0, so incompatible) revisions use one socket directory: each
+/// starts its own daemon beside the other's, and `fil ls` of each notes the other and says what to do about it.
 #[test]
 fn two_revisions_share_a_socket_directory_and_ls_notes_the_other() {
     let w = World::new("coexist");
-    let (a, b) = (ours(), ours() + 1);
+    let (a, b) = pre();
     w.host("hosta", a);
     w.host("hostb", b);
 
@@ -344,8 +344,11 @@ fn two_revisions_share_a_socket_directory_and_ls_notes_the_other() {
     );
     assert_eq!(
         lock_names(&w.socks),
-        [format!("fil-1-{a}.sock"), format!("fil-1-{b}.sock")],
-        "two sockets, named for their revisions and nothing else"
+        [
+            format!("fil-1-{a}-v{}.sock", env!("CARGO_PKG_VERSION")),
+            format!("fil-1-{b}-v{}.sock", env!("CARGO_PKG_VERSION"))
+        ],
+        "two sockets, named for their wires and builds and nothing else"
     );
 
     // And the first still answers, noting the second. Nothing was killed or replaced.
@@ -364,7 +367,7 @@ fn two_revisions_share_a_socket_directory_and_ls_notes_the_other() {
 #[test]
 fn a_session_survives_the_remote_being_upgraded_in_place() {
     let w = World::new("upgrade");
-    let (old, new) = (ours(), ours() + 1);
+    let (old, new) = pre();
     w.host("before", old); // ssh runs the old build's relay
     w.host("after", new); // the same host once `fil` there was upgraded
 
@@ -393,7 +396,7 @@ fn a_session_survives_the_remote_being_upgraded_in_place() {
     assert!(took < Duration::from_secs(10), "took {took:?}");
     assert_eq!(
         lock_names(&w.socks),
-        [format!("fil-1-{old}.sock")],
+        [format!("fil-1-{old}-v{}.sock", env!("CARGO_PKG_VERSION"))],
         "the new relay started nothing for an old client"
     );
 
@@ -417,7 +420,10 @@ fn a_session_survives_the_remote_being_upgraded_in_place() {
     );
     assert_eq!(
         lock_names(&w.socks),
-        [format!("fil-1-{old}.sock"), format!("fil-1-{new}.sock")]
+        [
+            format!("fil-1-{old}-v{}.sock", env!("CARGO_PKG_VERSION")),
+            format!("fil-1-{new}-v{}.sock", env!("CARGO_PKG_VERSION"))
+        ]
     );
 }
 
@@ -426,12 +432,10 @@ fn a_session_survives_the_remote_being_upgraded_in_place() {
 /// other. With no daemon of the client's revision on the host, the remote's relay serves it with
 /// a daemon of the 1.x family.
 ///
-/// Ignored until the relay routes by the 1.x family rather than by one revision: decision D2's
-/// routing (PR #8 and its follow-up). The daemon side is covered without a relay
-/// (`fil-daemon`'s `a_1x_client_of_another_revision_lists_and_attaches`). It names no socket, so
-/// D2's socket names do not matter to it.
+/// The relay routes by the 1.x family (decision D2): a client of either revision is served by
+/// the newest running daemon of the family, or by the relay's own build's daemon, started if
+/// need be. It names no socket, so D2's socket names do not matter to it.
 #[test]
-#[ignore = "needs the relay to route by the 1.x family (D2, PR #8 follow-up)"]
 fn two_1x_revisions_talk_both_ways() {
     let w = World::new("onex");
     let (a, b) = (ours(), ours() + 1);
@@ -461,6 +465,14 @@ fn two_1x_revisions_talk_both_ways() {
         run.text()
     );
     drop(run);
+    // The older relay sends its client to the newest daemon of the family, the newer one, which
+    // has the session: nothing of the older revision starts.
+    let (ok, out, err, _) = w.ls(a, "older");
+    assert!(ok && out.contains("mixed"), "{out}{err}");
+    assert_eq!(
+        lock_names(&w.socks),
+        [format!("fil-1-{b}-v{}.sock", env!("CARGO_PKG_VERSION"))]
+    );
     // A newer client, an older remote, on a host with no daemon yet.
     let w2 = World::new("onex2");
     w2.host("older", a);

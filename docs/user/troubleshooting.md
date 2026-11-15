@@ -31,7 +31,7 @@ Daemons of different wires coexist on a host, so an upgrade breaks no running se
 
 ## A patch release, and daemons that are still running
 
-A patch (for example 0.1.0 to 0.1.1) keeps the wire, so a new client reuses the daemon that is already running, and a fix to the daemon takes effect only after that daemon has exited. It exits on its own once it has no sessions and no connections for five minutes. To pick up a daemon-side fix at once, end your sessions on the host (`fil kill`).
+A patch (for example 0.1.0 to 0.1.1) keeps the wire. Each version runs its own daemon, so the new version's first connection starts a daemon of its own beside the one already running, new sessions go to it, and the old daemon exits as soon as its last session ends. Until fil can address an older daemon of the same wire (planned for 1.0), the old daemon's sessions are not listed or reachable once the new one runs, so end them (`fil kill`) before you upgrade the host. (Before this change a patch release reused the running daemon, and its fixes waited until that daemon exited.)
 
 ## "This host kills a user's processes when the last login ends"
 

@@ -107,7 +107,7 @@ fn concurrent_starts_of_two_revisions_each_start_exactly_one_daemon() {
     // `Scratch` stops revision A's daemon (the one in its own lock file); this stops revision B's
     // whatever the test does, by the pid in B's lock file (a private directory: ours alone), so a
     // failed assertion leaves nothing running. Declared after `s`: dropped before the files go.
-    let _stop_b = KillDaemonOnDrop(s.paths().with_revision(rev_b).lock());
+    let _stop_b = KillDaemonOnDrop(s.paths().with_revision(rev_b).build_lock());
     let launcher_for = |rev: u16| {
         DaemonLauncher::new(
             BIN,
@@ -153,8 +153,8 @@ fn concurrent_starts_of_two_revisions_each_start_exactly_one_daemon() {
         "one daemon process per revision"
     );
     let (pa, pb) = (
-        std::fs::read_to_string(s.paths().with_revision(rev_a).lock()).unwrap(),
-        std::fs::read_to_string(s.paths().with_revision(rev_b).lock()).unwrap(),
+        std::fs::read_to_string(s.paths().with_revision(rev_a).build_lock()).unwrap(),
+        std::fs::read_to_string(s.paths().with_revision(rev_b).build_lock()).unwrap(),
     );
     assert_ne!(pa.trim(), pb.trim(), "two different daemons");
     // Each connection reached the daemon of its own revision: the socket named for it.
@@ -293,7 +293,10 @@ fn an_idle_daemon_exits_on_its_own_and_the_next_use_starts_a_new_one() {
     );
     assert!(!lock_is_held(&s.paths()));
     // privacy #10: nothing of it is left in /tmp, not the pid in the lock file nor the start file.
-    assert!(!s.paths().lock().exists(), "the lock file was removed");
+    assert!(
+        !s.paths().lock().exists() && !s.paths().build_lock().exists(),
+        "the lock file was removed"
+    );
     assert!(
         !s.paths().start_lock().exists(),
         "the start file was removed"
@@ -455,7 +458,11 @@ async fn sigterm_lets_attached_clients_hear_how_their_session_ended() {
     assert!(code.is_some() || signal.is_some(), "{code:?} {signal:?}");
     wait_until("the daemon to exit", || !pid_alive(pid));
     // privacy #10, on the way out by a signal too.
-    assert!(!s.paths().lock().exists() && !s.paths().start_lock().exists());
+    assert!(
+        !s.paths().lock().exists()
+            && !s.paths().build_lock().exists()
+            && !s.paths().start_lock().exists()
+    );
 }
 
 /// security #9: the log lives in the socket directory when there is no home directory; a socket
@@ -520,13 +527,14 @@ fn the_default_paths_are_under_tmp_and_the_users_directories() {
         p.dir,
         Path::new(&format!("/tmp/fil-{}", fil_daemon::current_uid()))
     );
-    // The name holds the protocol major and the wire revision, and nothing else.
+    // The name holds the protocol major, the wire revision and the version, and nothing else.
     assert_eq!(
         p.socket().file_name().unwrap().to_str().unwrap(),
         format!(
-            "fil-{}-{}.sock",
+            "fil-{}-{}-v{}.sock",
             fil_proto::limits::PROTOCOL_MAJOR,
-            fil_proto::version::wire_revision()
+            fil_proto::version::wire_revision(),
+            env!("CARGO_PKG_VERSION")
         )
     );
     assert!(p.dir.starts_with("/tmp"), "not under $XDG_RUNTIME_DIR");

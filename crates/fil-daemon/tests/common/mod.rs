@@ -46,7 +46,7 @@ impl Scratch {
 
     /// The pid in the lock file: the daemon holding it.
     pub fn daemon_pid(&self) -> Option<u32> {
-        std::fs::read_to_string(self.paths().lock())
+        std::fs::read_to_string(self.paths().build_lock())
             .ok()?
             .trim()
             .parse()
@@ -78,7 +78,7 @@ pub fn lock_is_held(paths: &Paths) -> bool {
     let Ok(f) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(paths.lock())
+        .open(paths.build_lock())
     else {
         return false;
     };
@@ -256,6 +256,8 @@ pub struct Connect {
     /// `Attach::take_over`: `Any` by default here, as most tests are about what a takeover
     /// does; [`Connect::asking`] is the client's default.
     pub take_over: fil_proto::msg::TakeOver,
+    /// The wire revision the `Hello` states; the build's own when unset.
+    pub revision: Option<u16>,
 }
 
 impl Connect {
@@ -267,7 +269,13 @@ impl Connect {
             size: size(80, 24),
             resume: None,
             take_over: fil_proto::msg::TakeOver::Any,
+            revision: None,
         }
+    }
+    /// A client whose `Hello` states wire revision `revision` (another build's client).
+    pub fn revision(mut self, revision: u16) -> Self {
+        self.revision = Some(revision);
+        self
     }
     /// A fresh attach that does not take the session from a holder (`take_over` unset).
     pub fn asking(mut self) -> Self {
@@ -325,7 +333,16 @@ impl<L: Link> Client<L> {
     /// Sends `Hello` and `Attach` and waits for the reply or a refusal.
     pub async fn attach(link: L, c: Connect) -> Self {
         let mut cl = Self::new(link, c.size);
-        send_ctl(&cl.link, &hello()).await;
+        match c.revision {
+            Some(r) => {
+                send_ctl(
+                    &cl.link,
+                    &ControlMsg::Hello(Hello::with_revision(Agent::new("test").unwrap(), r)),
+                )
+                .await
+            }
+            None => send_ctl(&cl.link, &hello()).await,
+        }
         send_ctl(&cl.link, &ControlMsg::Attach(c.attach())).await;
         cl.wait("the attach reply", |c| {
             c.reply.is_some() || c.refused.is_some() || !c.errors.is_empty()

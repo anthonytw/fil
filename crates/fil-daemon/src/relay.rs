@@ -14,10 +14,19 @@
 //! must not strand that session: it reads the client's first frames (the layout of the frame and
 //! of `Hello` is frozen, so any build can), and
 //!
-//! - **the client's wire is the relay's own:** ensure the daemon (start it if needed), as ever;
-//! - **another wire whose daemon is running** (`fil-<major>-<rev>.sock`; revision 0 is the
-//!   pre-revision `fil-<major>.sock`): connect to it. Nothing is started;
-//! - **another wire with no daemon:** answer with this relay's `Hello` and
+//! "Wire" here is the client's **family** ([`crate::paths::same_family`]): for a 1.x client every
+//! 1.x revision, which all work together (docs/v1/wire.md, decision 9); otherwise its one
+//! revision.
+//!
+//! - **the client's family is the relay's own:** the newest daemon of the family (new sessions go
+//!   there): a running daemon of a newer build than the relay's, of any revision of the family,
+//!   or one of the client's revision from before daemons were keyed by build
+//!   (`fil-<major>-<rev>.sock`, which holds the wire lock alone), and otherwise the relay's own
+//!   build's daemon, started if needed (so a 1.x relay never refuses a 1.x client);
+//! - **another family whose daemon is running** (the newest of `fil-<major>-<rev>-v<ver>.sock`,
+//!   then `fil-<major>-<rev>.sock`; revision 0 is the pre-revision `fil-<major>.sock`): connect
+//!   to it. Nothing is started;
+//! - **another family with no daemon:** answer with this relay's `Hello` and
 //!   `Error(VersionMismatch)` and end, so the client can say which side is newer. Nothing is
 //!   started: a daemon of a wire nobody asked for would only idle.
 //!
@@ -46,6 +55,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -127,6 +137,9 @@ pub fn run_relay(opts: &RelayOptions) -> ExitCode {
     // Everything the pipe carries passes through this process: no core dump of it. Without a core
     // limit (on Linux): the relay starts the daemon, and a limit would pass to its sessions.
     let _ = crate::hardening::disable_core_dumps(false);
+    if let (Ok(exe), Some(home)) = (std::env::current_exe(), crate::paths::home_dir()) {
+        keep_own_copy(exe, home);
+    }
     // Raw descriptors, not `std::io::stdout()`, whose line buffering would hold frames back.
     use std::os::fd::AsFd;
     let dup = |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned().map(std::fs::File::from);
@@ -151,6 +164,24 @@ pub fn run_relay(opts: &RelayOptions) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Refreshes the modification time of the `fil install` version directory this relay runs from
+/// (`~/.local/share/fil/<ver>-w<major>.<rev>/fil`), by the checks of a daemon's hourly refresh
+/// ([`crate::paths::refresh_install_dir`]: a canonical path, a real directory of ours with a
+/// version directory's name, the file still the one running); anything else is left alone.
+///
+/// Under the 1.x family a relay may only pass bytes to a newer daemon of another revision, and no
+/// daemon then runs from (or refreshes) the copy the client's bootstrap started: this keeps that
+/// copy within the install's "recently used" window (docs/m4/release.md section 6.3, rule 2.5)
+/// for as long as clients connect through it, an added reason to keep, which section 6.4.1
+/// allows. On a thread of its own, never waited for: the home directory may be a network mount
+/// that hangs, and the relay must not.
+pub fn keep_own_copy(exe: PathBuf, home: PathBuf) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
+        let id = crate::paths::file_identity(&exe);
+        crate::paths::refresh_install_dir(&exe, &home, id)
+    })
 }
 
 /// How often a relay whose input is a socket looks again for an end it was not woken for.
@@ -385,12 +416,19 @@ fn refuse<W: Write>(output: &mut W, revision: u16) -> Result<(), RelayError> {
     write_control(output, &ControlMsg::Error(ErrorCode::VersionMismatch))
 }
 
-/// What to tell the user when this relay has just started a daemon and daemons of other wires
-/// are running: their sessions are not in the new one. One line and no numbers: `fil ls` names
-/// the daemons (its "also running" lines), so the two do not say the same thing twice, and a
-/// plain `fil HOST` after an upgrade, which has no `fil ls` output, still hears it.
+/// What to tell the user when this relay has just started a daemon and daemons of other builds
+/// (of another wire, or older ones of this wire) are running: their sessions are not in the new
+/// one. One line and no numbers: `fil ls` names the daemons (its "also running" lines), so the
+/// two do not say the same thing twice, and a plain `fil HOST` after an upgrade, which has no
+/// `fil ls` output, still hears it.
 fn others_note(paths: &Paths) -> Option<String> {
-    if crate::paths::other_daemons(paths).is_empty() {
+    let others = crate::paths::running_daemons(&paths.dir)
+        .into_iter()
+        .any(|d| {
+            (d.major, d.revision, d.version.as_deref())
+                != (paths.major, paths.revision, Some(paths.version.as_str()))
+        });
+    if !others {
         return None;
     }
     Some(
@@ -421,19 +459,43 @@ where
     let rx = read_in_background(input);
     let (want, held, ended) = read_opening(&rx, &mut output, opts.hello_wait)?;
     let own = (opts.paths.major, opts.paths.revision);
+    let theirs = match want {
+        Want::Wire { major, revision } => (major, revision),
+        Want::Own | Want::Gone => own,
+    };
+    let newer_than_ours = |d: &crate::paths::RunningDaemon| match &d.version {
+        // A daemon of the client's revision from before daemons were keyed by build holds that
+        // revision's wire lock alone: none can start beside it, so it takes the connection.
+        None => true,
+        Some(v) => {
+            crate::paths::compare_builds((v, d.revision), (&opts.paths.version, own.1))
+                == std::cmp::Ordering::Greater
+        }
+    };
     let sock = match want {
         Want::Gone => return Ok(RelayEnd::PipeClosed),
-        Want::Wire { major, revision } if (major, revision) != own => {
-            // Another build's client. Its daemon, if it is running; never a new daemon of
-            // another wire. (The directory was checked above: a socket in someone else's
-            // directory is not to be trusted.)
-            match UnixStream::connect(opts.paths.socket_of(major, revision)) {
-                Ok(s) => s,
-                Err(_) => {
+        Want::Wire { major, revision } if !crate::paths::same_family((major, revision), own) => {
+            // Another family's client (another major, or a revision from before 1.x that is not
+            // ours). The newest of its daemons that is running; never a new daemon of another
+            // wire. (The directory was checked above: a socket in someone else's directory is not
+            // to be trusted.)
+            match connect_newest(&opts.paths, major, revision, |_| true) {
+                Some(s) => s,
+                None => {
                     refuse(&mut output, opts.paths.revision)?;
                     return Ok(RelayEnd::Refused);
                 }
             }
+        }
+        // This relay's family (its own revision, or for a 1.x relay any 1.x revision: they all
+        // work together, docs/v1/wire.md decision 9): new sessions go to the newest daemon of the
+        // family. One of a newer build than this relay's that is running takes the connection
+        // (an older `fil` on the host starts no daemon of its own beside it); otherwise this
+        // relay's own build's daemon, started if need be, whatever 1.x revision the client is.
+        Want::Own | Want::Wire { .. }
+            if let Some(s) = connect_newest(&opts.paths, theirs.0, theirs.1, newer_than_ours) =>
+        {
+            s
         }
         Want::Own | Want::Wire { .. } => {
             let ensured = ensure_daemon(&opts.paths, &opts.launcher)?;
@@ -451,6 +513,22 @@ where
         }
     };
     pump_chunks(rx, held, ended, output, sock)
+}
+
+/// Connects to the newest running daemon of the family of wire `major`/`revision` that `pick`
+/// takes (a version of `None` is a daemon from before daemons were keyed by build), trying them
+/// newest first ([`crate::paths::sockets_of_wire`]) and going on to the next when one does not
+/// answer.
+fn connect_newest(
+    paths: &Paths,
+    major: u16,
+    revision: u16,
+    pick: impl Fn(&crate::paths::RunningDaemon) -> bool,
+) -> Option<UnixStream> {
+    crate::paths::sockets_of_wire(&paths.dir, major, revision)
+        .into_iter()
+        .filter(|d| pick(d))
+        .find_map(|d| UnixStream::connect(d.socket).ok())
 }
 
 /// Copies `input` to the socket and the socket to `output`, byte for byte, until one side ends.
@@ -583,6 +661,40 @@ mod tests {
         assert!(blocking_socket(a.as_fd()).is_none());
         let (r, _w) = std::io::pipe().unwrap();
         assert!(blocking_socket(r.as_fd()).is_none());
+    }
+
+    /// The relay keeps the version directory it runs from fresh (it may only pass bytes to a
+    /// daemon of another revision, which refreshes nothing of this copy), and touches nothing
+    /// when it runs from anywhere else.
+    #[test]
+    fn the_relay_refreshes_the_install_directory_it_runs_from() {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let dir = home.join(".local/share/fil/1.0.0-w1.16");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .unwrap();
+        let exe = dir.join("fil");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::open(&dir)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(keep_own_copy(exe.clone(), home.clone()).join().unwrap());
+        assert!(std::fs::metadata(&dir).unwrap().mtime() > 1_500_000_000);
+        // Not a `fil install` copy: nothing is touched.
+        let elsewhere = tmp.path().join("fil");
+        std::fs::write(&elsewhere, b"#!/bin/sh\n").unwrap();
+        std::fs::File::open(&dir)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(!keep_own_copy(elsewhere, home).join().unwrap());
+        assert_eq!(std::fs::metadata(&dir).unwrap().mtime(), 1_000_000_000);
     }
 
     /// A first connection after an upgrade starts a daemon beside the old one: the relay says the

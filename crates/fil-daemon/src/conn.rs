@@ -151,6 +151,14 @@ async fn tell_and_close<L: Link>(link: &L, msg: ControlMsg) {
 }
 
 impl Inner {
+    /// This daemon's build, as `fil ls` shows it for each of its sessions
+    /// (`SessionSummary::daemon_version`): its [`Paths::version`](crate::Paths::version), the
+    /// version in its file names.
+    fn daemon_version(&self) -> fil_proto::msg::FilVersion {
+        fil_proto::msg::FilVersion::new(&self.paths.version)
+            .unwrap_or_else(|_| fil_proto::msg::FilVersion::ours())
+    }
+
     /// Serves one connection. See the [module docs](self).
     pub(crate) async fn handle<L: Link>(self: &Arc<Self>, link: L, origin: Origin) {
         let negotiated = tokio::time::timeout(
@@ -384,7 +392,7 @@ impl Inner {
             Request::ListSessions => {
                 let mut list = Vec::new();
                 for h in self.sessions() {
-                    if let Some(s) = summary(&h).await {
+                    if let Some(s) = summary(&h, &self.daemon_version()).await {
                         list.push(s);
                     }
                 }
@@ -465,7 +473,7 @@ impl Inner {
         }
         let mut sessions = Vec::new();
         for h in self.sessions() {
-            let Some(summary) = summary(&h).await else {
+            let Some(summary) = summary(&h, &self.daemon_version()).await else {
                 continue;
             };
             let membership = match h.scope() {
@@ -495,7 +503,10 @@ impl Inner {
 }
 
 /// A session as `fil ls` and `fil ports` show it; `None` once it has ended.
-async fn summary(h: &SessionHandle) -> Option<SessionSummary> {
+async fn summary(
+    h: &SessionHandle,
+    version: &fil_proto::msg::FilVersion,
+) -> Option<SessionSummary> {
     let info = h.info().await?;
     Some(SessionSummary {
         name: info.name,
@@ -514,7 +525,7 @@ async fn summary(h: &SessionHandle) -> Option<SessionSummary> {
             }),
         forwards: h.forward_count(),
         agent: h.agent_relayed(),
-        daemon_version: fil_proto::msg::FilVersion::ours(),
+        daemon_version: version.clone(),
         ext: fil_proto::ext::RowExt::default(),
     })
 }

@@ -28,8 +28,9 @@
 //!   it holds ([`crate::route`]). The relay takes the `Route` out of the stream (the daemon never
 //!   sees it) and starts nothing for it; when it names nothing that runs, the rules below apply;
 //! - **another family whose daemon is running** (the newest of `fil-<major>-<rev>-v<ver>.sock`,
-//!   then `fil-<major>-<rev>.sock`; revision 0 is the pre-revision `fil-<major>.sock`): connect
-//!   to it. Nothing is started;
+//!   then `fil-<major>-<rev>.sock`): connect to it. Nothing is started. (Revision 0's path, the
+//!   pre-revision `fil-<major>.sock`, is still known to [`Paths::socket_of`], but no client
+//!   reaches it any more: those builds' openings are not recognised, see "The opening is frozen".);
 //! - **another family with no daemon:** answer with this relay's `Hello` and
 //!   `Error(VersionMismatch)` and end, so the client can say which side is newer. Nothing is
 //!   started: a daemon of a wire nobody asked for would only idle.

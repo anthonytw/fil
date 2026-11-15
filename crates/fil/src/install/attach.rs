@@ -101,7 +101,8 @@ pub enum Declined {
 /// The owner's guards on an install, as one decision (`docs/m4/plan.md` §3 U1, "The offer"):
 /// only an attach's interactive first run, with a terminal on stdin, may install; it asks
 /// unless the user's config says `always`. A reconnect and a management command never install,
-/// whatever the config says. A tunnel's first run installs only with `always`, and never asks.
+/// whatever the config says. A tunnel never asks: its first run installs only with `always`
+/// and a terminal on stdin (the same guard as an attach's).
 pub fn decide(offer: Offer, interactive: bool, stdin_tty: bool) -> Decision {
     let (mode, tunnel) = match offer {
         Offer::None => return Decision::Decline(Declined::Management),
@@ -173,19 +174,16 @@ pub async fn greeted(
             )
             .await);
         }
+        Decision::Decline(Declined::NoTerminal) if matches!(offer, Offer::Tunnel(_)) => {
+            return Err(decline(g, format!("not installing (`install = \"always\"` installs only when fil -N is started from a terminal, and stdin is not one). {manual}")).await);
+        }
         Decision::Decline(Declined::NoTerminal) => {
             return Err(
                 decline(g, format!("not asking (stdin is not a terminal). {manual}")).await,
             );
         }
         Decision::Decline(Declined::Tunnel) => {
-            return Err(decline(
-                g,
-                format!(
-                    "not asking (fil -N asks nothing; `install = \"always\"` installs). {manual}"
-                ),
-            )
-            .await);
+            return Err(decline(g, format!("not asking (fil -N asks nothing; with `install = \"always\"` it installs when started from a terminal). {manual}")).await);
         }
         Decision::Decline(Declined::Management | Declined::Never) => {
             return Err(decline(g, manual).await);

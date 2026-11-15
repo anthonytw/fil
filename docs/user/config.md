@@ -68,7 +68,7 @@ fil devbox --predict off
 
 ### `install`
 
-`"ask"` (default), `"never"` or `"always"`: whether an attach that finds no fil on the host offers to install it. It asks only on an interactive first attach. A tunnel (`fil -N`) never asks: with `"ask"` it says to run `fil install HOST`, and with `"always"` it installs.
+`"ask"` (default), `"never"` or `"always"`: whether an attach that finds no fil on the host offers to install it. It asks only on an interactive first attach. A tunnel (`fil -N`) never asks: with `"ask"` it says to run `fil install HOST`; with `"always"` it installs when `fil -N` is started from a terminal (stdin is one), and otherwise says to run `fil install HOST` too.
 
 ### `takeover`
 

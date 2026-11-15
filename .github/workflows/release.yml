@@ -81,10 +81,11 @@ jobs:
       # The owned lints, whatever the unowned selftest.sh (the release-test job) says: this
       # workflow's rules, and the read-only profile of the two check workflows, which have no code
       # owner.
-      - name: The workflows' lint (release.yml, and the check workflows read-only)
+      - name: The workflows' lint (release.yml, the check workflows read-only, the weekly scan's schedule)
         run: |
           tests/release/lint-workflow.sh .github/workflows/release.yml
           tests/release/lint-workflow.sh --check .github/workflows/linux-check.yml .github/workflows/macos-check.yml
+          tests/release/lint-workflow.sh --scheduled .github/workflows/audit.yml
       - name: The crates-io environment requires the owner's review (a warning on a dry run)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -258,7 +259,7 @@ jobs:
           PATH="$RUNNER_TEMP/pandoc/bin:$PATH" docs/man/build.sh docs-out
           PATH="$RUNNER_TEMP/pandoc/bin:$PATH" docs/man/build.sh docs-out-b
           diff -r docs-out docs-out-b
-      - name: Archives, source archive, .deb and .rpm packages and SHA256SUMS (in the pinned images), twice
+      - name: Archives, source archive, .deb and .rpm packages, the installer and SHA256SUMS (in the pinned images), twice
         env:
           SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.epoch }}
         run: |
@@ -272,7 +273,7 @@ jobs:
           } 2>&1 | tee info/build-info.txt
           # The archives and packages must not depend on which job built the binaries. The macOS
           # archive differs when the two macOS builds do (best effort); the others are gated.
-          for f in $(cd out && ls fil-*-x86_64-linux-musl.tar.gz fil-*-aarch64-linux-musl.tar.gz fil-*-source.tar.gz fil_*.deb fil-*.rpm); do
+          for f in $(cd out && ls fil-*-x86_64-linux-musl.tar.gz fil-*-aarch64-linux-musl.tar.gz fil-*-source.tar.gz fil_*.deb fil-*.rpm fil-install.sh); do
             cmp "out/$f" "out-b/$f" || { echo "::error::$f differs between the two assemblies"; exit 1; }
           done
           cmp out/fil-*-universal-apple-darwin.tar.gz out-b/fil-*-universal-apple-darwin.tar.gz \
@@ -404,6 +405,7 @@ jobs:
             out/fil-*.tar.gz
             out/fil_*.deb
             out/fil-*.rpm
+            out/fil-install.sh
       - name: Draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -413,7 +415,7 @@ jobs:
           set -euo pipefail
           tests/release/notes.sh "$VERSION" "$GITHUB_REPOSITORY" "$GITHUB_SHA" > notes.md
           gh release create "$TAG" --draft --verify-tag --title "fil $VERSION" --notes-file notes.md \
-            out/fil-*.tar.gz out/fil_*.deb out/fil-*.rpm out/SHA256SUMS
+            out/fil-*.tar.gz out/fil_*.deb out/fil-*.rpm out/fil-install.sh out/SHA256SUMS
 
   crates-io:
     # The nine crates on crates.io by trusted publishing (N8; docs/m4/release.md section 10.1,

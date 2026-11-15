@@ -8,19 +8,64 @@ fil runs on macOS and Linux (x86_64 and aarch64) as the client, and on Linux as 
 
 | Channel | Command | What you get |
 |---|---|---|
+| The installer (from 1.0) | `curl -fsSL https://github.com/anthonytw/fil/releases/latest/download/fil-install.sh \| sh` (below) | the client in `~/.local/bin` and the Linux programs `fil install` uploads, checked against the signed release; no root |
 | GitHub Releases | download, check, unpack (below) | the client, the Linux programs `fil install` uploads, man pages and completions |
 | Homebrew (macOS, Linux) | `brew install anthonytw/tap/fil` | the same archive |
 | Debian, Ubuntu | `sudo apt install ./fil_<version>_amd64.deb` (or `_arm64`) | the same files under `/usr` |
 | Fedora, RHEL, openSUSE | `sudo rpm --import package-signing-key.asc` (the `.github/package-signing-key.asc` of the repository), then `sudo dnf install ./fil-<version>-1.x86_64.rpm` (or `.aarch64`) | the same |
+| fil's apt and dnf repositories (from 1.0) | set up once (below), then `sudo apt install fil` or `sudo dnf install fil` | the same packages, upgraded with the rest of the system |
 | Arch Linux | `fil-shell-bin` on the AUR | the same (see the release notes for when it is published) |
 | crates.io | `cargo install --locked fil-shell` | a build from source; no man pages, completions or Linux programs to upload |
 | Nix | `nix profile install github:anthonytw/fil/v<version>` | a build from source, as with cargo |
 
-The command is `fil` everywhere. The crate is `fil-shell` and the AUR package `fil-shell-bin` because those names were taken by other projects: `cargo install fil` installs something else.
+The command is `fil` everywhere.
+
+### The installer
+
+From 1.0, every release carries `fil-install.sh`, a short POSIX shell script that needs no root. It downloads the release's `SHA256SUMS` and `SHA256SUMS.sig`, checks the signature with `ssh-keygen -Y verify` against the release key written in the script, picks the archive for your machine from that list, checks its SHA-256, and copies `fil` into `~/.local/bin` and the Linux programs `fil install` uploads into `~/.local/libexec/fil/remote`. It stops before installing anything if a check fails, and it runs nothing it downloaded but the installed `fil --version` at the end. It needs `curl` (or `wget`), `ssh-keygen` (OpenSSH 8.1 or later), `tar`, `gzip`, and `sha256sum` or `shasum`.
+
+The one-liner, which installs the latest release:
+
+```sh
+curl -fsSL https://github.com/anthonytw/fil/releases/latest/download/fil-install.sh | sh
+```
+
+Or download it, read it, then run it, for a given version:
+
+```sh
+curl -fsSLO https://github.com/anthonytw/fil/releases/download/v<version>/fil-install.sh
+less fil-install.sh
+sh fil-install.sh --version <version>
+```
+
+`--dir DIR` (or `FIL_INSTALL_DIR`) installs into another directory instead of `~/.local/bin`; the Linux programs go to `DIR/../libexec/fil/remote`. The script tells you if the directory is not on your `PATH`. To check the script itself before running it, it is listed in the release's `SHA256SUMS` like every other file (below). Run it again to upgrade.
+
+### fil's apt and dnf repositories
+
+From 1.0, fil's site serves an apt and a dnf repository with the release's `.deb` and `.rpm` packages, signed with the package signing key (fingerprint `9EF0 B189 34B7 0552 0F88  80A5 81C0 98D1 5D1A EC26`, also in the [README](../../README.md)). Check the fingerprint `gpg --show-keys` prints before you trust the key.
+
+Debian and Ubuntu:
+
+```sh
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://fil.anthonywertz.com/apt/fil-package-key.asc | sudo tee /etc/apt/keyrings/fil.asc > /dev/null
+gpg --show-keys /etc/apt/keyrings/fil.asc        # 9EF0 B189 34B7 0552 0F88  80A5 81C0 98D1 5D1A EC26
+echo "deb [signed-by=/etc/apt/keyrings/fil.asc] https://fil.anthonywertz.com/apt stable main" | sudo tee /etc/apt/sources.list.d/fil.list
+sudo apt update && sudo apt install fil
+```
+
+Fedora, RHEL and others with dnf:
+
+```sh
+sudo curl -fsSL -o /etc/yum.repos.d/fil.repo https://fil.anthonywertz.com/rpm/fil.repo
+sudo dnf install fil      # dnf shows the key's fingerprint and asks before it imports it
+```
+
+The repository's index (`InRelease` for apt, `repomd.xml.asc` for dnf) is signed, and it lists each package by its SHA-256, so apt and dnf refuse a package or an index that was changed; dnf also checks each rpm's own signature. Each repository holds the latest release only. The crate is `fil-shell` and the AUR package `fil-shell-bin` because those names were taken by other projects: `cargo install fil` installs something else.
 
 ### Checking a download
 
-Every file of a release is listed in `SHA256SUMS`, which is signed. The release signing key's fingerprint and the package signing key's are in the [README](../../README.md); compare them with the copies in the repository before you trust a release.
+Every file of a release is listed in `SHA256SUMS`, which is signed (the installer, `fil-install.sh`, too). The release signing key's fingerprint and the package signing key's are in the [README](../../README.md); compare them with the copies in the repository before you trust a release.
 
 ```sh
 # with the release signers file from the repository's main branch

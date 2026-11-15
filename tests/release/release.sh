@@ -550,10 +550,8 @@ draft_sums() {
   DRAFT_SUMS=$scratch/sums/SHA256SUMS
 }
 has_asset() { awk -v n="$1" '$1 == n { f = 1 } END { exit !f }' "$scratch/assets" 2> /dev/null; }
-# The release files of the version (section 4.1): the five archives and four packages SHA256SUMS lists.
-release_files() {
-  { printf '%s\n' "fil-$V-aarch64-linux-musl.tar.gz" "fil-$V-source.tar.gz" "fil-$V-universal-apple-darwin.tar.gz" "$(ci_archive_name "$V")" "fil-$V-x86_64-linux-musl.tar.gz"; package_names "$V"; } | LC_ALL=C sort
-}
+# The release files of the version (section 4.1): the five archives, four packages and the installer SHA256SUMS lists.
+release_files() { release_names "$V"; }
 MAC=fil-$V-universal-apple-darwin.tar.gz
 MACCI=$(ci_archive_name "$V")
 RPMS="$(package_file rpm x86_64 "$V") $(package_file rpm aarch64 "$V")"

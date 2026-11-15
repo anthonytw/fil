@@ -4,6 +4,12 @@ All notable changes to fil. The format follows [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+### Added
+
+- **An installer script, `fil-install.sh`,** in every release from now on. `curl -fsSL https://github.com/anthonytw/fil/releases/latest/download/fil-install.sh | sh` (or download it, read it, then `sh fil-install.sh --version X.Y.Z`) checks the release's signed `SHA256SUMS` against the release key written in the script, checks the archive for your machine against it, and copies `fil` into `~/.local/bin`, with the Linux programs `fil install` uploads beside it. No root; it stops before installing anything if a check fails. The release's `SHA256SUMS` lists it, so it is signed like every other file. The [install guide](docs/user/install.md) has the details.
+- **fil's own apt and dnf repositories,** from 1.0: the release's `.deb` and `.rpm` packages, with indexes signed by the package signing key, served from the project site. The install guide has the one-time setup.
+- **A security audit process** ([`SECURITY.md`](SECURITY.md) "Audits", [`docs/audits/`](docs/audits/README.md)): a release audit for every minor release and a full audit every six months, reviewed by AI models with independent verification and published after the fixes ship; a severity scale and when a CVE is requested; and a weekly scan of the locked dependencies against the RustSec and OSV advisory databases. The first full audit runs before 1.0.
+
 ## [0.3.0] - 2026-11-14
 
 Ask before taking over a session, and predictive echo that recovers after an interruption.

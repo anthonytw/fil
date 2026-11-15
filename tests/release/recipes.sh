@@ -24,10 +24,10 @@ REL=tests/release/release.just
 # The release path: what release.yml runs, every release* recipe, what the release scripts call, and
 # the private recipe behind `notices`.
 RECIPES="_notices crates-check no-test-hooks notices notices-update release release-build release-check
-release-deps release-keys release-preflight release-sign-macos release-sign-packages release-test
+release-deps release-keys release-preflight release-repos release-sign-macos release-sign-packages release-test
 release-verify reserve-crate-names"
 # The owner's commands: they unlock or use the keys, or decide whether a release is good.
-OWNER="release release-keys release-preflight release-sign-macos release-sign-packages release-verify
+OWNER="release release-keys release-preflight release-repos release-sign-macos release-sign-packages release-verify
 reserve-crate-names"
 
 die() { echo "recipes: $*" >&2; exit 1; }

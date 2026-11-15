@@ -6,10 +6,12 @@
 
 | Channel | Command | What you get |
 |---|---|---|
+| The installer (from 1.0) | `curl -fsSL https://github.com/anthonytw/fil/releases/latest/download/fil-install.sh \| sh` (§8) | the client in `~/.local/bin` and the remote bundle beside it, after checking the signature and the checksum |
 | GitHub Releases | download, check, unpack (below) | the client, the remote bundle for `fil install`, man pages and completions |
 | Homebrew (macOS, Linux) | `brew install anthonytw/tap/fil` | the same archive, unpacked into the Cellar |
 | Debian, Ubuntu | `sudo apt install ./fil_<ver>_amd64.deb` (or `_arm64`) | the same files under `/usr`, from the release's Linux archive |
 | Fedora, RHEL, openSUSE | `sudo rpm --import package-signing-key.asc`, then `sudo dnf install ./fil-<ver>-1.x86_64.rpm` (or `.aarch64`) | the same |
+| fil's apt and dnf repositories (from 1.0) | `apt install fil`, `dnf install fil` after the one-time setup in `docs/user/install.md` (§7) | the same packages, upgraded with the system |
 | Arch Linux | `fil-shell-bin` on the AUR (prepared, not published yet: §6) | the same |
 | crates.io | `cargo install --locked fil-shell` | a build from source of the client and the remote for this machine only |
 | Nix | `nix profile install github:anthonytw/fil/v<ver>` | a build from source, as with cargo |
@@ -33,7 +35,7 @@
 - **The version** is the package version with a pre-release's `-` as `~` (`0.1.0-rc.1` is `0.1.0~rc.1`, which sorts before `0.1.0`), and release 1. So a release version must be `X.Y.Z` or `X.Y.Z-PRE`, PRE of `[0-9A-Za-z.]` (nfpm's semver): `release-check` refuses another.
 - **Signed** (D3): the owner signs the two rpms on their own machine after verifying the draft (`tests/release/just.sh release-sign-packages`, `docs/m4/release.md` §10.4), which also rewrites `SHA256SUMS` and writes `SHA256SUMS.asc`. CI builds them unsigned; no signing key is in CI.
 - **Reproducible.** Every file and the package itself carry the time `SOURCE_DATE_EPOCH` (the tagged commit's, as for the archives), the rpm's build host is a fixed name, and the order is nfpm's own. The package job builds them twice (in the two assemblies of `package.sh`) and gates on identical bytes; `tests/release/just.sh release-verify` rebuilds them in the VM and compares hashes; for the signed rpms it compares everything after the signature header, which signing does not touch, and checks the signatures.
-- **`SHA256SUMS`** lists the four archives and the four packages, sorted bytewise (`docs/m4/release.md` §4.2), and each package gets a build-provenance attestation like the archives.
+- **`SHA256SUMS`** lists the five archives (the macOS one twice), the four packages and the installer (§8), sorted bytewise (`docs/m4/release.md` §4.2), and each package gets a build-provenance attestation like the archives.
 - **`release-check`** reads each package without running anything from it (`tests/release/pkg_inspect.py`): the name `fil`, the version and architecture its file name says, exactly the files of its archive, byte for byte, at their places, root-owned, no maintainer script, no dependency, and, for an rpm, only its own directories and whether it is signed.
 - **Install tests** (`tests/release/install-packages.sh`, `just packages-install DIR`): in Debian 13 and Fedora 45 containers pinned by digest, with no network, each package is installed, `fil --version` must print the release's first line, the bundle must check, `dpkg --verify` or `rpm -V` must pass, and removing it must leave no file behind. With `--key KEY.asc` (for signed rpms) the key is imported and the rpm is installed with its signature checked. `release.yml` runs the amd64 ones in the package job and the arm64 ones on an arm64 runner (`packages-arm64`); the draft is not made unless both pass.
 
@@ -69,6 +71,64 @@
 
 - **Decided** (owner 2026-11-04): the .deb and .rpm are named `fil` (D1); their Maintainer and Packager is the owner, with the address the owner gave for that field (D2); the rpms are signed on the owner's machine (D3, `docs/m4/release.md` §10.4). **Delegated to the coordinator:** the PKGBUILD keeps `/usr/libexec` for now (Arch prefers `/usr/lib`; the client looks for its bundle at `../libexec/fil/remote`).
 - **The package key** is in `.github/package-signing-key.asc` (the owner's key, fingerprint `9EF0 B189 34B7 0552 0F88  80A5 81C0 98D1 5D1A EC26`, also in the README). `release-verify` reads it from main.
-- **The AUR** is closed to new accounts, so `fil-shell-bin` is prepared and not published: `just aur-pkgbuild VERSION` writes the PKGBUILD and `.SRCINFO` from the verified `SHA256SUMS`. Publishing needs an AUR account (owner) and its SSH key; then each release pushes the rendered PKGBUILD and `.SRCINFO` to the AUR git repository of `fil-shell-bin`.
+- **The AUR** is closed to new accounts, so `fil-shell-bin` is prepared and not published: `just aur-pkgbuild VERSION` writes the PKGBUILD and `.SRCINFO` from the verified `SHA256SUMS`. Publishing needs an AUR account (owner) and its SSH key; then each release pushes the rendered PKGBUILD and `.SRCINFO` to the AUR git repository of `fil-shell-bin`. The owner's steps are in §9.
 - **Debian and Fedora submissions** (an ITP and RFS, a Fedora package review) are owner steps with a sponsor; they package from the source archive, not from these .deb and .rpm files.
+- **Distribution for 1.0** (owner, 2026-11-11, 1.0 decision D5): AUR and nixpkgs submitted from the owner's accounts (§9); official Debian, Fedora and homebrew-core not until there is demand, and no Ubuntu package of our own (it comes from Debian); plus fil's own signed apt and dnf repositories (§7) and the installer (§8).
 - **Not built here:** the `brew` step of `macos-check.yml` (§4), and a `cargo install --git` test in a clean container (`docs/m4/plan.md` PKG "Tests"; `just crates-check` builds the packaged crate, which covers most of it).
+
+## 7. fil's apt and dnf repositories (from 1.0)
+
+**Decided (owner, 2026-11-11, D5):** fil serves its own signed apt and dnf repositories on the project site. They hold the release's own `.deb` and `.rpm` files, nothing rebuilt, and are signed with the package key (`docs/m4/release.md` §10.4) on the owner's Mac, like the rpms: no key in CI.
+
+**The command, after the release is published:** `tests/release/just.sh release-repos X.Y.Z` (`tests/release/repos.sh`, an owner command of `tests/release/release.just`; it runs `entry-check.sh` first). It is a separate command, not an eighteenth step of `tests/release/just.sh release`: it publishes nothing (the site is another repository, which the release must not write), it needs only the verified files and the package key, it can be run again at any time (a new site, a key renewal) without touching a finished release's state, and leaving `release.sh`'s seventeen detected steps alone keeps the release's resume logic unchanged. Run it after `finish`, with the keys unlocked (`tests/release/just.sh release-keys unlock --need gpg`; `finish` forgets them, so unlock again):
+
+1. **The inputs** are `target/release-verify/X.Y.Z/files/`, as `release-verify` left them: `target/release-verify/X.Y.Z/verified` must say they were verified with the signature (`presign=0`) and name the `SHA256SUMS` that is there, every file must match it, and both rpms must carry the package key's signature. Anything else stops the command before it writes.
+2. **The trees** (`tests/release/repos.py`, Python's standard library, nothing run from the packages):
+   - `apt/`: `pool/main/f/fil/` holds the two `.deb`; `dists/stable/main/binary-{amd64,arm64}/Packages` (and `.gz`) each list one package with its size and SHA-256; `dists/stable/Release` lists those indexes with their SHA-256.
+   - `rpm/`: the two `.rpm`; `repodata/` holds `primary`, `filelists` and `other` (gzip, named by their SHA-256) and `repomd.xml`, which lists them with their SHA-256; `primary` binds each rpm by its SHA-256. `fil.repo` is the dnf configuration users download (`gpgcheck=1`, `repo_gpgcheck=1`).
+   - Each run makes a complete repository of that one release: older versions are not kept, so a client always gets the latest.
+3. **The signatures**, by gpg with the key of `.github/package-signing-key.asc`: `dists/stable/InRelease` (clearsigned) and `Release.gpg` (detached), and `repodata/repomd.xml.asc` (detached). Each is verified with the public key alone in a scratch keyring (and `InRelease` must carry exactly `Release`), and the public key is copied into both trees as `fil-package-key.asc`. One signature over the top index covers every byte a client installs, because each index binds the next by digest.
+4. **The install test** (Docker; `--no-install-test` skips it): in the pinned Debian 13 and Fedora 45 images of `install-packages.sh`, with no network, apt and dnf install `fil` from the trees as `file://` repositories with every signature check on, `fil --version` must name X.Y.Z, and the package is removed. It tests this machine's architecture (`--arch all` for both, where Docker can run the other).
+
+Checked when it was built (2026-11-14) on the published 0.3.0 packages, re-signed with a throwaway key: both trees installed in Debian 13 (apt 3, `sqv`) and Fedora 45 (dnf5) on arm64; a changed `Packages` (hash mismatch), a changed `InRelease` ("Message has been manipulated") and a changed `repomd.xml` (the repository is skipped) were each refused. `just release-test` covers the command on synthetic packages with a throwaway gpg key (the refusals, the digests in every index, the signatures), without Docker.
+
+**The hand-off to the site** (a task in the site's repository, `website/fil-site`, not here): the command prints where the trees are, `target/release-verify/X.Y.Z/repos/`. Copy
+
+| From | To | Served at |
+|---|---|---|
+| `target/release-verify/X.Y.Z/repos/apt/` (all of it) | the site's `/apt/` | `https://fil.anthonywertz.com/apt/` |
+| `target/release-verify/X.Y.Z/repos/rpm/` (all of it) | the site's `/rpm/` | `https://fil.anthonywertz.com/rpm/` |
+
+replacing what was there (a file the new tree lacks, such as the last release's packages or old `repodata/*.xml.gz`, goes). The site must serve the files byte for byte (no rewriting, minifying or compressing of `.gz`, `.xml` or `.asc`) and over HTTPS only; `--base-url` changes the address written into `fil.repo` if the site moves. Upload order matters for a client that updates mid-copy: copy the packages and the indexes first and `InRelease`, `Release`, `Release.gpg` and `repodata/repomd.xml` with its `.asc` last; a client that sees the old top index until then installs the old release. GitHub Pages limits a file to 100 MB, which the packages (about 14 MB each) are far below.
+
+## 8. The installer (from 1.0)
+
+**Decided (owner, 2026-11-11, D5):** a `curl | sh` installer that lives in the immutable release assets and on the site, and only downloads, verifies `SHA256SUMS` against the pinned release key (`ssh-keygen -Y verify`) and copies `fil` into `~/.local/bin`, with no root. The docs show the one-liner and the download-read-run form (`docs/user/install.md`).
+
+- **The script** is `packaging/install.sh` (owned, with the other packaging templates: it carries the release key, a trust anchor, so a change to it needs the code owner), published in every release as `fil-install.sh`: `package.sh` copies it byte for byte, it is the tenth file `SHA256SUMS` lists (`docs/m4/release.md` §4.1), the release key's signature covers it, CI attests it and `release-verify`'s rebuild reproduces it. Not a rendered template: the script holds no version, so the copy in a release is the tree's file at the tag.
+- **What it does:** POSIX sh (checked with `dash -n` and shellcheck), no root. It finds the release (`latest/download/`, or `download/vX.Y.Z/` with `--version`), downloads `SHA256SUMS` and `SHA256SUMS.sig` and verifies the signature with `ssh-keygen -Y verify -I release -n fil-release` against the key in `FIL_RELEASE_SIGNERS`, the `fil-release` lines of `.github/release-signers`, as `verify.sh` does. Then it takes this machine's archive (`uname -s`/`-m`: the two Linux archives, or the universal macOS one, never the `.ci` copy) from the verified list, downloads it, checks its SHA-256, unpacks it in a temporary directory and installs `bin/fil` into `~/.local/bin` (`--dir`, `FIL_INSTALL_DIR`) and `libexec/fil/remote/` into `../libexec/fil/remote` from there, where the client looks for its bundle, each through a temporary name and a rename. Any failure stops it before anything is installed; it refuses a symbolic link at the target and a URL other than `https://` (or `file://`, for a local copy laid out like GitHub's). It runs nothing it downloaded but the installed `fil --version`, and everything is inside a function called on the last line, so a download cut short runs nothing.
+- **The pinned key** must equal the `fil-release` lines of `.github/release-signers`: `release-check` fails a release whose installer pins anything else (and `just release-test` the tree). A key rotation changes both files in one PR. An installer from an older release then refuses a newer release signed with the new key, and says to get the current installer.
+- **On the site:** the site can serve the latest release's `fil-install.sh` at a short address (for example `https://fil.anthonywertz.com/install.sh`), copied from the published release, byte for byte. The script verifies what it installs either way; the site copy is a convenience, and the docs keep the GitHub release URL as the primary one.
+- **Tested** by `just release-test` offline: a fake release directory (`file://`) signed with a throwaway key, against a copy of the script that differs from the real one only in that key; it installs, and refuses a signature by another key, a changed `SHA256SUMS`, a changed archive, a missing signature, two matching archives, a version that does not match, a non-HTTPS URL and a symbolic link at the target.
+
+## 9. The owner's submissions: AUR and nixpkgs
+
+Both need the owner's own accounts (D5), so they are prepared here and submitted by the owner. Neither depends on the installer or the repositories: the AUR package installs from the release's Linux archives (by the checksums in the verified `SHA256SUMS`, where `fil-install.sh` is one more line the renderer ignores), and Nix builds from the tagged source.
+
+**AUR (`fil-shell-bin`)**, once, then for each release:
+
+1. Once: make an AUR account (registration was closed to new accounts when PKG was built, §6), add an SSH public key to it, and add `Host aur.archlinux.org` with that key (`IdentityFile`, `User aur`) to `~/.ssh/config`.
+2. Once: `git clone ssh://aur@aur.archlinux.org/fil-shell-bin.git ~/dev/aur-fil-shell-bin` (an empty repository: cloning a name that does not exist creates it on the first push).
+3. Each release, after `finish`: `just aur-pkgbuild X.Y.Z` (from the verified `target/release-verify/X.Y.Z/files/SHA256SUMS`), then copy `target/packaging/aur/PKGBUILD` and `.SRCINFO` into the clone.
+4. Check it on an Arch machine or container: `makepkg -si` in the clone (it downloads the archive and checks the sums), then `fil --version`; `namcap PKGBUILD` and `namcap fil-shell-bin-*.pkg.tar.zst` for lint.
+5. `git add PKGBUILD .SRCINFO && git commit -S -m "fil X.Y.Z" && git push` (the AUR accepts only `master`; the first push of the repository publishes the package).
+
+**nixpkgs (`fil-shell`)**, once (later versions are usually bumped by nixpkgs' update bot, or by the same steps with a new version and hashes):
+
+1. Wait until nixpkgs' `rustc` is at least the workspace's `rust-version` (`docs/m4/nixpkgs-pr.md`, "Before opening it").
+2. Fork `NixOS/nixpkgs` on the owner's GitHub account, and add the maintainer entry to `maintainers/maintainer-list.nix` (the GitHub handle and a contact of the owner's choosing) in its own commit.
+3. Add `pkgs/by-name/fi/fil-shell/package.nix` from `docs/m4/nixpkgs-pr.md`, with the release's version; build once with `lib.fakeHash` for `hash` and `cargoHash`, and copy the real hashes from the two errors.
+4. `nix-build -A fil-shell`, `./result/bin/fil --version`, and `nixpkgs-review wip`; then open the PR against `master` with the title `fil-shell: init at X.Y.Z` and the checklist nixpkgs' template asks for.
+5. The flake in this repository (§5) stays the way to install a version before nixpkgs has it.
+
+Checked for 1.0's new files (2026-11-14): `packaging/render.sh aur` and `brew` render from a `SHA256SUMS` that lists `fil-install.sh` (the self-test's render cases); the flake builds from `cleanSource ./.`, which the installer and the repository tooling do not change (it was not rebuilt: there is no Nix on the Mac).

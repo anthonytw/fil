@@ -4,8 +4,8 @@
 #
 #   check.sh [--dry-run | --tag vX.Y.Z] [--complete] [--no-tree] [--no-exec] DIR
 #
-#   DIR         the five archives (the macOS one twice: CI's own and the one the owner signs), the four .deb and .rpm packages and SHA256SUMS that package.sh
-#               wrote (or a downloaded release)
+#   DIR         the five archives (the macOS one twice: CI's own and the one the owner signs), the four .deb and .rpm packages, the installer
+#               (fil-install.sh) and SHA256SUMS that package.sh wrote (or a downloaded release)
 #   --dry-run   a build of a branch, not of a release: the tag and the changelog are not checked
 #   --tag TAG   the tag being released: it must be v<Cargo.toml version>, CHANGELOG.md must have a
 #               section for the version, and a patch release must keep its minor's wire
@@ -123,8 +123,7 @@ fi
 
 # ---- SHA256SUMS (section 4.2)
 sums=$dir/SHA256SUMS
-packages=$(package_names "$V" | tr '\n' ' ')
-names=$(printf '%s\n' "fil-$V-aarch64-linux-musl.tar.gz" "fil-$V-source.tar.gz" "fil-$V-universal-apple-darwin.tar.gz" "$(ci_archive_name "$V")" "fil-$V-x86_64-linux-musl.tar.gz" $packages | LC_ALL=C sort | tr '\n' ' ')
+names=$(release_names "$V" | tr '\n' ' ')
 if [ ! -f "$sums" ]; then
   fail "no SHA256SUMS in $dir"
 else
@@ -133,9 +132,9 @@ else
       [ -f "$dir/$n" ] && printf '%s  %s\n' "$(sha256 "$dir/$n")" "$n"
     done
   )" ]; then
-    ok "SHA256SUMS lists exactly the five archives and the four packages, sorted, in sha256sum format"
+    ok "SHA256SUMS lists exactly the five archives, the four packages and the installer, sorted, in sha256sum format"
   else
-    fail "SHA256SUMS is not exactly the five archives and the four packages ($names), bytewise sorted, 'hash  name' lines (it is: $(tr '\n' '|' < "$sums"))"
+    fail "SHA256SUMS is not exactly the five archives, the four packages and the installer ($names), bytewise sorted, 'hash  name' lines (it is: $(tr '\n' '|' < "$sums"))"
   fi
   if sums_check "$dir" SHA256SUMS; then ok "sha256sum -c SHA256SUMS"; else fail "sha256sum -c SHA256SUMS"; fi
   [ -z "$(tail -c 1 "$sums")" ] || fail "SHA256SUMS does not end with a newline"
@@ -147,6 +146,28 @@ for f in "$dir"/*; do
   case " SHA256SUMS SHA256SUMS.sig SHA256SUMS.asc $names " in *" $b "*) ;; *) extras="$extras $b" ;; esac
 done
 [ -z "$extras" ] || note "other files in $dir (not part of the release):$extras"
+
+# ---- the installer (section 4.1): a POSIX sh script that pins exactly the release key. It is only
+# read and parsed (`sh -n`), never run.
+inst=$dir/$INSTALLER_NAME
+if [ ! -f "$inst" ]; then
+  fail "no $INSTALLER_NAME in $dir"
+else
+  if [ "$(head -n 1 "$inst")" = "#!/bin/sh" ]; then ok "$INSTALLER_NAME is a #!/bin/sh script"; else fail "$INSTALLER_NAME does not start with #!/bin/sh"; fi
+  if sh -n "$inst" 2> "$work/installer-parse.log"; then ok "$INSTALLER_NAME parses (sh -n)"; else fail "$INSTALLER_NAME does not parse: $(head -n 3 "$work/installer-parse.log" | tr '\n' ' ')"; fi
+  pinned=$(installer_signers "$inst")
+  want_signers=$(signers_release_lines "$ROOT/.github/release-signers")
+  if [ -z "$want_signers" ]; then
+    fail ".github/release-signers has no fil-release key, so $INSTALLER_NAME can pin none (docs/m4/release.md section 9.2, step 0)"
+  elif [ "$pinned" = "$want_signers" ]; then
+    ok "$INSTALLER_NAME pins exactly the fil-release keys of .github/release-signers"
+  else
+    fail "$INSTALLER_NAME pins other keys than the fil-release lines of .github/release-signers (a key rotation changes $INSTALLER_SRC in the same PR): pinned '$(printf '%s' "$pinned" | tr '\n' '|')', signers '$(printf '%s' "$want_signers" | tr '\n' '|')'"
+  fi
+  if [ -f "$ROOT/$INSTALLER_SRC" ] && ! cmp -s "$inst" "$ROOT/$INSTALLER_SRC"; then
+    note "$INSTALLER_NAME differs from this tree's $INSTALLER_SRC (expected only when checking a release from another commit; the rebuild compares it byte for byte)"
+  fi
+fi
 
 # ---- the archives
 # Layout (section 4.3): every file of it, DOC's (man pages, completions, examples, changelog) too.

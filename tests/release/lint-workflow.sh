@@ -48,14 +48,20 @@
 #       `persist-credentials: false`;
 #   C4. no `${{ }}` expression inside a `run:` (an input or a matrix value reaches the shell through `env:`);
 #   C5. no secret is referenced.
+# The scheduled profile (--scheduled): the weekly advisory scan (audit.yml). C1, C3, C4 and C5 as in
+# the check profile, and instead of C2:
+#   S2. the triggers are exactly `schedule` (required; a block of `- cron:` lines and nothing else)
+#       and workflow_dispatch (required) with no settings: no inputs, no pull_request, no push.
 # (.gitea/workflows/ci.yml is not covered: it runs on pull requests, so C2 does not apply to it.)
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-if [ "${1:-}" = --check ]; then
+if [ "${1:-}" = --check ] || [ "${1:-}" = --scheduled ]; then
+  if [ "$1" = --scheduled ]; then sched=1; else sched=0; fi
+  profile=$1
   shift
-  [ $# -gt 0 ] || { echo "lint-workflow: --check needs a workflow file" >&2; exit 2; }
+  [ $# -gt 0 ] || { echo "lint-workflow: $profile needs a workflow file" >&2; exit 2; }
   rc=0
   for f in "$@"; do
     [ -f "$f" ] || { echo "lint-workflow: no such file: $f" >&2; exit 2; }
@@ -93,12 +99,19 @@ if [ "${1:-}" = --check ]; then
           key = line; sub(/^ */, "", key); sub(/:.*/, "", key)
           trig = key
           if (key == "workflow_dispatch") dispatch_seen = 1
+          else if (sched && key == "schedule") schedule_seen = 1
+          else if (sched) bad("trigger " key " is not allowed (schedule and workflow_dispatch only)")
           else if (key == "push") push_seen = 1
           else if (key != "pull_request") bad("trigger " key " is not allowed (workflow_dispatch, pull_request and a push of main only)")
           val = line; sub(/^[^:]*:[ ]*/, "", val)
           if (val != "") bad("trigger " key " must be a block, not inline: " line)
         }
-        if (section == "on" && indent > 2) {
+        if (sched && section == "on" && indent > 2) {
+          if (trig == "schedule" && line ~ /^    - cron:[ ]*["\047][0-9*\/, -]+["\047][ ]*$/) cron_seen = 1
+          else if (trig == "schedule") bad("schedule may hold - cron: lines only: " line)
+          else bad(trig " takes no settings in the scheduled profile: " line)
+        }
+        if (!sched && section == "on" && indent > 2) {
           if (trig == "pull_request") bad("pull_request takes no settings (types, branches or paths would change which events run it): " line)
           if (trig == "push") {
             if (indent == 4 && line ~ /^    branches:[ ]*\[[ ]*main[ ]*\][ ]*$/) push_main = 1
@@ -123,10 +136,11 @@ if [ "${1:-}" = --check ]; then
         finish_checkout()
         if (!top_seen) bad("no top-level permissions: contents: read")
         if (!dispatch_seen) bad("no workflow_dispatch trigger")
+        if (sched && !cron_seen) bad("no schedule with a cron line")
         if (push_seen && !push_main) bad("push without branches: [main] (it would run on every branch and tag)")
         exit fails ? 1 : 0
       }
-    ' "$f" || rc=1
+    ' sched="$sched" "$f" || rc=1
   done
   exit $rc
 fi

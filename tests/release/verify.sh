@@ -25,10 +25,11 @@
 #   4. `release-check --no-exec` passes on the files (--tag v<VERSION> --complete): the files are
 #      unpacked, hashed, grepped and inspected, and NOTHING that came from the download is run
 #      (no `cargo` in the source archive, no `--version` of a binary);
-#   5. the Linux VM rebuilds the Linux binaries, the four archives and the four .deb and .rpm
-#      packages from that commit in the digest-pinned images, and the hashes are compared with the
-#      release's. The rebuild judges the source archive byte for byte. Three archives (x86_64,
-#      aarch64, source) and the four packages are reproduced from the source; the macOS archive is
+#   5. the Linux VM rebuilds the Linux binaries, the four archives, the four .deb and .rpm
+#      packages and the installer from that commit in the digest-pinned images, and the hashes are
+#      compared with the release's. The rebuild judges the source archive byte for byte. Three
+#      archives (x86_64, aarch64, source), the four packages and the installer (the tree's
+#      packaging/install.sh) are reproduced from the source; the macOS archive is
 #      only REASSEMBLED around the released macOS binary, which is not rebuilt and is ad-hoc signed.
 #
 # The macOS binary (docs/m4/release.md section 10.3) is Developer-ID signed after CI. The release
@@ -210,7 +211,7 @@ if [ "$dry" = 0 ]; then
   # compares everything after the signature header.
   mac_archive=fil-$version-universal-apple-darwin.tar.gz
   [ -f "$dl/$(ci_archive_name "$version")" ] || die "STOP: the release has no $(ci_archive_name "$version") (CI's own macOS archive, the one that is attested)"
-  for a in "$dl"/fil-"$version"-*.tar.gz $(package_names "$version" | sed "s|^|$dl/|"); do
+  for a in "$dl"/fil-"$version"-*.tar.gz $(package_names "$version" | sed "s|^|$dl/|") "$dl/$INSTALLER_NAME"; do
     if [ "$a" = "$dl/$mac_archive" ] && ! cmp -s "$a" "$dl/$(ci_archive_name "$version")"; then
       echo "release-verify: note: $mac_archive is signed by the owner: its attestation is not checked (CI attested $(ci_archive_name "$version"), which is); it is tied to that one below" >&2
       continue
@@ -295,7 +296,7 @@ if [ "$rebuild" = 1 ]; then
   fi
   if [ -f "$rb/SHA256SUMS" ]; then
     echo "release-verify: rebuilt vs. released SHA256SUMS:" >&2
-    for n in fil-"$version"-x86_64-linux-musl.tar.gz fil-"$version"-aarch64-linux-musl.tar.gz fil-"$version"-source.tar.gz fil-"$version"-universal-apple-darwin.tar.gz "$(ci_archive_name "$version")" $(package_names "$version"); do
+    for n in $(release_names "$version"); do
       h1=$(grep -F "  $n" "$dl/SHA256SUMS" | cut -d' ' -f1)
       h2=$(grep -F "  $n" "$rb/SHA256SUMS" | cut -d' ' -f1)
       if [ "$n" = "fil-$version-universal-apple-darwin.tar.gz" ] && [ -n "$h1" ] && [ "$h1" != "$h2" ] && [ "$h2" = "$(grep -F "  $(ci_archive_name "$version")" "$rb/SHA256SUMS" | cut -d' ' -f1)" ]; then

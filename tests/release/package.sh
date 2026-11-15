@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Assemble the release files (docs/m4/release.md section 4) from the three built binaries:
-# the three binary archives, the vendored source archive, the four .deb and .rpm packages (made
-# from the two Linux archives by linux-packages.sh) and SHA256SUMS.
+# the three binary archives (and CI's copy of the macOS one), the vendored source archive, the four
+# .deb and .rpm packages (made from the two Linux archives by linux-packages.sh), the installer
+# (packaging/install.sh as fil-install.sh) and SHA256SUMS.
 #
 #   package.sh --bins DIR --out DIR [--extra DIR]
 #
@@ -97,6 +98,9 @@ cp "$out/fil-$V-universal-apple-darwin.tar.gz" "$out/$(ci_archive_name "$V")"
 # ---- the .deb and .rpm packages, from the two Linux archives just written (section 4.1)
 "$RELEASE_DIR/linux-packages.sh" --archives "$out" --out "$out"
 
-# ---- SHA256SUMS: exactly the four archives and the four packages, sorted bytewise (section 4.2)
+# ---- the installer (section 4.1): the tree's script, byte for byte
+install -m 755 "$ROOT/$INSTALLER_SRC" "$out/$INSTALLER_NAME"
+
+# ---- SHA256SUMS: exactly the five archives, the four packages and the installer, sorted bytewise (section 4.2)
 rewrite_sums "$out" "$V"
 cat "$out/SHA256SUMS" >&2

@@ -548,6 +548,10 @@ release-preflight *args:
     tests/release/just.sh release-preflight "$@"
 
 [positional-arguments]
+release-repos *args:
+    tests/release/just.sh release-repos "$@"
+
+[positional-arguments]
 release-sign-macos *args:
     tests/release/just.sh release-sign-macos "$@"
 

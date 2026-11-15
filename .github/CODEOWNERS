@@ -9,6 +9,7 @@
 /.github/CODEOWNERS @anthonytw
 /.github/release-signers @anthonytw
 /.github/package-signing-key.asc @anthonytw
+/.github/package-signing-key-revoked.asc @anthonytw
 /.github/macos-team-id @anthonytw
 /.github/workflows/** @anthonytw
 /tests/release/** @anthonytw
@@ -33,6 +34,10 @@
 /flake.nix @anthonytw
 /flake.lock @anthonytw
 /docs/man/** @anthonytw
+# The two documents users copy the installer one-liner from and compare the key fingerprints with:
+# an edit to either could send them to another script or another key.
+/README.md @anthonytw
+/docs/user/install.md @anthonytw
 # Unowned. The justfile (nothing on the release path reads it, above). The manual check workflows use
 # no secret and ask for no write permission (contents and actions: read only), which the owned
 # lint-workflow.sh --check requires, run by release.yml's prepare job and by the owned `release-test`

@@ -8,7 +8,7 @@ fil runs on macOS and Linux (x86_64 and aarch64) as the client, and on Linux as 
 
 | Channel | Command | What you get |
 |---|---|---|
-| The installer (from the release after 0.3.0) | `curl -fsSL https://github.com/anthonytw/fil/releases/latest/download/fil-install.sh \| sh` (below) | the client in `~/.local/bin` and the Linux programs `fil install` uploads, checked against the signed release; no root |
+| The installer (from the release after 0.3.0) | `curl -fsSL https://github.com/anthonytw/fil/releases/download/v1.0.0/fil-install.sh \| sh -s -- --version 1.0.0` (below) | the client in `~/.local/bin` and the Linux programs `fil install` uploads, checked against the signed release; no root |
 | GitHub Releases | download, check, unpack (below) | the client, the Linux programs `fil install` uploads, man pages and completions |
 | Homebrew (macOS, Linux) | `brew install anthonytw/tap/fil` | the same archive |
 | Debian, Ubuntu | `sudo apt install ./fil_<version>_amd64.deb` (or `_arm64`) | the same files under `/usr` |
@@ -24,11 +24,13 @@ The command is `fil` everywhere. The crate is `fil-shell` and the AUR package `f
 
 From the release after 0.3.0, every release carries `fil-install.sh`, a short POSIX shell script that needs no root. It downloads the release's `SHA256SUMS` and `SHA256SUMS.sig` with `curl` (HTTPS only, redirects included), checks the signature with `ssh-keygen -Y verify` against the release key written in the script, picks the archive for your machine from that list, checks its SHA-256, and copies `fil` into `~/.local/bin` and the Linux programs `fil install` uploads into `~/.local/libexec/fil/remote` (if `~/.local/bin` is a symbolic link, into the `libexec` beside the directory it points to, where `fil` looks). If a check or a copy fails it stops with nothing installed, and it runs nothing it downloaded but the installed `fil --version` at the end. It needs `curl`, `ssh-keygen` from OpenSSH 8.1 or later (for `-Y verify`; RHEL 8's OpenSSH 8.0 is too old), `tar`, `gzip`, and `sha256sum` or `shasum`, and checks for each before it downloads anything.
 
-The one-liner, which installs the latest release:
+The one-liner, for the current release:
 
 ```sh
-curl -fsSL https://github.com/anthonytw/fil/releases/latest/download/fil-install.sh | sh
+curl -fsSL https://github.com/anthonytw/fil/releases/download/v1.0.0/fil-install.sh | sh -s -- --version 1.0.0
 ```
+
+It names the version twice on purpose. The URL is that release's own copy of the script, which nobody can change once the release is published, and `--version` makes the script fetch that release's `SHA256SUMS`. Without `--version` it takes whatever release is marked as the latest, and it accepts any release the key ever signed, an older one included: a mirror (`FIL_RELEASE_URL`) or a changed "latest" could hand you an old version that way. The signature check proves who built what you install, not that it is the newest. A `curl | sh` runs the script before anything is checked, so for the one-liner the trust is in GitHub: its HTTPS and the repository's settings that keep anyone but the owner from making a release or changing one. The form below lets you read the script first.
 
 Or download it, read it, then run it, for a given version:
 
@@ -61,7 +63,7 @@ sudo curl -fsSL -o /etc/yum.repos.d/fil.repo https://fil.anthonywertz.com/rpm/fi
 sudo dnf install fil      # dnf shows the key's fingerprint and asks before it imports it
 ```
 
-The repository's index (`InRelease` for apt, `repomd.xml.asc` for dnf) is signed, and it lists each package by its SHA-256, so apt and dnf refuse a package or an index that was changed; dnf also checks each rpm's own signature. Each repository holds the latest release only.
+The repository's index (`InRelease` for apt, `repomd.xml.asc` for dnf) is signed, and it lists each package by its SHA-256, so apt and dnf refuse a package or an index that was changed; dnf also checks each rpm's own signature. Each repository holds the latest release only. Their indexes carry no expiry date, so a mirror or a compromised site could go on serving an older signed release and apt and dnf would not notice; compare the version they install (`apt policy fil`, `dnf info fil`) with the [releases page](https://github.com/anthonytw/fil/releases).
 
 The package signing key expires on 2028-11-08 and will be extended before then. apt keeps the copy you downloaded, so after an extension run the `curl … /etc/apt/keyrings/fil.asc` line above again (the fingerprint stays the same); if dnf then reports an expired key, import the extended one with `sudo rpm --import https://fil.anthonywertz.com/rpm/fil-package-key.asc`.
 

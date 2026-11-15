@@ -180,6 +180,35 @@ package_names() {
 # release key's signature covers it.
 INSTALLER_SRC=packaging/install.sh
 INSTALLER_NAME=fil-install.sh
+# The documents that give the installer's one-liner (and the key fingerprints users compare).
+INSTALLER_DOCS="README.md docs/user/install.md"
+# installer_oneliner VERSION: the one form the docs may give the `curl | sh` one-liner in. It names
+# the version twice: the URL is that release's own copy (immutable once published, under a v* tag
+# only the owner can create), never releases/latest, which any writer could point at a release of
+# their own; and --version makes the script fetch that release's SHA256SUMS, never latest's.
+# `just set-version` rewrites both; release-check holds the docs to it (doc_oneliner_problems).
+installer_oneliner() {
+  printf 'curl -fsSL https://github.com/anthonytw/fil/releases/download/v%s/%s | sh -s -- --version %s' "$1" "$INSTALLER_NAME" "$1"
+}
+# doc_oneliner_problems FILE VERSION: what is wrong with how FILE gives the installer one-liner, one
+# problem a line (nothing when it is right): it must give installer_oneliner VERSION at least once,
+# pipe the installer to a shell in no other form, and never name releases/latest. A Markdown table's
+# `\|` counts as `|`.
+doc_oneliner_problems() {
+  local f=$1 want line rest n=0
+  [ -f "$f" ] || { echo "it is missing"; return 0; }
+  want=$(installer_oneliner "$2")
+  ! grep -q 'releases/latest' "$f" || echo "it names releases/latest"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line//\\|/|}
+    rest=${line//"$want"/}
+    [ "$rest" = "$line" ] || n=$((n + 1))
+    case $rest in
+      *"$INSTALLER_NAME"*"|"*sh*) echo "it pipes $INSTALLER_NAME to a shell in another form: $(printf '%s' "$line" | head -c 200)" ;;
+    esac
+  done < "$f"
+  [ "$n" -gt 0 ] || echo "it does not give '$want'"
+}
 # release_names VERSION: the files SHA256SUMS lists (sections 4.1 and 4.2): the five archives (the
 # macOS one twice), the four packages and the installer, sorted bytewise.
 release_names() {

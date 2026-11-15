@@ -157,7 +157,7 @@ mutate_wf "a job drops its permissions block" 's/(  smoke-macos:.*?)    permissi
 mutate_wf "the workflow-level permissions widen" 's/\npermissions:\n  contents: read\n/\npermissions:\n  contents: write\n/'
 mutate_wf "publish stops requiring a tag" "s/ && startsWith\\(github.ref, 'refs\\/tags\\/v'\\)//"
 mutate_wf "an action is pinned by tag" 's/(actions\/upload-artifact)@[0-9a-f]{40} # v7.0.2/$1\@v7/'
-mutate_wf "an action is pinned by a short SHA" 's/(taiki-e\/install-action)\@682ce6c3c696a4cd5168a05f98e51aa02b877941/$1\@682ce6c/'
+mutate_wf "an action is pinned by a short SHA" 's/(taiki-e\/install-action)\@ab49d3c64680143e184118bed66a46419fc15519/$1\@ab49d3c/'
 mutate_wf "a secret is used" 's/(GH_TOKEN: )\$\{\{ github.token \}\}/$1\$\{\{ secrets.RELEASE_TOKEN \}\}/'
 mutate_wf "a cache step is added" 's/(      - name: Toolchain \(from rust-toolchain.toml\)\n)/      - uses: actions\/cache\@0123456789abcdef0123456789abcdef01234567\n$1/'
 mutate_wf "checkout keeps its token" 's/(  build-macos:.*?    steps:\n      - uses: actions\/checkout\@[0-9a-f]{40} # v7.0.1\n        with:\n)          persist-credentials: false\n/$1          fetch-depth: 1\n/s'
@@ -196,6 +196,30 @@ mutate_wf "prepare runs the self-test again" 's/(run: tests\/release\/just.sh cr
 mutate_wf "prepare no longer checks the lock's sources" 's/check bans licenses sources/check bans licenses/'
 mutate_wf "prepare checks the lock without --locked" 's/cargo deny --locked check/cargo deny check/'
 mutate_wf "the lock's check moved out of prepare" 's/      - name: The lock.s sources, bans and licenses[^\n]*\n        run: cargo deny --locked check bans licenses sources\n//'
+# rule 12: the digests between the jobs
+mutate_wf "build-macos records no digest" 's/      - name: The universal binary.s SHA-256, as a job output\n        id: digest\n[^\n]*\n[^\n]*\n[^\n]*\n//'
+mutate_wf "build-macos loses an output" 's/      sha256_b: \$\{\{ steps.digest.outputs.sha256_b \}\}\n//'
+mutate_wf "package builds the man pages after downloading the binaries" 's/(      # Before the binaries are downloaded:.*?diff -r docs-out docs-out-b\n)(      - uses: actions\/download-artifact\@[0-9a-f]{40} # v8.0.2\n        with:\n          pattern: bin-\*\n          path: in\n)/$2$1/s'
+mutate_wf "package does not check macOS binary b" 's/          tests\/release\/digest.sh check "\$MACOS_SHA256_B" sets\/b\/universal-apple-darwin\/fil\n//'
+mutate_wf "package checks the macOS binaries after package.sh" 's/(          tests\/release\/digest.sh check "\$MACOS_SHA256_A" sets\/a\/universal-apple-darwin\/fil\n)(.*?tests\/release\/package.sh --bins sets\/b[^\n]*\n)/$2$1/s'
+mutate_wf "package checks against another output" 's/(MACOS_SHA256_A: \$\{\{ needs.build-macos.outputs.)sha256_a/${1}sha256_b/'
+mutate_wf "package records no SHA256SUMS digest" 's/        run: tests\/release\/digest.sh out sums out\/SHA256SUMS\n/        run: sha256sum out\/SHA256SUMS\n/'
+mutate_wf "publish checks SHA256SUMS against itself only" 's/          tests\/release\/digest.sh check "\$SUMS_SHA256" out\/SHA256SUMS\n//'
+mutate_wf "publish checks SHA256SUMS after attesting" 's/(      - name: The files are the ones that were checked\n.*?\(cd out && sha256sum -c SHA256SUMS\)\n)(      - uses: actions\/attest-build-provenance\@[0-9a-f]{40} # v4.2.2\n        with:\n          subject-path: \|\n(?:            [^\n]*\n)+)/$2$1/s'
+# digest.sh, the checks those steps run
+dg=$tmp/digest
+mkdir -p "$dg/a/top/bin"
+echo binary > "$dg/a/top/bin/fil"
+(cd "$dg/a" && tar -czf "$dg/a.tar.gz" top)
+dsum=$(sha256 "$dg/a/top/bin/fil")
+expect_pass "digest.sh: out writes NAME=SHA-256 to GITHUB_OUTPUT" sh -c ': > "$2/o" && GITHUB_OUTPUT="$2/o" "$1" out sha256_a "$2/a/top/bin/fil" && test "$(cat "$2/o")" = "sha256_a=$3"' sh "$RELEASE_DIR/digest.sh" "$dg" "$dsum"
+expect_pass "digest.sh: check passes the recorded digest" "$RELEASE_DIR/digest.sh" check "$dsum" "$dg/a/top/bin/fil"
+expect_fail "digest.sh: check fails another digest" "$RELEASE_DIR/digest.sh" check "$(printf '%064d' 0)" "$dg/a/top/bin/fil"
+expect_fail "digest.sh: check fails an empty digest (an output that was never set)" "$RELEASE_DIR/digest.sh" check "" "$dg/a/top/bin/fil"
+expect_pass "digest.sh: check-tar passes the archive's bin/fil" "$RELEASE_DIR/digest.sh" check-tar "$dsum" "$dg/a.tar.gz"
+echo swapped > "$dg/a/top/bin/fil"
+(cd "$dg/a" && tar -czf "$dg/b.tar.gz" top)
+expect_fail "digest.sh: check-tar fails a swapped bin/fil" "$RELEASE_DIR/digest.sh" check-tar "$dsum" "$dg/b.tar.gz"
 # --locked: scripts in a copy of the directory
 mkdir -p "$tmp/scripts"
 cp "$RELEASE_DIR"/*.sh "$tmp/scripts/"
@@ -373,7 +397,7 @@ for f in "$REPO_ROOT"/tests/release/*; do
   case ${f##*/} in selftest.sh | selftest_macho.py | selftest_pkg.py) ;; *) owned+=("/tests/release/${f##*/}") ;; esac
 done
 # a file added later in an owned directory is owned until CODEOWNERS says otherwise
-owned+=(/.github/workflows/release.yml /.github/workflows/new.yml /tests/release/new-step.sh /packaging/new/x /.cargo/config.toml /flake.nix /flake.lock /rust-toolchain /docs/man/strip-links.lua /docs/man/build.sh /docs/man/install-pandoc.sh /docs/man/new-filter.lua)
+owned+=(/.github/workflows/release.yml /.github/workflows/new.yml /tests/release/new-step.sh /packaging/new/x /.cargo/config.toml /flake.nix /flake.lock /rust-toolchain /docs/man/strip-links.lua /docs/man/build.sh /docs/man/install-pandoc.sh /docs/man/new-filter.lua /.github/package-signing-key-revoked.asc /README.md /docs/user/install.md)
 codeowners_owner "$REPO_ROOT/.github/CODEOWNERS" "${owned[@]}" "${unowned[@]}" > "$tmp/owners" 2>&1 || cat "$tmp/owners" >&2
 for path in "${owned[@]}"; do
   expect_pass "CODEOWNERS: $path is the owner's" grep -qxF "$path @anthonytw" "$tmp/owners"
@@ -485,8 +509,9 @@ mk_tree() { # DIR VER
   cp "$REPO_ROOT/crates/fil-proto/src/limits.rs" "$d/crates/fil-proto/src/"
   cp "$REPO_ROOT/crates/fil-proto/tests/golden/wire.txt" "$d/crates/fil-proto/tests/golden/"
   cp "$REPO_ROOT/crates/fil-transport/src/pipe/remote-commands.txt" "$d/crates/fil-transport/src/pipe/"
-  mkdir -p "$d/packaging" "$d/.github"
+  mkdir -p "$d/packaging" "$d/.github" "$d/docs/user"
   cp "$REPO_ROOT/$INSTALLER_SRC" "$d/$INSTALLER_SRC"
+  cp "$REPO_ROOT/docs/user/install.md" "$d/docs/user/"
   git init -q -b main "$d"
   set_version "$d" "$2"
   git -C "$d" add -A
@@ -496,9 +521,17 @@ mk_tree() { # DIR VER
   cp "$REPO_ROOT/.github/release-signers" "$d/.github/release-signers"
   echo /.github/release-signers >> "$d/.git/info/exclude"
 }
-set_version() { # DIR VER: Cargo.toml and a changelog section
+set_version() { # DIR VER: Cargo.toml, a changelog section and the docs' installer one-liner (as just set-version)
   perl -pi -e 'if (!$d && s/^version = "[^"]*"/version = "'"$2"'"/) { $d = 1 }' "$1/Cargo.toml"
+  sv_docs "$1" "$2"
   printf '# Changelog\n\n## [%s] - 2026-11-04\n\n- first\n' "$2" > "$1/CHANGELOG.md"
+}
+# sv_docs DIR VER: the installer one-liner of DIR's README.md and docs/user/install.md at VER, by the
+# justfile's own set-version line (read from it, so a change there is what this tests).
+sv_docs() {
+  local line
+  line=$(grep -F 'fil-install\.sh' "$REPO_ROOT/justfile" | grep -F 'perl -pi -e') || { echo "selftest: no installer line in the justfile's set-version" >&2; return 1; }
+  (cd "$1" && v=$2 && eval "$line")
 }
 fake_bin() { # FILE KIND
   cat > "$1" << EOT
@@ -687,6 +720,27 @@ expect_fail "mutation: the tag is not the Cargo.toml version" check --tag v0.9.1
 printf '# Changelog\n\n## [0.0.1]\n' > "$tree/CHANGELOG.md"
 expect_fail "mutation: the version has no changelog section" check --tag v0.9.0 --no-tree "$rel"
 expect_pass "(a dry run does not read the changelog)" check --dry-run --no-tree "$rel"
+set_version "$tree" 0.9.0
+expect_pass "the tree's docs give the installer one-liner at 0.9.0 (set-version's rewrite)" check --tag v0.9.0 --no-tree "$rel"
+# doc_case NAME PATTERN FILE PERL: FILE of the tree changed by PERL; a tag run fails, saying PATTERN
+doc_case() {
+  cp "$tree/$3" "$tmp/doc.keep"
+  perl -pi -e "$4" "$tree/$3"
+  if check --tag v0.9.0 --no-tree "$rel" > "$tmp/out.log" 2>&1; then flunk "release-check: $1 (it should have failed)"
+  elif grep -qF -- "$2" "$tmp/out.log"; then pass "release-check: $1"
+  else flunk "release-check: $1 (failed, but not with '$2')"; sed 's/^/       | /' "$tmp/out.log" | tail -5; fi
+  cp "$tmp/doc.keep" "$tree/$3"
+}
+doc_case "the README's one-liner at another version" "README.md: it pipes fil-install.sh to a shell in another form" README.md 's{download/v0\.9\.0/}{download/v0.8.0/}'
+doc_case "the README's one-liner without --version" "README.md: it pipes fil-install.sh to a shell in another form" README.md 's{ -s -- --version 0\.9\.0}{}'
+doc_case "install.md's one-liner at releases/latest" "docs/user/install.md: it names releases/latest" docs/user/install.md 's{releases/download/v0\.9\.0/}{releases/latest/download/} if /^curl -fsSL/'
+doc_case "install.md without the one-liner" "docs/user/install.md: it does not give" docs/user/install.md '$_ = "" if /fil-install\.sh \\?\| sh/'
+mv "$tree/docs/user/install.md" "$tmp/doc.keep"
+if check --tag v0.9.0 --no-tree "$rel" > "$tmp/out.log" 2>&1; then flunk "release-check: no docs/user/install.md fails"; elif grep -qF "docs/user/install.md: it is missing" "$tmp/out.log"; then pass "release-check: no docs/user/install.md fails"; else flunk "release-check: no docs/user/install.md fails (not saying so)"; fi
+mv "$tmp/doc.keep" "$tree/docs/user/install.md"
+perl -pi -e 's{download/v0\.9\.0/}{download/v0.8.0/}' "$tree/README.md"
+expect_pass "(a dry run does not read the docs' one-liner)" check --dry-run --no-tree "$rel"
+perl -pi -e 's{download/v0\.8\.0/}{download/v0.9.0/}' "$tree/README.md"
 
 mutated "a builder path (/Users/) is left in the Linux bin/fil" \
   "echo '# /Users/builder/.cargo/registry/src/x.rs' >> fil-0.9.0-x86_64-linux-musl/bin/fil"
@@ -2302,9 +2356,10 @@ case "$*" in
   "api repos/o/r/environments/crates-io/deployment-branch-policies"*) echo "tag:v*" ;;
   "api repos/o/r/environments/crates-io"*prevent_self_review*) echo "${FAKE_SELF_REVIEW:-false}" ;;
   "api repos/o/r/environments/crates-io"*) echo "${FAKE_REVIEWERS-anthonytw}" ;;
-  "api repos/o/r/rulesets/7"*) echo "${FAKE_RULESET_REF-refs/tags/v*}" ;;
+  "api repos/o/r/rulesets/7"*) echo "${FAKE_TAG_RULESET-~ALL 0 creation,deletion,non_fast_forward,update}" ;;
   "api repos/o/r/rulesets"*) echo 7 ;;
-  "api repos/o/r/immutable-releases"*) [ -z "${FAKE_IMMUTABLE_OFF:-}" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }; echo true ;;
+  "api repos/o/r/rules/branches/main"*) echo "${FAKE_CODE_OWNER_REVIEW:-true}" ;;
+  "api repos/o/r/immutable-releases"*) [ -z "${FAKE_IMMUTABLE_404:-}" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }; echo "${FAKE_IMMUTABLE:-true}" ;;
   "api repos/o/r"*) echo "${FAKE_ADMIN:-true}" ;;
   "release view"*)
     [ -z "${FAKE_RELEASE:-}" ] || exit 0
@@ -2581,10 +2636,21 @@ pf_class "gh without admin" "no admin rights" FAKE_ADMIN=false
 pf_class "ssh to GitHub as someone else" "did not say 'Hi anthonytw'" FAKE_SSH_USER=other
 pf_class "crates-io without the owner as reviewer" "catches: crates-io reviewers missing" FAKE_REVIEWERS=
 pf_class "crates-io preventing self-review" "prevents self-review" FAKE_SELF_REVIEW=true
-pf_class "no tag ruleset on v*" "no active tag ruleset" FAKE_RULESET_REF=refs/tags/x*
+pf_class "no tag ruleset at all" "no active tag ruleset in o/r covers every tag" FAKE_TAG_RULESET="refs/tags/x* 0 creation,deletion,update"
+pf_class "a tag ruleset on v* alone" "no active tag ruleset in o/r covers every tag" FAKE_TAG_RULESET="refs/tags/v* 0 creation,deletion,non_fast_forward,update"
+expect_pass "preflight: ...refs/tags/* counts as every tag" pfr FAKE_TAG_RULESET="refs/tags/* 0 creation,deletion,update"
+pf_class "a tag ruleset on every tag that lets anyone create one" "does not restrict all of creation, update and deletion" FAKE_TAG_RULESET="~ALL 0 deletion,non_fast_forward,update"
+pf_class "a tag ruleset on every tag with an exclude" "excludes some" FAKE_TAG_RULESET="~ALL 1 creation,deletion,update"
+pf_class "main without code-owner review" "do not require a code owner's review" FAKE_CODE_OWNER_REVIEW=false
+pf_class "main's rules unreadable" "cannot read the rules on main" FAKE_CODE_OWNER_REVIEW=oops
+pf_class "immutable releases off (an admin's 404) fails" "immutable releases are off in o/r" FAKE_IMMUTABLE_404=1
+pf_class "immutable releases off (enabled: false) fails" "immutable releases are off in o/r" FAKE_IMMUTABLE=false
+pfx "$PF" 0.9.0 --repo o/r --only immutable-releases > "$tmp/imm-on.log" 2>&1 && st=0 || st=$?
+expect_pass "preflight: the immutable-releases check passes when they are on" sh -c 'test "$1" = 0 && grep -q "ok    immutable-releases: releases are immutable" "$2"' sh "$st" "$tmp/imm-on.log"
+pfx FAKE_IMMUTABLE_404=1 FAKE_ADMIN=false "$PF" 0.9.0 --repo o/r --only immutable-releases > "$tmp/out.log" 2>&1 && st=0 || st=$?
+if [ "$st" = 1 ] && grep -q "FAIL  immutable-releases: cannot read whether releases are immutable" "$tmp/out.log" && grep -q "run the preflight from the owner seat" "$tmp/out.log"; then pass "preflight: a 404 to a token that is not an admin's is unreadable, not a pass (run from the owner seat)"; else flunk "preflight: a 404 to a token that is not an admin's is unreadable, not a pass (exit $st)"; sed 's/^/       | /' "$tmp/out.log" | tail -8; fi
 pf_class "a release that exists" "already has a release" FAKE_RELEASE=1
 if pfr FAKE_GH_DOWN=1 > "$tmp/out.log" 2>&1 && grep -q 'WARN  tag-free: could not ask GitHub whether a release' "$tmp/out.log"; then pass "preflight: a gh error is not read as no release (a warning)"; else flunk "preflight: a gh error is not read as no release (a warning)"; sed 's/^/       | /' "$tmp/out.log" | tail -8; fi
-if pfr FAKE_IMMUTABLE_OFF=1 > "$tmp/out.log" 2>&1 && grep -q 'WARN  tag-ruleset: immutable releases are off' "$tmp/out.log"; then pass "preflight: immutable releases off (404) is a warning"; else flunk "preflight: immutable releases off (404) is a warning"; sed 's/^/       | /' "$tmp/out.log" | tail -8; fi
 pf_class "a crates.io version that exists" "already on crates.io" FAKE_CRATES_CODE=200
 pf_class "Docker down on the Mac" "catches: Docker not started" FAKE_DOCKER_DOWN=1
 pf_class "...says how to start it" "open -a Docker" FAKE_DOCKER_DOWN=1

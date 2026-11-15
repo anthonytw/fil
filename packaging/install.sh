@@ -2,7 +2,7 @@
 # fil's installer (docs/user/install.md; docs/m4/release.md section 4.1). Published with every
 # release as fil-install.sh, which the release's SHA256SUMS lists and its owner signs.
 #
-#   curl -fsSL https://github.com/anthonytw/fil/releases/latest/download/fil-install.sh | sh
+#   curl -fsSL https://github.com/anthonytw/fil/releases/download/vX.Y.Z/fil-install.sh | sh -s -- --version X.Y.Z
 #   sh fil-install.sh [--version X.Y.Z] [--dir DIR] [--help]
 #
 # What it does, and nothing else:
@@ -25,7 +25,12 @@
 # Environment: FIL_VERSION (as --version), FIL_INSTALL_DIR (as --dir), FIL_RELEASE_URL (the
 # releases base, default https://github.com/anthonytw/fil/releases; a mirror or a local copy as
 # file:///path, laid out as GitHub's: latest/download/FILE and download/vX.Y.Z/FILE). Whatever the
-# URL, the signature is checked against the key below, which is the only thing trusted.
+# URL, what this script installs must verify against the key below. That proves who signed it, not
+# that it is the newest: without --version a mirror (or a release marked latest) can hand over any
+# older release the key signed, so name the version. And this script itself is checked by nothing
+# before `curl | sh` runs it: the one-liner's trust is GitHub's HTTPS and the repository's settings
+# (only the owner can create a tag or a release, and a published release never changes), which is
+# why the docs give it at a version (docs/m4/packaging.md section 8).
 #
 # Needs: sh, curl, ssh-keygen (OpenSSH 8.1 or later, for -Y verify), tar, gzip, and sha256sum or
 # shasum. Each is checked before anything is downloaded. (No wget: GNU wget's --https-only does not

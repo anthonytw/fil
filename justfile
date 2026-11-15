@@ -495,7 +495,11 @@ set-version version:
     perl -0pi -e 's/(\[workspace\.package\]\nversion = ")[^"]*"/${1}'"$v"'"/; s/(version = ")=[^"]*(")/${1}='"$v"'${2}/g' Cargo.toml
     cargo update -w --offline -q
     cargo update -w --offline -q --manifest-path tests/terminals/exporter/Cargo.toml
+    # The installer one-liner, at this version in both places (a tag's release-check requires it:
+    # installer_oneliner in tests/release/common.sh). A Markdown table writes its pipe as `\|`.
+    perl -pi -e 's{(releases/download/v)[0-9][0-9A-Za-z.-]*(/fil-install\.sh \\?\| sh -s -- --version )[0-9][0-9A-Za-z.-]*}{${1}'"$v"'${2}'"$v"'}g' README.md docs/user/install.md
     grep -nE '^version = |version = "=' Cargo.toml
+    grep -nF 'fil-install.sh' README.md docs/user/install.md | grep -F -- '--version'
 
 # The Homebrew formula for VERSION, from the release's SHA256SUMS: by default the copy that
 # `tests/release/just.sh release-verify VERSION` verified (and the owner signed). Writes OUT/homebrew/fil.rb, for the

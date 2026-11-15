@@ -15,9 +15,11 @@
 default-filter = "not test(/(^|::)wallclock_/) and not test(/(^|::)soak_/)"
 # Report every failure in one run; the run still fails on any.
 fail-fast = false
-# A test still running after 60 s is reported as slow (nothing is killed: the tests bound their
-# own waits, and fil-forward's run under FIL_FORWARD_TEST_LIMIT).
-slow-timeout = { period = "60s" }
+# A test still running after 60 s is reported as slow, and one still running after 5 periods
+# (300 s) is killed and fails, so a hung test fails in about 5 min instead of holding the job to
+# its timeout. The tests bound their own waits (fil-forward's under FIL_FORWARD_TEST_LIMIT) and no
+# smoke-size test comes near 300 s; the os profile inherits this.
+slow-timeout = { period = "60s", terminate-after = 5 }
 # Each test runs in a process of its own here, so the in-process locks some tests take (fil-forward's
 # `heavy()`, channel_churn's `serial()`, fwdprobe's port pick) no longer keep them apart. These
 # groups do instead; see the overrides.
@@ -81,4 +83,5 @@ and not test(/(^|::)wallclock_/) and not test(/(^|::)soak_/)
 # one test at a time (its full sizes use up ephemeral ports and listen queues).
 [profile.release]
 default-filter = "all()"
-slow-timeout = { period = "300s" }
+# Killed after 12 periods (an hour): the full-size soaks are long, but a hang still ends.
+slow-timeout = { period = "300s", terminate-after = 12 }

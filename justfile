@@ -73,8 +73,7 @@ ci-release-full:
     j=(just --justfile "{{source_file()}}" --working-directory "{{source_directory()}}")
     failed=()
     part() { echo "==== ci-release-full: $*"; "${j[@]}" "$@" || failed+=("$*"); }
-    # lint, not ci: ci's tests at smoke size are a subset of test-release's at full size.
-    part lint
+    part ci
     part release-test
     part test-release
     part ci-release

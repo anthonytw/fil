@@ -83,5 +83,7 @@ and not test(/(^|::)wallclock_/) and not test(/(^|::)soak_/)
 # one test at a time (its full sizes use up ephemeral ports and listen queues).
 [profile.release]
 default-filter = "all()"
-# Killed after 12 periods (an hour): the full-size soaks are long, but a hang still ends.
-slow-timeout = { period = "300s", terminate-after = 12 }
+# Killed after 13 periods (65 min): the full-size soaks are long, but a hang still ends. One period
+# past fil-forward's own 3600 s limit at full size (FIL_FORWARD_TEST_LIMIT), so its named failure
+# reports first.
+slow-timeout = { period = "300s", terminate-after = 13 }

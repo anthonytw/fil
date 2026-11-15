@@ -201,7 +201,7 @@ jobs:
       - name: Lint the release scripts (as release.yml does, so a warning shows up before a release)
         if: steps.relpaths.outputs.run == 'true'
         # --norc: no .shellcheckrc of the tree turns a check off; ubuntu-24.04's shellcheck is release.yml's
-        run: shellcheck --norc -x -S warning tests/release/*.sh tests/ci/release-paths.sh
+        run: shellcheck --norc -x -S warning tests/release/*.sh tests/ci/release-paths.sh tests/ci/test_release_paths.sh
       - name: The release scripts' own tests
         if: steps.relpaths.outputs.run == 'true'
         run: tests/release/just.sh release-test

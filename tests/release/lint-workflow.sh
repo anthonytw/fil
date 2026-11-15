@@ -34,11 +34,15 @@
 #      deny.toml (owned) bounds the unowned Cargo.lock on the release path itself.
 #  12. the digests between the jobs (tests/release/digest.sh; docs/m4/release.md section 9.1):
 #      `build-macos` records each attempt's universal binary (outputs sha256_a and sha256_b of its
-#      step `digest`); `package` builds the man pages (docs/man/build.sh runs unowned crate code)
-#      before it downloads any binary, checks both sets/*/universal-apple-darwin/fil against those
-#      outputs before tests/release/package.sh reads them, and records SHA256SUMS (output sums of
-#      its step `sums`); `publish` checks the downloaded SHA256SUMS against that output before it
-#      attests anything.
+#      step `digest`); a job `docs` runs docs/man/build.sh (unowned crate code, via cargo run) and
+#      records its tar (output docs of its step `docs`); `package` runs neither docs/man/build.sh
+#      nor `cargo run`, checks the docs tar against that output before it unpacks it, checks both
+#      sets/*/universal-apple-darwin/fil against build-macos's outputs before
+#      tests/release/package.sh reads them and both assemblies' macOS archives after it, and
+#      records SHA256SUMS (output sums of its step `sums`) after those checks and before any
+#      release-check that runs a binary (check.sh without --no-exec) or install-packages.sh;
+#      `publish` checks the downloaded SHA256SUMS against that output, and that out/ holds exactly
+#      the files it lists (digest.sh listed), before it attests anything.
 #
 # The check profile (--check): these workflows run on a dispatch, a pull request or a push of main,
 # and hold no secret.
@@ -236,24 +240,35 @@ awk '
       if (job == "prepare" && line ~ /(run:|^)[ ]*cargo deny --locked check( [a-z]+)+[ ]*$/ && line ~ / bans( |$)/ && line ~ / sources( |$)/) deny_seen = 1
       if (indent == 4 && line ~ /^    environment:/) { e = line; sub(/^    environment:[ ]*/, "", e); job_env[job] = e }
       # rule 12: where the digests are recorded and checked (first line of each, per job)
-      if (line ~ /actions\/download-artifact@/ && !first_dl[job]) first_dl[job] = NR
       if (line ~ /actions\/attest-build-provenance@/ && !first_attest[job]) first_attest[job] = NR
       if (line ~ /docs\/man\/build\.sh/ && !first_docs[job]) first_docs[job] = NR
+      if (line ~ /cargo[ ]+run/ && !first_cargo_run[job]) first_cargo_run[job] = NR
       if (line ~ /tests\/release\/package\.sh/ && !first_pkg[job]) first_pkg[job] = NR
+      if (line ~ /tests\/release\/check\.sh/ && line !~ /--no-exec/ && !first_exec_check[job]) first_exec_check[job] = NR
+      if (line ~ /tests\/release\/install-packages\.sh/ && !first_instpkg[job]) first_instpkg[job] = NR
+      if (line ~ /tar[ ]+-x[a-z]*f[ ]+docs-in\/docs\.tar/ && !first_docs_untar[job]) first_docs_untar[job] = NR
       t = line; sub(/^ */, "", t)
       if (t ~ /^sha256_a: \$\{\{ steps\.digest\.outputs\.sha256_a \}\}$/) d12[job, "out_a"] = NR
       if (t ~ /^sha256_b: \$\{\{ steps\.digest\.outputs\.sha256_b \}\}$/) d12[job, "out_b"] = NR
       if (t ~ /^id: digest$/) d12[job, "id_digest"] = NR
       if (t ~ /^run: tests\/release\/digest\.sh out "sha256_\$ATTEMPT" out\/universal-apple-darwin\/fil$/) d12[job, "emit_mac"] = NR
+      if (t ~ /^docs: \$\{\{ steps\.docs\.outputs\.docs \}\}$/) d12[job, "out_docs"] = NR
+      if (t ~ /^id: docs$/) d12[job, "id_docs"] = NR
+      if (t ~ /^run: tests\/release\/digest\.sh out docs docs-tar\/docs\.tar$/) d12[job, "emit_docs"] = NR
+      if (t ~ /^DOCS_SHA256: \$\{\{ needs\.docs\.outputs\.docs \}\}$/) d12[job, "env_docs"] = NR
+      if (t ~ /^tests\/release\/digest\.sh check "\$DOCS_SHA256" docs-in\/docs\.tar$/ && !d12[job, "check_docs"]) d12[job, "check_docs"] = NR
       if (t ~ /^MACOS_SHA256_A: \$\{\{ needs\.build-macos\.outputs\.sha256_a \}\}$/) d12[job, "env_a"] = NR
       if (t ~ /^MACOS_SHA256_B: \$\{\{ needs\.build-macos\.outputs\.sha256_b \}\}$/) d12[job, "env_b"] = NR
       if (t ~ /^tests\/release\/digest\.sh check "\$MACOS_SHA256_A" sets\/a\/universal-apple-darwin\/fil$/ && !d12[job, "check_a"]) d12[job, "check_a"] = NR
       if (t ~ /^tests\/release\/digest\.sh check "\$MACOS_SHA256_B" sets\/b\/universal-apple-darwin\/fil$/ && !d12[job, "check_b"]) d12[job, "check_b"] = NR
+      if (t ~ /^tests\/release\/digest\.sh check-tar "\$MACOS_SHA256_A" out\/fil-\*-universal-apple-darwin\.tar\.gz /) d12[job, "tar_a"] = NR
+      if (t ~ /^tests\/release\/digest\.sh check-tar "\$MACOS_SHA256_B" out-b\/fil-\*-universal-apple-darwin\.tar\.gz /) d12[job, "tar_b"] = NR
       if (t ~ /^sums: \$\{\{ steps\.sums\.outputs\.sums \}\}$/) d12[job, "out_sums"] = NR
       if (t ~ /^id: sums$/) d12[job, "id_sums"] = NR
       if (t ~ /^run: tests\/release\/digest\.sh out sums out\/SHA256SUMS$/) d12[job, "emit_sums"] = NR
       if (t ~ /^SUMS_SHA256: \$\{\{ needs\.package\.outputs\.sums \}\}$/) d12[job, "env_sums"] = NR
       if (t ~ /^tests\/release\/digest\.sh check "\$SUMS_SHA256" out\/SHA256SUMS$/ && !d12[job, "check_sums"]) d12[job, "check_sums"] = NR
+      if (t ~ /^tests\/release\/digest\.sh listed out$/ && !d12[job, "listed"]) d12[job, "listed"] = NR
     }
     # whole-file rules
     if (line ~ /uses:/) {
@@ -289,18 +304,33 @@ awk '
     # rule 12
     if (!d12["build-macos", "out_a"] || !d12["build-macos", "out_b"] || !d12["build-macos", "id_digest"] || !d12["build-macos", "emit_mac"])
       bad("build-macos does not record its binary digest (outputs sha256_a and sha256_b from the step id: digest that runs tests/release/digest.sh out)")
-    if (!first_docs["package"] || !first_dl["package"] || first_docs["package"] > first_dl["package"])
-      bad("package does not build the man pages (docs/man/build.sh, unowned code) before it downloads the binaries")
+    if (!("docs" in jobs) || !first_docs["docs"] || !d12["docs", "out_docs"] || !d12["docs", "id_docs"] || !d12["docs", "emit_docs"])
+      bad("no job docs that runs docs/man/build.sh and records its tar (output docs from the step id: docs that runs tests/release/digest.sh out docs docs-tar/docs.tar)")
+    if (first_docs["package"] || first_cargo_run["package"])
+      bad("package runs docs/man/build.sh or cargo run (unowned crate code beside the release files; the docs job builds the docs)")
+    if (!d12["package", "env_docs"] || !d12["package", "check_docs"] || !first_docs_untar["package"] || d12["package", "check_docs"] > first_docs_untar["package"])
+      bad("package does not check the docs tar against the docs job output docs before it unpacks it (tests/release/digest.sh check)")
     if (!d12["package", "env_a"] || !d12["package", "env_b"] || !d12["package", "check_a"] || !d12["package", "check_b"])
       bad("package does not check both macOS binaries against build-macos outputs sha256_a and sha256_b (tests/release/digest.sh check)")
     else if (!first_pkg["package"] || d12["package", "check_a"] > first_pkg["package"] || d12["package", "check_b"] > first_pkg["package"])
       bad("package checks the macOS binaries after tests/release/package.sh reads them, not before")
+    if (!d12["package", "tar_a"] || !d12["package", "tar_b"] || d12["package", "tar_a"] < first_pkg["package"] || d12["package", "tar_b"] < first_pkg["package"])
+      bad("package does not check the macOS archives of both assemblies after tests/release/package.sh (tests/release/digest.sh check-tar)")
     if (!d12["package", "out_sums"] || !d12["package", "id_sums"] || !d12["package", "emit_sums"])
       bad("package does not record SHA256SUMS (output sums from the step id: sums that runs tests/release/digest.sh out sums out/SHA256SUMS)")
+    else {
+      e = d12["package", "emit_sums"]
+      if (e < d12["package", "tar_a"] || e < d12["package", "tar_b"] || e < first_pkg["package"])
+        bad("package records SHA256SUMS before its macOS archives are checked")
+      if ((first_exec_check["package"] && first_exec_check["package"] < e) || (first_instpkg["package"] && first_instpkg["package"] < e))
+        bad("package records SHA256SUMS after a step that runs a release binary (check.sh without --no-exec, or install-packages.sh): record it first")
+    }
     if (!d12["publish", "env_sums"] || !d12["publish", "check_sums"])
       bad("publish does not check SHA256SUMS against the package job output sums (tests/release/digest.sh check)")
     else if (!first_attest["publish"] || d12["publish", "check_sums"] > first_attest["publish"])
       bad("publish checks SHA256SUMS after it attests, not before")
+    if (!d12["publish", "listed"] || !first_attest["publish"] || d12["publish", "listed"] > first_attest["publish"])
+      bad("publish does not require, before it attests, that out/ holds exactly SHA256SUMS and the files it lists (tests/release/digest.sh listed out)")
     exit fails ? 1 : 0
   }
 ' "$wf"

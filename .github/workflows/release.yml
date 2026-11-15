@@ -118,8 +118,8 @@ jobs:
     # runs where nothing it writes ($GITHUB_ENV, $GITHUB_PATH, the workspace) reaches an owned step
     # of another job. publish waits for it. An artifact is no barrier: a step that gets hold of the
     # runner's token can replace one of the same name. What publish attests is held instead to the
-    # SHA256SUMS digest that package recorded as a job output, which no other job can change
-    # (tests/release/digest.sh).
+    # SHA256SUMS digest that package recorded as a job output, which no other job can change, and to
+    # exactly the files that SHA256SUMS lists (tests/release/digest.sh).
     needs: package
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -137,6 +137,51 @@ jobs:
           tool: just@1.59.0
       - name: The release scripts' own tests (workflow lint, tag signers, release-check)
         run: tests/release/just.sh release-test
+
+  docs:
+    # The man pages, completions and example configs (docs/man/build.sh), in a job of their own:
+    # build.sh runs `cargo run --example gen_docs`, crate code without a code owner (with every build
+    # script of its graph), which must not run on the runner that assembles the release. The tree
+    # goes to package as one tar whose SHA-256 is this job's output, which package checks before it
+    # unpacks it. The tree itself is the tree's own work (its text and completions come from the
+    # unowned crates by design); what this keeps out is that code running beside the binaries.
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      docs: ${{ steps.docs.outputs.docs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Man pages, completions and example configs (docs/man/build.sh; pandoc is a pinned build tool, not a dependency)
+        run: |
+          docs/man/install-pandoc.sh "$RUNNER_TEMP/pandoc"
+          # Twice: the generated files must not depend on the run.
+          PATH="$RUNNER_TEMP/pandoc/bin:$PATH" docs/man/build.sh docs-out
+          PATH="$RUNNER_TEMP/pandoc/bin:$PATH" docs/man/build.sh docs-out-b
+          diff -r docs-out docs-out-b
+      - name: One deterministic tar of the tree
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.epoch }}
+        run: |
+          set -euo pipefail
+          mkdir -p docs-tar
+          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner --format=gnu \
+            -cf docs-tar/docs.tar -C docs-out .
+      - name: The tar's SHA-256, as a job output
+        id: docs
+        run: tests/release/digest.sh out docs docs-tar/docs.tar
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docs
+          path: docs-tar/
+          if-no-files-found: error
+          retention-days: 14
 
   build-linux:
     needs: prepare
@@ -221,12 +266,15 @@ jobs:
           retention-days: 14
 
   package:
-    needs: [prepare, build-linux, build-macos]
+    needs: [prepare, docs, build-linux, build-macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
-    # The SHA-256 of the SHA256SUMS that release-check passed, which publish checks before it attests.
+    # The SHA-256 of SHA256SUMS, recorded right after the files are assembled and their macOS
+    # binaries checked, before anything from out/ is run; publish checks it before it attests. This
+    # job runs no code of the tree's without a code owner before that point: the docs come from the
+    # docs job, checked by its digest.
     outputs:
       sums: ${{ steps.sums.outputs.sums }}
     steps:
@@ -239,16 +287,19 @@ jobs:
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: just@1.59.0
-      # Before the binaries are downloaded: docs/man/build.sh runs gen_docs, crate code without a code
-      # owner (with every build script of its graph), which must never run while a binary that ships
-      # is on this runner to change.
-      - name: Man pages, completions and example configs (docs/man/build.sh; pandoc is a pinned build tool, not a dependency)
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: docs
+          path: docs-in
+      - name: The docs job's tree, checked by its digest, unpacked once for each assembly
+        env:
+          DOCS_SHA256: ${{ needs.docs.outputs.docs }}
         run: |
-          docs/man/install-pandoc.sh "$RUNNER_TEMP/pandoc"
-          # Twice, one tree for each assembly below: the generated files must not depend on the run.
-          PATH="$RUNNER_TEMP/pandoc/bin:$PATH" docs/man/build.sh docs-out
-          PATH="$RUNNER_TEMP/pandoc/bin:$PATH" docs/man/build.sh docs-out-b
-          diff -r docs-out docs-out-b
+          set -euo pipefail
+          tests/release/digest.sh check "$DOCS_SHA256" docs-in/docs.tar
+          mkdir docs-out docs-out-b
+          tar -xf docs-in/docs.tar -C docs-out
+          tar -xf docs-in/docs.tar -C docs-out-b
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: bin-*
@@ -306,6 +357,11 @@ jobs:
           # ...and the ones the macOS archives hold
           tests/release/digest.sh check-tar "$MACOS_SHA256_A" out/fil-*-universal-apple-darwin.tar.gz out/fil-*-universal-apple-darwin.ci.tar.gz
           tests/release/digest.sh check-tar "$MACOS_SHA256_B" out-b/fil-*-universal-apple-darwin.tar.gz out-b/fil-*-universal-apple-darwin.ci.tar.gz
+      # Before release-check, which runs the x86_64 fil from out/: from here on a change to out/
+      # fails publish's check.
+      - name: SHA256SUMS's SHA-256, as a job output
+        id: sums
+        run: tests/release/digest.sh out sums out/SHA256SUMS
       - name: Release check (a tag push also needs the complete layout, the changelog and the tag)
         env:
           RELEASE: ${{ needs.prepare.outputs.release }}
@@ -318,9 +374,6 @@ jobs:
           fi
       - name: The amd64 .deb and .rpm install, run and remove cleanly (Debian and Fedora containers)
         run: tests/release/install-packages.sh --arch amd64 out
-      - name: SHA256SUMS's SHA-256, as a job output
-        id: sums
-        run: tests/release/digest.sh out sums out/SHA256SUMS
       - name: Summary
         run: |
           {
@@ -431,9 +484,11 @@ jobs:
           SUMS_SHA256: ${{ needs.package.outputs.sums }}
         run: |
           set -euo pipefail
-          # SHA256SUMS is package's (its output, which no other job can change), and it lists each file
+          # SHA256SUMS is package's (its output, which no other job can change), it lists each file,
+          # and out/ holds exactly those files and SHA256SUMS: nothing else gets attested
           tests/release/digest.sh check "$SUMS_SHA256" out/SHA256SUMS
           (cd out && sha256sum -c SHA256SUMS)
+          tests/release/digest.sh listed out
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |

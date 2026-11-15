@@ -190,22 +190,31 @@ INSTALLER_DOCS="README.md docs/user/install.md"
 installer_oneliner() {
   printf 'curl -fsSL https://github.com/anthonytw/fil/releases/download/v%s/%s | sh -s -- --version %s' "$1" "$INSTALLER_NAME" "$1"
 }
+# The download-read-run form's download line, as docs/user/install.md gives it (<version> literal).
+INSTALLER_READFIRST='curl -fsSLO https://github.com/anthonytw/fil/releases/download/v<version>/fil-install.sh'
 # doc_oneliner_problems FILE VERSION: what is wrong with how FILE gives the installer one-liner, one
-# problem a line (nothing when it is right): it must give installer_oneliner VERSION at least once,
-# pipe the installer to a shell in no other form, and never name releases/latest. A Markdown table's
-# `\|` counts as `|`.
+# problem a line (nothing when it is right). FILE must give installer_oneliner VERSION at least once
+# and never name releases/latest. Every line that names the installer or the releases must give it
+# only as that exact line, or as `ONE-LINER` in backticks (closed right after it), or be the
+# download line of the download-read-run form; what else is on such a line may not run anything
+# (no curl or wget command, no pipe into a shell, no sh -c or $(...), no continuation). So a suffix
+# (another --version, a -rc), a second command (; ... | sh) and a second one-liner at another
+# version all fail. A Markdown table's `\|` counts as `|`.
 doc_oneliner_problems() {
-  local f=$1 want line rest n=0
+  local f=$1 want line rest n=0 runs='curl[[:space:]]|wget[[:space:]]|[|][[:space:]]*(env[[:space:]]+)?([a-z]*sh|sudo)([[:space:]]|$|`)|sh[[:space:]]+-c|[$][(]|\\$'
   [ -f "$f" ] || { echo "it is missing"; return 0; }
   want=$(installer_oneliner "$2")
   ! grep -q 'releases/latest' "$f" || echo "it names releases/latest"
   while IFS= read -r line || [ -n "$line" ]; do
     line=${line//\\|/|}
-    rest=${line//"$want"/}
+    if [ "$line" = "$want" ]; then n=$((n + 1)); continue; fi
+    [ "$line" = "$INSTALLER_READFIRST" ] && continue
+    case $line in *"$INSTALLER_NAME"* | *"github.com/anthonytw/fil/releases"*) ;; *) continue ;; esac
+    rest=${line//"\`$want\`"/}
     [ "$rest" = "$line" ] || n=$((n + 1))
-    case $rest in
-      *"$INSTALLER_NAME"*"|"*sh*) echo "it pipes $INSTALLER_NAME to a shell in another form: $(printf '%s' "$line" | head -c 200)" ;;
-    esac
+    if [[ $rest =~ $runs ]]; then
+      echo "it gives $INSTALLER_NAME in another form (only the exact one-liner, or the download-read-run form): $(printf '%s' "$line" | head -c 200)"
+    fi
   done < "$f"
   [ "$n" -gt 0 ] || echo "it does not give '$want'"
 }

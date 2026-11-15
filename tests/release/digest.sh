@@ -8,6 +8,8 @@
 #   digest.sh out NAME FILE          append NAME=<SHA-256 of FILE> to $GITHUB_OUTPUT (and print it)
 #   digest.sh check WANT FILE...     every FILE has SHA-256 WANT (64 lowercase hex), else fail
 #   digest.sh check-tar WANT TGZ...  the one TOP/bin/fil inside each .tar.gz has SHA-256 WANT
+#   digest.sh listed DIR             DIR holds exactly SHA256SUMS and the files it lists (regular
+#                                    files), so nothing unlisted is attested or uploaded
 #
 # Exit status 0 only if every check passed.
 set -euo pipefail
@@ -57,5 +59,17 @@ case $cmd in
       echo "digest: $a's $members is $want, as recorded" >&2
     done
     ;;
-  *) die "usage: digest.sh out NAME FILE | check WANT FILE... | check-tar WANT TGZ..." ;;
+  listed)
+    [ $# = 1 ] || die "usage: digest.sh listed DIR"
+    dir=$1
+    [ -f "$dir/SHA256SUMS" ] || die "digest: no $dir/SHA256SUMS"
+    want=$({ echo SHA256SUMS; awk '{ print $2 }' "$dir/SHA256SUMS"; } | LC_ALL=C sort)
+    have=$(cd "$dir" && LC_ALL=C ls -A | LC_ALL=C sort)
+    [ "$have" = "$want" ] || die "digest: $dir holds other files than SHA256SUMS and the files it lists: has '$(printf '%s' "$have" | tr '\n' ' ')', lists '$(printf '%s' "$want" | tr '\n' ' ')'"
+    for f in $have; do
+      [ -f "$dir/$f" ] && [ ! -L "$dir/$f" ] || die "digest: $dir/$f is not a regular file"
+    done
+    echo "digest: $dir holds exactly SHA256SUMS and the $(($(printf '%s\n' "$want" | wc -l) - 1)) files it lists" >&2
+    ;;
+  *) die "usage: digest.sh out NAME FILE | check WANT FILE... | check-tar WANT TGZ... | listed DIR" ;;
 esac

@@ -199,13 +199,20 @@ mutate_wf "the lock's check moved out of prepare" 's/      - name: The lock.s so
 # rule 12: the digests between the jobs
 mutate_wf "build-macos records no digest" 's/      - name: The universal binary.s SHA-256, as a job output\n        id: digest\n[^\n]*\n[^\n]*\n[^\n]*\n//'
 mutate_wf "build-macos loses an output" 's/      sha256_b: \$\{\{ steps.digest.outputs.sha256_b \}\}\n//'
-mutate_wf "package builds the man pages after downloading the binaries" 's/(      # Before the binaries are downloaded:.*?diff -r docs-out docs-out-b\n)(      - uses: actions\/download-artifact\@[0-9a-f]{40} # v8.0.2\n        with:\n          pattern: bin-\*\n          path: in\n)/$2$1/s'
+mutate_wf "no docs job (the docs tar is not recorded)" 's/        id: docs\n        run: tests\/release\/digest.sh out docs docs-tar\/docs.tar\n/        run: sha256sum docs-tar\/docs.tar\n/'
+mutate_wf "package builds the docs itself again" 's/(          tar -xf docs-in\/docs.tar -C docs-out-b\n)/$1          docs\/man\/build.sh docs-out\n/'
+mutate_wf "package runs cargo run" 's/(            cargo --version\n)/$1            cargo run --locked -p fil-shell --example gen_docs -- --help\n/'
+mutate_wf "package unpacks the docs before checking them" 's/(          tests\/release\/digest.sh check "\$DOCS_SHA256" docs-in\/docs.tar\n)(          mkdir docs-out docs-out-b\n          tar -xf docs-in\/docs.tar -C docs-out\n)/$2$1/'
+mutate_wf "package no longer checks the docs tar" 's/          tests\/release\/digest.sh check "\$DOCS_SHA256" docs-in\/docs.tar\n//'
+mutate_wf "package records SHA256SUMS after release-check runs the binary" 's/(      # Before release-check, which runs[^\n]*\n[^\n]*\n      - name: SHA256SUMS.s SHA-256, as a job output\n        id: sums\n        run: tests\/release\/digest.sh out sums out\/SHA256SUMS\n)(.*?)(      - name: The amd64 .deb and .rpm install)/$2$1$3/s'
+mutate_wf "package no longer checks the macOS archive of assembly b" 's/          tests\/release\/digest.sh check-tar "\$MACOS_SHA256_B" out-b\/[^\n]*\n//'
+mutate_wf "publish no longer requires exactly the listed files" 's/          tests\/release\/digest.sh listed out\n//'
 mutate_wf "package does not check macOS binary b" 's/          tests\/release\/digest.sh check "\$MACOS_SHA256_B" sets\/b\/universal-apple-darwin\/fil\n//'
 mutate_wf "package checks the macOS binaries after package.sh" 's/(          tests\/release\/digest.sh check "\$MACOS_SHA256_A" sets\/a\/universal-apple-darwin\/fil\n)(.*?tests\/release\/package.sh --bins sets\/b[^\n]*\n)/$2$1/s'
 mutate_wf "package checks against another output" 's/(MACOS_SHA256_A: \$\{\{ needs.build-macos.outputs.)sha256_a/${1}sha256_b/'
 mutate_wf "package records no SHA256SUMS digest" 's/        run: tests\/release\/digest.sh out sums out\/SHA256SUMS\n/        run: sha256sum out\/SHA256SUMS\n/'
 mutate_wf "publish checks SHA256SUMS against itself only" 's/          tests\/release\/digest.sh check "\$SUMS_SHA256" out\/SHA256SUMS\n//'
-mutate_wf "publish checks SHA256SUMS after attesting" 's/(      - name: The files are the ones that were checked\n.*?\(cd out && sha256sum -c SHA256SUMS\)\n)(      - uses: actions\/attest-build-provenance\@[0-9a-f]{40} # v4.2.2\n        with:\n          subject-path: \|\n(?:            [^\n]*\n)+)/$2$1/s'
+mutate_wf "publish checks SHA256SUMS after attesting" 's/(      - name: The files are the ones that were checked\n.*?          tests\/release\/digest.sh listed out\n)(      - uses: actions\/attest-build-provenance\@[0-9a-f]{40} # v4.2.2\n        with:\n          subject-path: \|\n(?:            [^\n]*\n)+)/$2$1/s'
 # digest.sh, the checks those steps run
 dg=$tmp/digest
 mkdir -p "$dg/a/top/bin"
@@ -220,6 +227,15 @@ expect_pass "digest.sh: check-tar passes the archive's bin/fil" "$RELEASE_DIR/di
 echo swapped > "$dg/a/top/bin/fil"
 (cd "$dg/a" && tar -czf "$dg/b.tar.gz" top)
 expect_fail "digest.sh: check-tar fails a swapped bin/fil" "$RELEASE_DIR/digest.sh" check-tar "$dsum" "$dg/b.tar.gz"
+mkdir -p "$dg/rel"
+printf 'x\n' > "$dg/rel/a.tar.gz"
+printf 'y\n' > "$dg/rel/fil-install.sh"
+(cd "$dg/rel" && sha256sum a.tar.gz fil-install.sh > SHA256SUMS 2> /dev/null || shasum -a 256 a.tar.gz fil-install.sh > SHA256SUMS)
+expect_pass "digest.sh: listed passes SHA256SUMS and exactly its files" "$RELEASE_DIR/digest.sh" listed "$dg/rel"
+printf 'z\n' > "$dg/rel/fil-1.0.0-x86_64-linux-gnu.tar.gz"
+expect_fail "digest.sh: listed fails an unlisted file" "$RELEASE_DIR/digest.sh" listed "$dg/rel"
+rm "$dg/rel/fil-1.0.0-x86_64-linux-gnu.tar.gz" "$dg/rel/fil-install.sh"
+expect_fail "digest.sh: listed fails a listed file that is missing" "$RELEASE_DIR/digest.sh" listed "$dg/rel"
 # --locked: scripts in a copy of the directory
 mkdir -p "$tmp/scripts"
 cp "$RELEASE_DIR"/*.sh "$tmp/scripts/"
@@ -731,10 +747,16 @@ doc_case() {
   else flunk "release-check: $1 (failed, but not with '$2')"; sed 's/^/       | /' "$tmp/out.log" | tail -5; fi
   cp "$tmp/doc.keep" "$tree/$3"
 }
-doc_case "the README's one-liner at another version" "README.md: it pipes fil-install.sh to a shell in another form" README.md 's{download/v0\.9\.0/}{download/v0.8.0/}'
-doc_case "the README's one-liner without --version" "README.md: it pipes fil-install.sh to a shell in another form" README.md 's{ -s -- --version 0\.9\.0}{}'
+doc_case "the README's one-liner at another version" "README.md: it gives fil-install.sh in another form" README.md 's{download/v0\.9\.0/}{download/v0.8.0/}'
+doc_case "the README's one-liner without --version" "README.md: it gives fil-install.sh in another form" README.md 's{ -s -- --version 0\.9\.0}{}'
 doc_case "install.md's one-liner at releases/latest" "docs/user/install.md: it names releases/latest" docs/user/install.md 's{releases/download/v0\.9\.0/}{releases/latest/download/} if /^curl -fsSL/'
 doc_case "install.md without the one-liner" "docs/user/install.md: it does not give" docs/user/install.md '$_ = "" if /fil-install\.sh \\?\| sh/'
+doc_case "a second --version after the one-liner" "docs/user/install.md: it gives fil-install.sh in another form" docs/user/install.md 's{(--version 0\.9\.0)$}{$1 --version 0.8.0} if /^curl -fsSL/'
+doc_case "a pre-release suffix on the README's one-liner" "README.md: it gives fil-install.sh in another form" README.md 's{--version 0\.9\.0`}{--version 0.9.0-rc1`}'
+doc_case "another command after the one-liner (; ... | sh)" "docs/user/install.md: it gives fil-install.sh in another form" docs/user/install.md 's{(--version 0\.9\.0)$}{$1; curl -fsSL https://example.invalid/x | sh} if /^curl -fsSL/'
+doc_case "another command beside the README's one-liner" "README.md: it gives fil-install.sh in another form" README.md 's{(--version 0\.9\.0`)}{$1; `curl https://example.invalid/x | sh`}'
+doc_case "a second line piping the installer at another version" "docs/user/install.md: it gives fil-install.sh in another form" docs/user/install.md '$_ .= "curl -fsSL https://github.com/anthonytw/fil/releases/download/v0.8.0/fil-install.sh | sh -s -- --version 0.8.0\n" if /^curl -fsSL/'
+doc_case "the installer run through sh -c and \$(...)" "docs/user/install.md: it gives fil-install.sh in another form" docs/user/install.md '$_ .= "sh -c \"\$(curl -fsSL https://github.com/anthonytw/fil/releases/download/v0.8.0/fil-install.sh)\"\n" if /^curl -fsSL/'
 mv "$tree/docs/user/install.md" "$tmp/doc.keep"
 if check --tag v0.9.0 --no-tree "$rel" > "$tmp/out.log" 2>&1; then flunk "release-check: no docs/user/install.md fails"; elif grep -qF "docs/user/install.md: it is missing" "$tmp/out.log"; then pass "release-check: no docs/user/install.md fails"; else flunk "release-check: no docs/user/install.md fails (not saying so)"; fi
 mv "$tmp/doc.keep" "$tree/docs/user/install.md"
@@ -2352,13 +2374,14 @@ cat > "$pf/bin/gh" << 'EOF2'
 echo "$*" >> "$FAKE_GH_LOG"
 case "$*" in
   --version) echo "gh version 2.0 (stub)" ;;
+  "api users/anthonytw"*) echo 42 ;;
   "api user"*) echo "${FAKE_GH_USER-anthonytw}" ;;
   "api repos/o/r/environments/crates-io/deployment-branch-policies"*) echo "tag:v*" ;;
   "api repos/o/r/environments/crates-io"*prevent_self_review*) echo "${FAKE_SELF_REVIEW:-false}" ;;
   "api repos/o/r/environments/crates-io"*) echo "${FAKE_REVIEWERS-anthonytw}" ;;
-  "api repos/o/r/rulesets/7"*) echo "${FAKE_TAG_RULESET-~ALL 0 creation,deletion,non_fast_forward,update}" ;;
-  "api repos/o/r/rulesets"*) echo 7 ;;
-  "api repos/o/r/rules/branches/main"*) echo "${FAKE_CODE_OWNER_REVIEW:-true}" ;;
+  "api repos/o/r/rulesets/7"*) echo "${FAKE_TAG_RULESET-~ALL 0 creation,deletion,non_fast_forward,update active RepositoryRole:5}" ;;
+  "api repos/o/r/rulesets/8"*) echo "${FAKE_MAIN_RULESET-~DEFAULT_BRANCH 0 active true true false User:42}" ;;
+  "api repos/o/r/rulesets"*) [ -n "${FAKE_NO_RULESETS:-}" ] || printf '7 tag\n8 branch\n' ;;
   "api repos/o/r/immutable-releases"*) [ -z "${FAKE_IMMUTABLE_404:-}" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }; echo "${FAKE_IMMUTABLE:-true}" ;;
   "api repos/o/r"*) echo "${FAKE_ADMIN:-true}" ;;
   "release view"*)
@@ -2636,13 +2659,26 @@ pf_class "gh without admin" "no admin rights" FAKE_ADMIN=false
 pf_class "ssh to GitHub as someone else" "did not say 'Hi anthonytw'" FAKE_SSH_USER=other
 pf_class "crates-io without the owner as reviewer" "catches: crates-io reviewers missing" FAKE_REVIEWERS=
 pf_class "crates-io preventing self-review" "prevents self-review" FAKE_SELF_REVIEW=true
-pf_class "no tag ruleset at all" "no active tag ruleset in o/r covers every tag" FAKE_TAG_RULESET="refs/tags/x* 0 creation,deletion,update"
-pf_class "a tag ruleset on v* alone" "no active tag ruleset in o/r covers every tag" FAKE_TAG_RULESET="refs/tags/v* 0 creation,deletion,non_fast_forward,update"
-expect_pass "preflight: ...refs/tags/* counts as every tag" pfr FAKE_TAG_RULESET="refs/tags/* 0 creation,deletion,update"
-pf_class "a tag ruleset on every tag that lets anyone create one" "does not restrict all of creation, update and deletion" FAKE_TAG_RULESET="~ALL 0 deletion,non_fast_forward,update"
-pf_class "a tag ruleset on every tag with an exclude" "excludes some" FAKE_TAG_RULESET="~ALL 1 creation,deletion,update"
-pf_class "main without code-owner review" "do not require a code owner's review" FAKE_CODE_OWNER_REVIEW=false
-pf_class "main's rules unreadable" "cannot read the rules on main" FAKE_CODE_OWNER_REVIEW=oops
+pf_class "no tag ruleset at all" "no active tag ruleset in o/r covers every tag" FAKE_TAG_RULESET="refs/tags/x* 0 creation,deletion,update active RepositoryRole:5"
+pf_class "a tag ruleset on v* alone" "no active tag ruleset in o/r covers every tag" FAKE_TAG_RULESET="refs/tags/v* 0 creation,deletion,non_fast_forward,update active RepositoryRole:5"
+pf_class "a tag ruleset on refs/tags/* (its * does not match a /)" "no active tag ruleset in o/r covers every tag" FAKE_TAG_RULESET="refs/tags/* 0 creation,deletion,update active RepositoryRole:5"
+pf_class "a tag ruleset on every tag that lets anyone create one" "does not restrict all of creation, update and deletion" FAKE_TAG_RULESET="~ALL 0 deletion,non_fast_forward,update active RepositoryRole:5"
+pf_class "a tag ruleset on every tag with an exclude" "excludes some" FAKE_TAG_RULESET="~ALL 1 creation,deletion,update active RepositoryRole:5"
+pf_class "a tag ruleset in evaluate mode" "is not active (enforcement 'evaluate')" FAKE_TAG_RULESET="~ALL 0 creation,deletion,update evaluate RepositoryRole:5"
+pf_class "a tag ruleset the write role bypasses" "lets RepositoryRole:4 bypass it" FAKE_TAG_RULESET="~ALL 0 creation,deletion,update active RepositoryRole:5,RepositoryRole:4"
+pf_class "a tag ruleset an app bypasses" "lets Integration:99 bypass it" FAKE_TAG_RULESET="~ALL 0 creation,deletion,update active Integration:99"
+pf_class "a tag ruleset another user bypasses" "lets User:7 bypass it" FAKE_TAG_RULESET="~ALL 0 creation,deletion,update active User:7"
+pf_class "a tag ruleset whose bypass list cannot be read" "cannot be read (GitHub shows it to an admin only): run as the owner" FAKE_TAG_RULESET="~ALL 0 creation,deletion,update active unreadable"
+expect_pass "preflight: ...an empty bypass list passes" pfr FAKE_TAG_RULESET="~ALL 0 creation,deletion,update active none"
+pf_class "main without code-owner review" "does not require a code owner's review" FAKE_MAIN_RULESET="~DEFAULT_BRANCH 0 active false true false User:42"
+pf_class "main keeping an approval across a push" "require_last_push_approval" FAKE_MAIN_RULESET="~DEFAULT_BRANCH 0 active true false false User:42"
+pfr FAKE_MAIN_RULESET="~DEFAULT_BRANCH 0 active true false false User:42" > "$tmp/main-push.log" 2>&1 || true
+expect_pass "preflight: ...naming both settings" sh -c 'grep -q "Require approval of the most recent reviewable push" "$1" && grep -q "dismiss_stale_reviews_on_push" "$1"' sh "$tmp/main-push.log"
+expect_pass "preflight: ...dismissing stale reviews instead passes" pfr FAKE_MAIN_RULESET="refs/heads/main 0 active true false true RepositoryRole:5"
+pf_class "main's ruleset in evaluate mode" "is not active (enforcement 'evaluate')" FAKE_MAIN_RULESET="~DEFAULT_BRANCH 0 evaluate true true false User:42"
+pf_class "main's ruleset that a deploy key bypasses" "lets DeployKey:none bypass it" FAKE_MAIN_RULESET="~DEFAULT_BRANCH 0 active true true false DeployKey:none"
+pf_class "main's ruleset whose bypass list cannot be read" "run as the owner" FAKE_MAIN_RULESET="~DEFAULT_BRANCH 0 active true true false unreadable"
+pf_class "no ruleset on main" "no active branch ruleset in o/r applies to main" FAKE_MAIN_RULESET="refs/heads/dev 0 active true true false User:42"
 pf_class "immutable releases off (an admin's 404) fails" "immutable releases are off in o/r" FAKE_IMMUTABLE_404=1
 pf_class "immutable releases off (enabled: false) fails" "immutable releases are off in o/r" FAKE_IMMUTABLE=false
 pfx "$PF" 0.9.0 --repo o/r --only immutable-releases > "$tmp/imm-on.log" 2>&1 && st=0 || st=$?

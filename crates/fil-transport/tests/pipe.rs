@@ -1372,6 +1372,82 @@ async fn own_process_group_puts_the_command_in_a_group_of_its_own() {
     assert!(!child.is_empty());
 }
 
+/// A tunnel (`fil -N`) keeps the terminal cooked, in one foreground group with the command, so
+/// the terminal's `^C` and hangup reach both. With `ignore_job_signals` the command starts with
+/// SIGHUP, SIGINT and SIGQUIT ignored and lives through them; the client alone decides to go.
+#[tokio::test]
+async fn ignore_job_signals_starts_the_command_with_the_terminal_signals_ignored() {
+    for (ignore, want) in [(true, "alive HUP INT QUIT"), (false, "")] {
+        let hb = Frame::new(
+            ChannelId::CONTROL,
+            ControlMsg::Heartbeat {
+                nonce: 9,
+                reply: true,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .encode()
+        .unwrap();
+        let octal: String = hb.iter().map(|b| format!("\\{b:03o}")).collect();
+        // Each signal is sent to the shell itself; a default disposition ends it at the first.
+        // The signals wait for the client's first byte (its reply to the heartbeat), so the link
+        // is up before the shell can die.
+        let script = format!(
+            "printf '\\033FIL-CONNECT 1\\n'; printf '{octal}'; printf alive >&2; \
+             head -c 1 >/dev/null; \
+             for s in HUP INT QUIT; do kill -s $s $$; printf ' %s' $s >&2; done; cat >/dev/null"
+        );
+        let cmd = PipeCommand::custom(["sh", "-c", &script]).unwrap();
+        let mut c = cfg();
+        c.stderr = PipeStderr::Capture;
+        c.ignore_job_signals = ignore;
+        let link = PipeLink::spawn(&cmd, c).await.unwrap();
+        let mut seen = String::new();
+        for _ in 0..250 {
+            seen = link.stderr_text().trim().to_owned();
+            if seen.ends_with("QUIT") || (!ignore && seen == "alive") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if ignore {
+            assert_eq!(seen, want, "the command did not live through the signals");
+        } else {
+            // Killed by the first one, before it could say so (given time to say it anyway).
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(link.stderr_text().trim(), "alive");
+        }
+        link.shutdown().await;
+    }
+}
+
+/// A pipe program that does not exist fails as a spawn error with or without the shell that
+/// ignores the terminal's signals: the shell's own 127 must not read as "no fil on the host".
+#[tokio::test]
+async fn a_missing_program_is_a_spawn_error_with_ignore_job_signals_too() {
+    for ignore in [false, true] {
+        for program in ["fil-test-no-such-program", "/nonexistent/fil-test-pipe"] {
+            let cmd = PipeCommand::custom([program, "arg"]).unwrap();
+            let mut c = cfg();
+            c.stderr = PipeStderr::Capture;
+            c.ignore_job_signals = ignore;
+            let e = match PipeLink::spawn(&cmd, c).await {
+                Ok(_) => panic!("{program} started"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(&e.kind, PipeErrorKind::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound),
+                "{program}, ignore {ignore}: {e:?}"
+            );
+            assert!(
+                e.to_string().contains("could not start the pipe command"),
+                "{e}"
+            );
+        }
+    }
+}
+
 /// Efficiency sweep #7: the round-trip time differs a little on every heartbeat, and each change
 /// used to be published, waking the engine and the link watchers once a second for nothing. Only
 /// a change of 10 % or 2 ms is published now.

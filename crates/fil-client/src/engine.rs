@@ -733,6 +733,11 @@ pub(crate) struct Core<I, O> {
     fwd_confirm: Option<FwdConfirm>,
     /// The `~#` summary, until the next key.
     ports: Option<Vec<String>>,
+    /// Tunnel only ([`ClientConfig::tunnel`]): the link is up and the sink was told so (it is
+    /// told again when the link goes and comes back).
+    tunnel_up: bool,
+    /// Tunnel only: the first "up" line has been given.
+    tunnel_announced: bool,
 }
 
 /// A question about a forward on the screen.
@@ -811,6 +816,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             fwd_asks: Asks::default(),
             fwd_confirm: None,
             ports: None,
+            tunnel_up: false,
+            tunnel_announced: false,
         })
     }
 
@@ -969,6 +976,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// ending is shown, the terminal is cooked again.
     fn leave_screen(&mut self, result: &Result<Outcome, ClientError>) {
         if std::mem::replace(&mut self.screen_left, true) {
+            return;
+        }
+        if self.cfg.tunnel.is_some() {
+            // Nothing was drawn and the terminal was never raw: only the ending is said (an
+            // error is said by the caller, as for an attach).
+            if let Ok(o) = result {
+                let m = o.message(self.cfg.session.as_str(), self.cfg.time_format);
+                self.tunnel_say(m.strip_prefix("fil: ").unwrap_or(&m));
+            }
             return;
         }
         // The termios first. `set_raw(false)` never waits for the terminal, and everything after
@@ -2405,6 +2421,9 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             self.disconnected_since = Some(Instant::now());
             self.attempt = 0;
         }
+        if std::mem::replace(&mut self.tunnel_up, false) {
+            self.tunnel_say("connection lost; reconnecting (the forwards wait for it)");
+        }
         let _ = self.refresh_display();
     }
 
@@ -2440,6 +2459,17 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         }
         self.link_ok = true;
         self.ready_since.get_or_insert_with(Instant::now);
+        if self.cfg.tunnel.is_some() && !std::mem::replace(&mut self.tunnel_up, true) {
+            if std::mem::replace(&mut self.tunnel_announced, true) {
+                self.tunnel_say("reconnected");
+            } else {
+                let line = format!(
+                    "holding the forwards of session \"{}\" (no terminal; Ctrl-C detaches)",
+                    self.cfg.session
+                );
+                self.tunnel_say(&line);
+            }
+        }
         // The window may have changed size while the daemon could not be told (a quiet link,
         // a snapshot on its way, a swap). The record goes before anything held back is released.
         self.send_size();
@@ -2583,6 +2613,13 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 let (cols, rows) = self.window_or(cols, rows);
                 self.on_resize(cols, rows)?;
                 Ok(Ev::Continue)
+            }
+            // A tunnel is stopped by a signal: that is its `~.`, so the daemon is told and the
+            // session's `-R` listeners refuse at once instead of holding connections for a link.
+            // Before the first attach there is nothing to detach: the run was stopped (the `fil`
+            // binary exits 255 for it, as `ssh -N` does).
+            TermEvent::Signal(_) if self.cfg.tunnel.is_some() && self.first_attached => {
+                Ok(Ev::Detach)
             }
             TermEvent::Signal(n) => Ok(Ev::End(Outcome::Signalled(n))),
             TermEvent::Eof => Ok(Ev::End(Outcome::InputClosed)),
@@ -2798,6 +2835,19 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     fn on_note(&mut self, note: Note) -> Result<(), ClientError> {
         match note {
+            Note::Ask(q) if self.cfg.tunnel.is_some() => {
+                // Nobody can answer: "no", as a question nobody answers ends anyway, but now.
+                if let Some(h) = &self.fwd {
+                    h.answer(&q, false);
+                }
+                let what = if q.agent {
+                    "refused a signature that needs confirming (agent = \"confirm\"): -N cannot ask"
+                } else {
+                    "refused a forward the host asked for: -N cannot ask (it stays in the session's table)"
+                };
+                self.tunnel_say(what);
+                return Ok(());
+            }
             Note::Ask(q) => self.fwd_asks.push(q),
             Note::Cancel { token } => {
                 self.fwd_asks.remove(token);
@@ -2812,6 +2862,18 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             Note::CancelAll => {
                 self.fwd_asks.clear();
                 self.fwd_confirm = None;
+            }
+            Note::Notice(lines) if self.cfg.tunnel.is_some() => {
+                // Wrapped for the overlay: one line again, without its own "fil: " (the sink
+                // has one).
+                let one = lines
+                    .iter()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.tunnel_say(one.strip_prefix("fil: ").unwrap_or(&one));
+                return Ok(());
             }
             Note::Notice(lines) => {
                 self.notice = lines;
@@ -2850,6 +2912,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     Outcome::Attached {
                         by,
                         since_unix_ms: holder.since_unix_ms,
+                        connected: *connected,
                     },
                 )
             }
@@ -2863,6 +2926,31 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             ),
         };
         self.link_ok = false;
+        if self.cfg.tunnel.is_some() {
+            // Nobody to ask. A session whose holder is disconnected (a tunnel or a laptop gone
+            // without detaching: asleep, killed, its link cut) is taken, and said so, so that a
+            // restarted tunnel is not locked out by its own ghost; anything else is a no, and the
+            // ending says why (`leave_screen`). `--take-over` never gets here.
+            if let (
+                Prompt::TakeOver {
+                    holder,
+                    connected: false,
+                    ..
+                },
+                Outcome::Attached { by, .. },
+            ) = (&prompt, &no)
+            {
+                let line = format!(
+                    "taking session \"{session}\" over from {by}, attached since {} and disconnected",
+                    (self.cfg.time_format)(holder.since_unix_ms)
+                );
+                self.tunnel_say(&line);
+                self.disconnected_since.get_or_insert_with(Instant::now);
+                self.attempt = 0;
+                return Ok(Ok(()));
+            }
+            return Ok(Err(no));
+        }
         self.confirm = None;
         self.requeue_fwd_confirm();
         if matches!(prompt, Prompt::Replaced) {
@@ -2936,6 +3024,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         Ok(answer)
     }
 
+    /// Gives a tunnel-only run's sink one line ([`ClientConfig::tunnel`]); nothing otherwise.
+    fn tunnel_say(&self, line: &str) {
+        if let Some(sink) = &self.cfg.tunnel
+            && !line.is_empty()
+        {
+            sink(line);
+        }
+    }
+
     // ---- the display -------------------------------------------------------------------
 
     fn display_mut(&mut self, cols: u16, rows: u16) -> Result<&mut Display, ClientError> {
@@ -2984,6 +3081,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
 
     /// The first attach: raw mode, the warnings, and room for the snapshot (section 6.2).
     fn enter_session_screen(&mut self) -> Result<(), ClientError> {
+        if self.cfg.tunnel.is_some() {
+            // No terminal is the session's: nothing goes raw and nothing is written for it.
+            self.first_attached = true;
+            return Ok(());
+        }
         self.out.set_raw(true)?;
         self.raw = true;
         // The window may have changed since the client started: a new size has a new generation,
@@ -3007,7 +3109,8 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
     /// Writes to the user's terminal. Everything the overlay draws or removes comes through here,
     /// so this is where [`Repair`] learns of it.
     fn write(&mut self, bytes: &[u8]) -> Result<(), ClientError> {
-        if bytes.is_empty() {
+        // A tunnel has no terminal of its own: nothing of the session or the overlay is written.
+        if bytes.is_empty() || self.cfg.tunnel.is_some() {
             return Ok(());
         }
         self.out.write_all(bytes).map_err(ClientError::Terminal)?;

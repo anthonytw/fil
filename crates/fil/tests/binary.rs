@@ -221,3 +221,31 @@ fn a_taken_forward_port_exits_255_with_forward_failure_exit_and_warns_otherwise(
     drop(squat);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// `fil -N` starts its pipe command through a shell that ignores the terminal's signals: a
+/// program that does not exist must still say the pipe command could not start, as an attach
+/// does, never that fil is missing on the host (the shell's 127 is a login shell's word for that).
+#[test]
+fn a_tunnel_with_a_missing_pipe_program_says_the_command_could_not_start() {
+    let home = std::env::temp_dir().join(format!("fil-bin-test-tunnel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".config/fil")).unwrap();
+    std::fs::write(
+        home.join(".config/fil/config.toml"),
+        "[host.probe]\npipe = [\"fil-test-no-such-pipe-program\", \"x\"]\n",
+    )
+    .unwrap();
+    let out = Command::new(FIL)
+        .args(["-N", "probe", "-L", &free_port().to_string()])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("could not start the pipe command"), "{err}");
+    assert!(!err.contains("not installed"), "{err}");
+    let _ = std::fs::remove_dir_all(&home);
+}

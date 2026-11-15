@@ -4,6 +4,7 @@
 //! fil HOST [SESSION] [-L SPEC]... [-R SPEC]... [-D SPEC]... [-A|-a]
 //!          [--transport auto|pipe|direct] [--predict off|adaptive|always] [--take-over]
 //!                                                attach (default session: main)
+//! fil -N HOST [SESSION] -L|-R|-D SPEC... [-A]    tunnel only (default session: tunnel)
 //! fil ls HOST                                    list sessions
 //! fil kill HOST SESSION                          end a session
 //! fil detach [HOST SESSION]                      detach whoever is attached (no arguments: inside a session)
@@ -33,6 +34,10 @@ use crate::forward_spec::{self, AgentFlag, CliForwards};
 
 /// The session `fil HOST` attaches to when none is named.
 pub const DEFAULT_SESSION: &str = "main";
+
+/// The session `fil -N HOST` holds when none is named: not `main`, so a tunnel started beside an
+/// attached shell does not ask to take that shell's session over (DESIGN.md section 7.3).
+pub const DEFAULT_TUNNEL_SESSION: &str = "tunnel";
 
 /// What `fil --version` prints after the name: the package version and the wire this build
 /// speaks (`wire <major>.<revision>`, DESIGN.md section 8.5). Two builds with the same wire talk
@@ -67,6 +72,19 @@ pub fn full_version_string() -> &'static str {
     FULL.as_str()
 }
 
+/// What `fil --version` prints (`app::main` prints it in place of clap's): `fil` and the first
+/// line of [`full_version_string`], as clap writes it, then how this copy was installed and the command that upgrades it
+/// (1.0 decision 6, [`crate::upgrade`]: from this machine's files only, never the network), then
+/// the legal notices. The first line is unchanged, for the scripts that read it.
+pub fn version_text(install: &crate::upgrade::Install) -> String {
+    let full = full_version_string();
+    let (first, rest) = full.split_once('\n').unwrap_or((full, ""));
+    format!(
+        "fil {first}\n{}\n{rest}\n",
+        crate::upgrade::upgrade_line(install)
+    )
+}
+
 const AFTER_HELP: &str = "\
 Examples:
   fil devbox                 attach to (or create) session \"main\" on devbox
@@ -74,11 +92,14 @@ Examples:
   fil ls devbox              list the sessions on devbox
   fil kill devbox build      end session \"build\"
   fil detach devbox build    detach whoever is attached to \"build\"
+  fil -N devbox -L 5432      forward localhost:5432 to devbox, no terminal, until Ctrl-C
 
 Inside a session, type ~. after a newline to detach; ~? lists the escapes.
 
 Configuration: ~/.config/fil/config.toml (see fil-config(5), or `fil config show HOST`).
 Logs: ~/.local/state/fil/client.log (set FIL_LOG=debug for more).
+Upgrading: `fil --version` names the command for the way this copy was installed (fil never
+updates itself or checks for updates).
 
 Exit status: 0 on a normal end (detached, or the session ended with nothing to report);
 the shell's own status if it exited with one; 128+N if the shell was killed by signal N or
@@ -87,6 +108,7 @@ fil was stopped by signal N;
 attached elsewhere and you did not take it over;
 2 on a usage error;
 255 if a forward failed and forward_failure = \"exit\".
+With -N, a stop signal (Ctrl-C) detaches and exits 0, or 255 before the session is attached.
 
 Source: every release publishes fil-<version>-source.tar.gz beside the binaries (GPL-3.0 Corresponding Source).";
 
@@ -162,6 +184,14 @@ pub struct AttachArgs {
     /// config's takeover = "always" for this run). By default fil asks first
     #[arg(long)]
     pub take_over: bool,
+
+    /// Tunnel only, as ssh -N: hold the forwards (and the agent relay, with -A) with no terminal,
+    /// until interrupted. Needs a forward (-L, -R, -D, the config's) or -A. The session defaults
+    /// to "tunnel", not "main", so it never asks to take your shell's session. It asks nothing:
+    /// a session whose holder is disconnected is taken over, a connected holder is left alone
+    /// (status 1) unless --take-over is given, which an unattended tunnel should
+    #[arg(short = 'N')]
+    pub tunnel: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -521,6 +551,8 @@ pub enum Action {
         take_over: bool,
         /// `-L`, `-R`, `-D`, `-A` and `-a`, parsed and checked, for the run's plan.
         forwards: CliForwards,
+        /// `-N`: tunnel only, no terminal.
+        tunnel: bool,
     },
     List {
         host: String,
@@ -622,6 +654,9 @@ impl Cli {
         if a.take_over {
             stray.push("--take-over".to_string());
         }
+        if a.tunnel {
+            stray.push("-N".to_string());
+        }
         if stray.is_empty() {
             return Ok(());
         }
@@ -720,11 +755,18 @@ impl Cli {
                     host: a
                         .host
                         .expect("clap requires a host when there is no subcommand"),
-                    session: a.session.unwrap_or_else(default_session),
+                    session: a.session.unwrap_or_else(|| {
+                        if a.tunnel {
+                            SessionName::new(DEFAULT_TUNNEL_SESSION).expect("valid")
+                        } else {
+                            default_session()
+                        }
+                    }),
                     transport: a.transport.map(Into::into),
                     predict: a.predict.map(Into::into),
                     take_over: a.take_over,
                     forwards,
+                    tunnel: a.tunnel,
                 })
             }
         }
@@ -750,6 +792,39 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_only_defaults_to_its_own_session() {
+        match action(&["-N", "devbox", "-L", "5432"]) {
+            Action::Attach {
+                session,
+                tunnel: true,
+                forwards,
+                ..
+            } => {
+                assert_eq!(session, name(DEFAULT_TUNNEL_SESSION));
+                assert_eq!(forwards.specs.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A named session is that session; -N goes anywhere on the line, like ssh's.
+        assert!(matches!(
+            action(&["devbox", "db", "-R", "9000", "-N"]),
+            Action::Attach { session, tunnel: true, .. } if session == name("db")
+        ));
+        // Without -N nothing changes.
+        assert!(matches!(
+            action(&["devbox", "-L", "5432"]),
+            Action::Attach { session, tunnel: false, .. } if session == name("main")
+        ));
+        // Before a command it would be ignored: a usage error, as the other attach flags.
+        let e = parse(&["-N", "ls", "devbox"])
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::ArgumentConflict);
+        assert!(e.to_string().contains("-N"), "{e}");
+    }
+
+    #[test]
     fn the_cli_definition_is_consistent() {
         Cli::command().debug_assert();
     }
@@ -764,7 +839,8 @@ mod tests {
                 transport: None,
                 predict: None,
                 take_over: false,
-                forwards: Default::default()
+                forwards: Default::default(),
+                tunnel: false
             }
         );
         assert_eq!(
@@ -775,7 +851,8 @@ mod tests {
                 transport: None,
                 predict: None,
                 take_over: false,
-                forwards: Default::default()
+                forwards: Default::default(),
+                tunnel: false
             }
         );
     }
@@ -795,7 +872,8 @@ mod tests {
                     transport: Some(want),
                     predict: None,
                     take_over: false,
-                    forwards: Default::default()
+                    forwards: Default::default(),
+                    tunnel: false
                 }
             );
         }
@@ -853,7 +931,8 @@ mod tests {
                     transport: None,
                     predict: Some(want),
                     take_over: false,
-                    forwards: Default::default()
+                    forwards: Default::default(),
+                    tunnel: false
                 }
             );
             // After the host too, like the other attach options.
@@ -1182,6 +1261,7 @@ mod tests {
                 predict: None,
                 take_over: false,
                 forwards: forwards(&["devbox", "-L", "80"]),
+                tunnel: false,
             }
         );
         assert_eq!(
@@ -1415,7 +1495,8 @@ mod tests {
                 transport: None,
                 predict: None,
                 take_over: false,
-                forwards: Default::default()
+                forwards: Default::default(),
+                tunnel: false
             }
         );
     }
@@ -1430,7 +1511,8 @@ mod tests {
                 transport: None,
                 predict: None,
                 take_over: false,
-                forwards: Default::default()
+                forwards: Default::default(),
+                tunnel: false
             }
         );
     }
@@ -1459,6 +1541,25 @@ mod tests {
             cli.config.as_deref(),
             Some(std::path::Path::new("/tmp/y.toml"))
         );
+    }
+
+    #[test]
+    fn the_version_text_keeps_its_first_line_and_says_how_to_upgrade() {
+        let text = version_text(&crate::upgrade::Install::Homebrew);
+        let lines: Vec<&str> = text.lines().collect();
+        // The first line is exactly what clap printed before (scripts and the bootstrap read it).
+        assert_eq!(
+            lines[0],
+            Cli::command().render_version().lines().next().unwrap()
+        );
+        assert_eq!(lines[0], format!("fil {}", version_string()));
+        assert_eq!(
+            lines[1],
+            crate::upgrade::upgrade_line(&crate::upgrade::Install::Homebrew)
+        );
+        // Then the legal notices, as before.
+        assert_eq!(lines[2], "Copyright (C) 2026 Anthony Wertz");
+        assert!(text.ends_with("permitted by law.\n"), "{text}");
     }
 
     #[test]

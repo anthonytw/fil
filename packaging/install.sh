@@ -197,18 +197,18 @@ main() {
       mv "$lib/remote" "$oldlib/remote" || { rm -rf "$oldlib"; die "could not move the old bundle aside"; }
     fi
     if ! mv "$newlib" "$lib/remote"; then
-      [ -z "$oldlib" ] || mv "$oldlib/remote" "$lib/remote"
-      [ -z "$oldlib" ] || rm -rf "$oldlib"
+      [ -n "$oldlib" ] || die "could not install $lib/remote"
+      mv "$oldlib/remote" "$lib/remote" || die "could not install $lib/remote, nor put the old bundle back: it is in $oldlib/remote"
+      rm -rf "$oldlib"
       die "could not install $lib/remote (the old bundle is back)"
     fi
     newlib=''
   fi
   if ! mv -f "$newbin" "$pdir/fil"; then
-    if [ -n "$lib" ]; then
-      rm -rf "$lib/remote"
-      [ -z "$oldlib" ] || mv "$oldlib/remote" "$lib/remote"
-    fi
-    [ -z "$oldlib" ] || rm -rf "$oldlib"
+    [ -z "$lib" ] || rm -rf "$lib/remote"
+    [ -n "$oldlib" ] || die "could not install $pdir/fil"
+    mv "$oldlib/remote" "$lib/remote" || die "could not install $pdir/fil, nor put the old bundle back: it is in $oldlib/remote"
+    rm -rf "$oldlib"
     die "could not install $pdir/fil (the old bundle is back)"
   fi
   newbin=''

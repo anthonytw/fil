@@ -18,7 +18,7 @@ fil runs on macOS and Linux (x86_64 and aarch64) as the client, and on Linux as 
 | crates.io | `cargo install --locked fil-shell` | a build from source; no man pages, completions or Linux programs to upload |
 | Nix | `nix profile install github:anthonytw/fil/v<version>` | a build from source, as with cargo |
 
-The command is `fil` everywhere.
+The command is `fil` everywhere. The crate is `fil-shell` and the AUR package `fil-shell-bin` because those names were taken by other projects: `cargo install fil` installs something else.
 
 ### The installer
 
@@ -63,7 +63,7 @@ sudo dnf install fil      # dnf shows the key's fingerprint and asks before it i
 
 The repository's index (`InRelease` for apt, `repomd.xml.asc` for dnf) is signed, and it lists each package by its SHA-256, so apt and dnf refuse a package or an index that was changed; dnf also checks each rpm's own signature. Each repository holds the latest release only.
 
-The package signing key expires on 2028-11-08 and will be extended before then. apt keeps the copy you downloaded, so after an extension run the `curl … /etc/apt/keyrings/fil.asc` line above again (the fingerprint stays the same); dnf asks to import the extended key on its own. The crate is `fil-shell` and the AUR package `fil-shell-bin` because those names were taken by other projects: `cargo install fil` installs something else.
+The package signing key expires on 2028-11-08 and will be extended before then. apt keeps the copy you downloaded, so after an extension run the `curl … /etc/apt/keyrings/fil.asc` line above again (the fingerprint stays the same); if dnf then reports an expired key, import the extended one with `sudo rpm --import https://fil.anthonywertz.com/rpm/fil-package-key.asc`.
 
 ### Checking a download
 

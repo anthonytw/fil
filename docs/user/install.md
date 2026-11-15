@@ -8,12 +8,12 @@ fil runs on macOS and Linux (x86_64 and aarch64) as the client, and on Linux as 
 
 | Channel | Command | What you get |
 |---|---|---|
-| The installer (from the release after 0.3.0) | `curl -fsSL https://github.com/anthonytw/fil/releases/download/v1.0.0/fil-install.sh \| sh -s -- --version 1.0.0` (below) | the client in `~/.local/bin` and the Linux programs `fil install` uploads, checked against the signed release; no root |
+| The installer (from 1.0.0) | `curl -fsSL https://github.com/anthonytw/fil/releases/download/v1.0.0/fil-install.sh \| sh -s -- --version 1.0.0` (below) | the client in `~/.local/bin` and the Linux programs `fil install` uploads, checked against the signed release; no root |
 | GitHub Releases | download, check, unpack (below) | the client, the Linux programs `fil install` uploads, man pages and completions |
 | Homebrew (macOS, Linux) | `brew install anthonytw/tap/fil` | the same archive |
 | Debian, Ubuntu | `sudo apt install ./fil_<version>_amd64.deb` (or `_arm64`) | the same files under `/usr` |
 | Fedora, RHEL, openSUSE | `sudo rpm --import package-signing-key.asc` (the `.github/package-signing-key.asc` of the repository), then `sudo dnf install ./fil-<version>-1.x86_64.rpm` (or `.aarch64`) | the same |
-| fil's apt and dnf repositories (from the release after 0.3.0) | set up once (below), then `sudo apt install fil` or `sudo dnf install fil` | the same packages, upgraded with the rest of the system |
+| fil's apt and dnf repositories (from 1.0.0) | set up once (below), then `sudo apt install fil` or `sudo dnf install fil` | the same packages, upgraded with the rest of the system |
 | Arch Linux | `fil-shell-bin` on the AUR | the same (see the release notes for when it is published) |
 | crates.io | `cargo install --locked fil-shell` | a build from source; no man pages, completions or Linux programs to upload |
 | Nix | `nix profile install github:anthonytw/fil/v<version>` | a build from source, as with cargo |
@@ -22,7 +22,7 @@ The command is `fil` everywhere. The crate is `fil-shell` and the AUR package `f
 
 ### The installer
 
-From the release after 0.3.0, every release carries `fil-install.sh`, a short POSIX shell script that needs no root. It downloads the release's `SHA256SUMS` and `SHA256SUMS.sig` with `curl` (HTTPS only, redirects included), checks the signature with `ssh-keygen -Y verify` against the release key written in the script, picks the archive for your machine from that list, checks its SHA-256, and copies `fil` into `~/.local/bin` and the Linux programs `fil install` uploads into `~/.local/libexec/fil/remote` (if `~/.local/bin` is a symbolic link, into the `libexec` beside the directory it points to, where `fil` looks). If a check or a copy fails it stops with nothing installed, and it runs nothing it downloaded but the installed `fil --version` at the end. It needs `curl`, `ssh-keygen` from OpenSSH 8.1 or later (for `-Y verify`; RHEL 8's OpenSSH 8.0 is too old), `tar`, `gzip`, and `sha256sum` or `shasum`, and checks for each before it downloads anything.
+From 1.0.0, every release carries `fil-install.sh`, a short POSIX shell script that needs no root. It downloads the release's `SHA256SUMS` and `SHA256SUMS.sig` with `curl` (HTTPS only, redirects included), checks the signature with `ssh-keygen -Y verify` against the release key written in the script, picks the archive for your machine from that list, checks its SHA-256, and copies `fil` into `~/.local/bin` and the Linux programs `fil install` uploads into `~/.local/libexec/fil/remote` (if `~/.local/bin` is a symbolic link, into the `libexec` beside the directory it points to, where `fil` looks). If a check or a copy fails it stops with nothing installed, and it runs nothing it downloaded but the installed `fil --version` at the end. It needs `curl`, `ssh-keygen` from OpenSSH 8.1 or later (for `-Y verify`; RHEL 8's OpenSSH 8.0 is too old), `tar`, `gzip`, and `sha256sum` or `shasum`, and checks for each before it downloads anything.
 
 The one-liner, for the current release:
 
@@ -44,7 +44,7 @@ sh fil-install.sh --version <version>
 
 ### fil's apt and dnf repositories
 
-From the release after 0.3.0, fil's site serves an apt and a dnf repository with the release's `.deb` and `.rpm` packages, signed with the package signing key (fingerprint `9EF0 B189 34B7 0552 0F88  80A5 81C0 98D1 5D1A EC26`, also in the [README](../../README.md)). Check the fingerprint `gpg --show-keys` prints before you trust the key.
+From 1.0.0, fil's site serves an apt and a dnf repository with the release's `.deb` and `.rpm` packages, signed with the package signing key (fingerprint `9EF0 B189 34B7 0552 0F88  80A5 81C0 98D1 5D1A EC26`, also in the [README](../../README.md)). Check the fingerprint `gpg --show-keys` prints before you trust the key.
 
 Debian and Ubuntu:
 

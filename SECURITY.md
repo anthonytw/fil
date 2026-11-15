@@ -30,10 +30,10 @@ Out of scope, as [`DESIGN.md`](DESIGN.md) §11 and the [security and privacy](do
 Besides taking reports, the project audits itself on a schedule and publishes what it found. The runbook is [`docs/audits/`](docs/audits/README.md).
 
 - **A release audit for every minor release** (1.1, 1.2, ...): the changes since the last audited version, reviewed before the release is tagged. A patch release gets one only if it touches security-relevant code.
-- **A full audit every six months:** every area of the code on `main`, plus a refresh of the dependencies and the CI pins. When a full audit falls near a release, one report covers both. The first full audit, the baseline, is the security and privacy part of the sweep before 1.0. `tests/release/just.sh release` warns (never stops) when the last full audit is more than seven months old.
+- **A full audit every six months:** every area of the code on `main`, plus a refresh of the dependencies and the CI pins. When a full audit falls near a release, one report covers both. The first full audit, the baseline, was the security and privacy part of the sweep before 1.0 (2026-11-15). `tests/release/just.sh release` warns (never stops) when the last full audit is more than seven months old.
 - **A weekly scan** of the locked dependencies against the RustSec and OSV advisory databases (`.github/workflows/audit.yml`), between audits.
 - **Reports are published after the fixes ship**, in [`docs/audits/`](docs/audits/README.md): what was checked, what was found, what was fixed, and which documented claims were checked against the code. Until a fix is in a release, its details stay in a private security advisory, and nothing public (a commit, branch, pull request title or changelog line) describes it. A finding that cannot be fixed within 90 days is published with its details withheld (id, severity, area, advisory link). An audit that finds nothing is still published.
-- **The reviewers are AI models** working from the source, with a second model verifying each finding and a second reviewer checking the triage. They can miss things. A clean report is evidence, not proof, and it is not a third-party audit or a certification.
+- **The reviewers are AI models** working from the source, with a separate verifier checking each finding (a different agent, and a different model where one is available) and a second reviewer checking the triage. They can miss things. A clean report is evidence, not proof, and it is not a third-party audit or a certification.
 
 Severity, highest first. GitHub advisories use Critical, High, Moderate and Low; Medium here is GitHub's Moderate.
 
@@ -49,8 +49,7 @@ A CVE is requested (through GitHub) for every published advisory rated High or C
 
 | Audit | Date | Version | Report |
 | --- | --- | --- | --- |
-
-No audit is published yet; the baseline full audit runs before 1.0.
+| Full (the baseline) | 2026-11-15 | 1.0.0 | [`docs/audits/2026-11-15-full-1.0.0.md`](docs/audits/2026-11-15-full-1.0.0.md) |
 
 ## Verifying releases
 

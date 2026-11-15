@@ -63,7 +63,7 @@ PF_KEY_WARN_DAYS=60
 PF_OVERRIDES=$(printf '%s\n' $TEST_OVERRIDES | grep -vx FIL_RELEASE_SELFTEST | tr '\n' ' ')
 
 # The checks, in the order they run.
-PF_CHECKS="overrides tools lock disk tree recipes version audit lockfiles github-main gh github-ssh commit-signing crates-env tag-ruleset tag-free docker vm release-key package-key apple"
+PF_CHECKS="overrides tools lock disk tree recipes version audit lockfiles github-main gh github-ssh commit-signing crates-env tag-ruleset main-ruleset immutable-releases tag-free docker vm release-key package-key apple"
 # The steps of `tests/release/just.sh release` (docs: the design's section 5), in order.
 PF_STEPS="candidate on-main dry-run dry-verify tag tag-run verify-presign sign-macos sign-packages sign-sums upload verify-signed publish verify-published crates brew finish"
 
@@ -74,7 +74,7 @@ pf_step_checks() {
     on-main) echo "github-main" ;;
     dry-run) echo "gh" ;;
     dry-verify) echo "docker vm" ;;
-    tag) echo "tag-free tag-ruleset crates-env release-key github-ssh gh" ;;
+    tag) echo "tag-free tag-ruleset main-ruleset immutable-releases crates-env release-key github-ssh gh" ;;
     tag-run) echo "gh" ;;
     verify-presign) echo "gh docker vm release-key" ;;
     sign-macos) echo "gh docker apple release-key" ;;
@@ -119,7 +119,7 @@ pf_check_tools() {
   case $1 in
     tree | github-main | commit-signing | version) echo git ;;
     lockfiles) echo cargo ;;
-    gh | crates-env | tag-ruleset) echo gh ;;
+    gh | crates-env | tag-ruleset | main-ruleset | immutable-releases) echo gh ;;
     tag-free) echo "git gh curl" ;;
     github-ssh) echo ssh ;;
     docker) echo docker ;;
@@ -636,28 +636,173 @@ pf_check_crates_env() {
   return "$bad"
 }
 
-pf_check_tag_ruleset() {
-  local gh ids id inc found='' imm
+# pf_rulesets TARGET: the ids of the active rulesets of PF_REPO for TARGET (tag or branch), one a
+# line. Fails (1) if they cannot be listed.
+pf_rulesets() {
+  local gh out
   gh=$(pf_tool gh)
-  ids=$("$gh" api "repos/$PF_REPO/rulesets" --jq '.[] | select(.target == "tag" and .enforcement == "active") | .id' 2> /dev/null) || {
+  out=$("$gh" api "repos/$PF_REPO/rulesets" --jq '.[] | select(.enforcement == "active") | "\(.id) \(.target)"' 2> /dev/null) || return 1
+  printf '%s\n' "$out" | awk -v t="$1" '$2 == t { print $1 }'
+}
+# The jq that sums up the bypass list of a ruleset as one word: "unreadable" when GitHub leaves it
+# out (it shows it to an admin only), "none" when it is empty, else TYPE:ID entries joined by commas.
+PF_JQ_BYPASS='(if .bypass_actors == null then "unreadable" elif (.bypass_actors | length) == 0 then "none" else ([.bypass_actors[] | "\(.actor_type):\(.actor_id // "none")"] | join(",")) end)'
+# pf_bypass_problem RULESET WORD: why the bypass list WORD (PF_JQ_BYPASS) of RULESET is not only the
+# owner or the admin role (nothing when it is). Only these may pass a ruleset: the repository's admin
+# role (RepositoryRole 5) and the owner's own account.
+pf_bypass_problem() {
+  local gh e oid=''
+  case $2 in
+    none) return 0 ;;
+    unreadable | '')
+      echo "the bypass list of ruleset $1 cannot be read (GitHub shows it to an admin only): run as the owner (gh auth switch -u $PF_OWNER)"
+      return 0
+      ;;
+  esac
+  for e in ${2//,/ }; do
+    case $e in
+      RepositoryRole:5) ;;
+      User:*)
+        if [ -z "$oid" ]; then
+          gh=$(pf_tool gh)
+          oid=$("$gh" api "users/$PF_OWNER" --jq .id 2> /dev/null) || oid=unknown
+        fi
+        [ "$e" = "User:$oid" ] || { echo "ruleset $1 lets $e bypass it (only $PF_OWNER and the admin role may)"; return 0; }
+        ;;
+      *) echo "ruleset $1 lets $e bypass it (only $PF_OWNER and the admin role may)"; return 0 ;;
+    esac
+  done
+}
+
+# pf_check_tag_ruleset: an active tag ruleset covers every tag (~ALL, nothing excluded), restricts
+# creation, update and deletion, and lets only the owner or the admin role bypass it. Nobody else
+# can then make a tag, so nobody else can publish a release either (a new release's tag is created
+# with it), under any name. Only ~ALL is accepted: a ruleset's `*` does not match a `/`, so
+# refs/tags/* leaves a tag like x/y open, and refs/tags/v* every other name.
+pf_check_tag_ruleset() {
+  local gh ids id line inc exc rules enf byp why found='' problem=''
+  gh=$(pf_tool gh)
+  ids=$(pf_rulesets tag) || {
     pf_fail "cannot list the rulesets of $PF_REPO" - "gh api repos/$PF_REPO/rulesets (as $PF_OWNER, admin)"
     return 1
   }
   for id in $ids; do
-    inc=$("$gh" api "repos/$PF_REPO/rulesets/$id" --jq '.conditions.ref_name.include[]?' 2> /dev/null || true)
-    case " $(printf '%s' "$inc" | tr '\n' ' ') " in *" refs/tags/v* "*) found=$id ;; esac
+    # one line: the includes (comma-separated), the number of excludes, the rule types (sorted),
+    # the enforcement and the bypass list
+    line=$("$gh" api "repos/$PF_REPO/rulesets/$id" --jq '[(.conditions.ref_name.include // [] | join(",") | if . == "" then "-" else . end), (.conditions.ref_name.exclude // [] | length | tostring), ([.rules[]?.type] | sort | join(",") | if . == "" then "-" else . end), (.enforcement // "-"), '"$PF_JQ_BYPASS"'] | join(" ")' 2> /dev/null || true)
+    inc='' exc='' rules='' enf='' byp=''
+    read -r inc exc rules enf byp <<< "$line" || true
+    case ",$inc," in *",~ALL,"*) ;; *) continue ;; esac
+    if [ "$enf" != active ]; then
+      why="ruleset $id is not active (enforcement '$enf')"
+    elif [ "$exc" != 0 ] || ! pf_has_all ",$rules," creation update deletion; then
+      why="ruleset $id covers every tag but excludes some, or does not restrict all of creation, update and deletion"
+    else
+      why=$(pf_bypass_problem "$id" "$byp")
+    fi
+    if [ -z "$why" ]; then found=$id; break; fi
+    problem=$why
   done
-  if [ -z "$found" ]; then
-    pf_fail "no active tag ruleset on refs/tags/v* in $PF_REPO" - "GitHub, $PF_REPO, Settings, Rules, Rulesets: an active tag ruleset for v* that blocks updates and deletions, the owner bypassing (docs/m4/plan.md section 5)"
-    return 1
+  if [ -n "$found" ]; then
+    pf_ok "tag ruleset $found covers every tag, restricts creation, update and deletion, and only $PF_OWNER or the admin role bypasses it"
+    return 0
   fi
-  pf_ok "tag ruleset $found protects v*"
-  imm=$("$gh" api "repos/$PF_REPO/immutable-releases" --jq .enabled 2>&1) || case $imm in *404* | *"Not Found"*) imm=false ;; *) imm='' ;; esac
+  if [ -n "$problem" ]; then
+    pf_fail "$problem" - \
+      "GitHub, $PF_REPO, Settings, Rules, Rulesets: the tag ruleset targets all tags (~ALL), is active, has no excludes, restricts creations, updates and deletions, and lists only $PF_OWNER or the admin role as bypass (as $PF_OWNER, to read it)"
+  else
+    pf_fail "no active tag ruleset in $PF_REPO covers every tag (~ALL): one on refs/tags/v* or refs/tags/* leaves other tag names open to any writer, and a release with them" - \
+      "GitHub, $PF_REPO, Settings, Rules, Rulesets: an active tag ruleset targeting all tags that restricts creations, updates and deletions, only $PF_OWNER bypassing (docs/m4/release.md section 9.2)"
+  fi
+  return 1
+}
+# pf_has_all ,A,B,C, WORD...: every WORD is in the comma-delimited list.
+pf_has_all() {
+  local list=$1 w
+  shift
+  for w in "$@"; do
+    case $list in *",$w,"*) ;; *) return 1 ;; esac
+  done
+}
+
+# pf_check_main_ruleset: an active branch ruleset on main (~DEFAULT_BRANCH, refs/heads/main or
+# ~ALL; nothing excluded) requires a code owner's review, voids an approval when more is pushed
+# (require_last_push_approval or dismiss_stale_reviews_on_push: otherwise a PR approved by the
+# owner can change after the approval and merge under it), and lets only the owner or the admin
+# role bypass it. A change to a file that decides what a release is or who signs it
+# (.github/CODEOWNERS) then needs the owner, on the commit that merges.
+pf_check_main_ruleset() {
+  local gh ids id line inc exc enf co last dismiss byp why found='' problem='' fix
+  gh=$(pf_tool gh)
+  ids=$(pf_rulesets branch) || {
+    pf_fail "cannot list the rulesets of $PF_REPO" - "gh api repos/$PF_REPO/rulesets (as $PF_OWNER, admin)"
+    return 1
+  }
+  for id in $ids; do
+    # one line: the includes, the number of excludes, the enforcement, then over the pull_request
+    # rules: code-owner review, last-push approval, stale-review dismissal; and the bypass list
+    line=$("$gh" api "repos/$PF_REPO/rulesets/$id" --jq '[(.conditions.ref_name.include // [] | join(",") | if . == "" then "-" else . end), (.conditions.ref_name.exclude // [] | length | tostring), (.enforcement // "-"), ([.rules[]? | select(.type == "pull_request") | .parameters.require_code_owner_review] | any | tostring), ([.rules[]? | select(.type == "pull_request") | .parameters.require_last_push_approval] | any | tostring), ([.rules[]? | select(.type == "pull_request") | .parameters.dismiss_stale_reviews_on_push] | any | tostring), '"$PF_JQ_BYPASS"'] | join(" ")' 2> /dev/null || true)
+    inc='' exc='' enf='' co='' last='' dismiss='' byp=''
+    read -r inc exc enf co last dismiss byp <<< "$line" || true
+    case ",$inc," in *",~DEFAULT_BRANCH,"* | *",refs/heads/main,"* | *",~ALL,"*) ;; *) continue ;; esac
+    if [ "$enf" != active ]; then
+      why="ruleset $id is not active (enforcement '$enf')"
+    elif [ "$exc" != 0 ]; then
+      why="ruleset $id on main excludes some branches"
+    elif [ "$co" != true ]; then
+      why="ruleset $id does not require a code owner's review (\"Require review from Code Owners\"): CODEOWNERS is not enforced"
+    elif [ "$last" != true ] && [ "$dismiss" != true ]; then
+      why="ruleset $id keeps an approval when more commits are pushed: turn on require_last_push_approval (\"Require approval of the most recent reviewable push\") or dismiss_stale_reviews_on_push (\"Dismiss stale pull request approvals when new commits are pushed\")"
+    else
+      why=$(pf_bypass_problem "$id" "$byp")
+    fi
+    if [ -z "$why" ]; then found=$id; break; fi
+    problem=$why
+  done
+  if [ -n "$found" ]; then
+    pf_ok "main ruleset $found requires a code owner's review on the last push, and only $PF_OWNER or the admin role bypasses it"
+    return 0
+  fi
+  fix="GitHub, $PF_REPO, Settings, Rules, Rulesets, the main ruleset: active, no excludes, \"Require review from Code Owners\" and \"Require approval of the most recent reviewable push\" (or \"Dismiss stale pull request approvals when new commits are pushed\") ticked, only $PF_OWNER or the admin role bypassing (docs/m4/release.md section 9.2)"
+  if [ -n "$problem" ]; then
+    pf_fail "$problem" - "$fix"
+  else
+    pf_fail "no active branch ruleset in $PF_REPO applies to main" - "$fix"
+  fi
+  return 1
+}
+
+# pf_check_immutable_releases: releases are immutable, so a published release's files can never be
+# replaced (what makes the versioned installer URL in the docs trustworthy). GitHub answers 404 both
+# when the setting is off and when the token may not read it (any token that is not an admin's), so
+# a 404 is "off" only from an admin's token; from any other it fails, saying to run from the owner
+# seat. It never passes on an answer it could not read.
+pf_check_immutable_releases() {
+  local gh imm admin
+  gh=$(pf_tool gh)
+  imm=$("$gh" api "repos/$PF_REPO/immutable-releases" --jq .enabled 2>&1) || case $imm in *404* | *"Not Found"*) imm=404 ;; *) imm='' ;; esac
   case $imm in
-    true) pf_ok "releases are immutable" ;;
-    false) pf_warn "immutable releases are off in $PF_REPO (Settings, General, Releases)" ;;
-    *) pf_warn "could not read whether releases are immutable in $PF_REPO" ;;
+    true)
+      pf_ok "releases are immutable"
+      return 0
+      ;;
+    false) ;;
+    404)
+      admin=$("$gh" api "repos/$PF_REPO" --jq .permissions.admin 2> /dev/null) || admin=''
+      if [ "$admin" != true ]; then
+        pf_fail "cannot read whether releases are immutable in $PF_REPO: GitHub answers 404 to a token that is not an admin's, so this is not a pass" - \
+          "run the preflight from the owner seat (gh auth switch -u $PF_OWNER), where the setting can be read"
+        return 1
+      fi
+      ;;
+    *)
+      pf_fail "could not read whether releases are immutable in $PF_REPO" - "gh api repos/$PF_REPO/immutable-releases (as $PF_OWNER, admin)"
+      return 1
+      ;;
   esac
+  pf_fail "immutable releases are off in $PF_REPO: a published release's files could be replaced" - \
+    "GitHub, $PF_REPO, Settings, General, Releases: turn on immutable releases"
+  return 1
 }
 
 pf_check_tag_free() {

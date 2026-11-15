@@ -69,8 +69,15 @@ if [ "$dry" = 0 ]; then
   else
     fail "CHANGELOG.md has no section for $V"
   fi
+  # The installer one-liner the docs give (common.sh, installer_oneliner): at this version.
+  for d in $INSTALLER_DOCS; do
+    p=$(doc_oneliner_problems "$ROOT/$d" "$V")
+    if [ -z "$p" ]; then ok "$d gives the installer one-liner at $V"; else
+      fail "$d: $(printf '%s' "$p" | tr '\n' ';') (want '$(installer_oneliner "$V")'; just set-version $V rewrites it)"
+    fi
+  done
 else
-  note "dry run: tag and changelog not checked"
+  note "dry run: tag, changelog and the docs' installer one-liner not checked"
 fi
 major=$(wire_major) rev=$(wire_revision) last=$(golden_last_revision)
 if [ -n "$rev" ] && [ "$rev" = "$last" ]; then

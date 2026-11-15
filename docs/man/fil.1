@@ -60,7 +60,7 @@ always
 Take the session over without asking when another client is attached to it (the config\*(Aqs takeover = "always" for this run). By default fil asks first
 .TP
 \fB\-N\fR
-Tunnel only, as ssh \-N: hold the forwards (and the agent relay, with \-A) with no terminal, until interrupted. Needs a forward (\-L, \-R, \-D, the config\*(Aqs) or \-A. The session defaults to "tunnel", not "main", so it never asks to take your shell\*(Aqs session
+Tunnel only, as ssh \-N: hold the forwards (and the agent relay, with \-A) with no terminal, until interrupted. Needs a forward (\-L, \-R, \-D, the config\*(Aqs) or \-A. The session defaults to "tunnel", not "main", so it never asks to take your shell\*(Aqs session. It asks nothing: a session whose holder is disconnected is taken over, a connected holder is left alone (status 1) unless \-\-take\-over is given, which an unattended tunnel should
 .TP
 \fB\-\-config\fR \fI<FILE>\fR
 Read this config file instead of ~/.config/fil/config.toml ($FIL_CONFIG also works)
@@ -180,7 +180,7 @@ fil was stopped by signal N;
 attached elsewhere and you did not take it over;
 2 on a usage error;
 255 if a forward failed and forward_failure = "exit".
-With \-N, a stop signal (Ctrl\-C) detaches and exits 0.
+With \-N, a stop signal (Ctrl\-C) detaches and exits 0, or 255 before the session is attached.
 .PP
 Source: every release publishes fil\-<version>\-source.tar.gz beside the binaries (GPL\-3.0 Corresponding Source).
 .SH "SEE ALSO"

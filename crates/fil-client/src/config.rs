@@ -86,7 +86,9 @@ pub struct ClientConfig {
     /// Tunnel only (`fil -N`, DESIGN.md section 7.3): the run holds the session's forwards (and
     /// its agent relay) with no terminal. Nothing is drawn and no key is read: the session's
     /// output goes nowhere, questions are answered "no" without asking (a forward or signature the
-    /// host asks for is refused, a session held elsewhere is left alone), a stop signal detaches,
+    /// host asks for is refused, a session held by a connected client is left alone; one whose
+    /// holder is disconnected is taken over, and said so), a stop signal detaches (before the
+    /// first attach it ends the run as `Outcome::Signalled`),
     /// and what the user should know (attached, link lost, reconnected, notices, the ending) is
     /// given to this sink as plain lines, one call per line, without a newline. `None` (the
     /// default) is an ordinary attach.
@@ -223,7 +225,13 @@ pub enum Outcome {
     /// Someone else took the session over and the user chose not to take it back.
     TakenOver { by: String, at_unix_ms: u64 },
     /// The session is attached from another client and the user chose not to take it over.
-    Attached { by: String, since_unix_ms: u64 },
+    /// `connected` is false when that client's link was down (a laptop asleep, a client gone
+    /// without detaching): the ending says "(disconnected)", as the question did.
+    Attached {
+        by: String,
+        since_unix_ms: u64,
+        connected: bool,
+    },
     /// The session was killed and recreated (or the daemon restarted) and the user chose not to
     /// start a fresh attach.
     SessionReplaced,
@@ -261,8 +269,13 @@ impl Outcome {
                 "fil: session \"{session}\" was taken over by {by} at {} (left alone)",
                 time_format(*at_unix_ms)
             ),
-            Outcome::Attached { by, since_unix_ms } => format!(
-                "fil: session \"{session}\" is attached from {by} since {}; left alone (--take-over takes it without asking)",
+            Outcome::Attached {
+                by,
+                since_unix_ms,
+                connected,
+            } => format!(
+                "fil: session \"{session}\" is attached from {by}{} since {}; left alone (--take-over takes it without asking)",
+                if *connected { "" } else { " (disconnected)" },
                 time_format(*since_unix_ms)
             ),
             Outcome::SessionReplaced => format!(

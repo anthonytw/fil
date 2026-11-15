@@ -45,6 +45,8 @@ fil-client.workspace = true
 fil-daemon.workspace = true
 fil-forward.workspace = true
 fil-proto.workspace = true
+# `ignored_signals`: the dispositions a `fil -N` honors (already in the build, through fil-daemon).
+fil-session.workspace = true
 fil-transport.workspace = true
 # `localtime_r`, for the time zone of `fil ports` (rustix has no time zone calls): one narrow
 # `unsafe` in src/localtime.rs.

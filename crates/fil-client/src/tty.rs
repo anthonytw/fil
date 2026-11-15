@@ -267,7 +267,16 @@ pub fn from_fds(
 /// tunnel in the background is not stopped by `SIGTTIN`), and the output takes every write and
 /// keeps nothing, is never raw, and is 80x24. Works with no terminal on any descriptor. Must be
 /// called inside a tokio runtime (it starts the signal tasks).
-pub fn headless(local_term: Option<String>) -> io::Result<Terminal<SignalInput, NullOutput>> {
+///
+/// `ignored` (bit `n - 1` for signal `n`) are the signals this process was started with
+/// ignored: they get no handler and stay ignored, as in OpenSSH's client, so `nohup fil -N ...`
+/// lives through the terminal's hangup and a script's `&` job (SIGINT and SIGQUIT ignored by
+/// `sh`) through the script's `^C`. The caller reads them (the `fil` binary from the process
+/// table, `fil_session::proc::ignored_signals`); 0 installs every handler.
+pub fn headless(
+    local_term: Option<String>,
+    ignored: u64,
+) -> io::Result<Terminal<SignalInput, NullOutput>> {
     let (tx, rx) = mpsc::channel(4);
     let mut tasks = Vec::new();
     for (kind, num) in [
@@ -276,6 +285,9 @@ pub fn headless(local_term: Option<String>) -> io::Result<Terminal<SignalInput, 
         (SignalKind::interrupt(), 2),
         (SignalKind::quit(), 3),
     ] {
+        if ignored & (1u64 << (num - 1)) != 0 {
+            continue;
+        }
         let mut s = signal(kind)?;
         let txs = tx.clone();
         tasks.push(tokio::spawn(async move {

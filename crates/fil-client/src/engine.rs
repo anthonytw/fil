@@ -2616,7 +2616,11 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
             }
             // A tunnel is stopped by a signal: that is its `~.`, so the daemon is told and the
             // session's `-R` listeners refuse at once instead of holding connections for a link.
-            TermEvent::Signal(_) if self.cfg.tunnel.is_some() => Ok(Ev::Detach),
+            // Before the first attach there is nothing to detach: the run was stopped (the `fil`
+            // binary exits 255 for it, as `ssh -N` does).
+            TermEvent::Signal(_) if self.cfg.tunnel.is_some() && self.first_attached => {
+                Ok(Ev::Detach)
+            }
             TermEvent::Signal(n) => Ok(Ev::End(Outcome::Signalled(n))),
             TermEvent::Eof => Ok(Ev::End(Outcome::InputClosed)),
         }
@@ -2860,9 +2864,15 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 self.fwd_confirm = None;
             }
             Note::Notice(lines) if self.cfg.tunnel.is_some() => {
-                for l in &lines {
-                    self.tunnel_say(l.trim());
-                }
+                // Wrapped for the overlay: one line again, without its own "fil: " (the sink
+                // has one).
+                let one = lines
+                    .iter()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.tunnel_say(one.strip_prefix("fil: ").unwrap_or(&one));
                 return Ok(());
             }
             Note::Notice(lines) => {
@@ -2902,6 +2912,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     Outcome::Attached {
                         by,
                         since_unix_ms: holder.since_unix_ms,
+                        connected: *connected,
                     },
                 )
             }
@@ -2916,7 +2927,28 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
         };
         self.link_ok = false;
         if self.cfg.tunnel.is_some() {
-            // Nobody to ask: no, and the ending says why (`leave_screen`).
+            // Nobody to ask. A session whose holder is disconnected (a tunnel or a laptop gone
+            // without detaching: asleep, killed, its link cut) is taken, and said so, so that a
+            // restarted tunnel is not locked out by its own ghost; anything else is a no, and the
+            // ending says why (`leave_screen`). `--take-over` never gets here.
+            if let (
+                Prompt::TakeOver {
+                    holder,
+                    connected: false,
+                    ..
+                },
+                Outcome::Attached { by, .. },
+            ) = (&prompt, &no)
+            {
+                let line = format!(
+                    "taking session \"{session}\" over from {by}, attached since {} and disconnected",
+                    (self.cfg.time_format)(holder.since_unix_ms)
+                );
+                self.tunnel_say(&line);
+                self.disconnected_since.get_or_insert_with(Instant::now);
+                self.attempt = 0;
+                return Ok(Ok(()));
+            }
             return Ok(Err(no));
         }
         self.confirm = None;

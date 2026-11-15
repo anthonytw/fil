@@ -79,6 +79,6 @@ When a link drops and comes back, the client says where it stopped and the daemo
 - `2` on a usage error;
 - `255` if a forward failed and `forward_failure = "exit"`.
 
-`fil -N HOST` exits the same way, except that Ctrl-C (or SIGTERM, SIGHUP, SIGQUIT) is how a tunnel is stopped: it detaches, and the status is `0`.
+`fil -N HOST` exits the same way, except that Ctrl-C (or SIGTERM, SIGHUP, SIGQUIT) is how a tunnel is stopped: it detaches, and the status is `0` (`255` if it came before the tunnel was attached, as with `ssh -N`). A tunnel takes over a session whose holder is disconnected without asking, and leaves a connected holder alone (status `1`) unless you give `--take-over`, which an unattended tunnel should.
 
 A host or session named like a subcommand (`ls`, `kill`, `detach`, `forward`, `ports`, `server`, `install`, `config`) is attached with `--`: `fil -- ls`, `fil devbox -- ls`.

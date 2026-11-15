@@ -206,6 +206,16 @@ fn pacman_has_fil(f: &dyn Facts) -> bool {
 /// The line `fil --version` prints after its first: how this copy was installed and how to
 /// upgrade it. Plain text, no newline.
 pub fn upgrade_line(install: &Install) -> String {
+    line(install, true)
+}
+
+/// [`upgrade_line`] without the path of a copy made by hand: for text that is often pasted
+/// elsewhere (`fil ls`'s note about a newer daemon), where the path would show the user's home.
+pub fn upgrade_line_without_path(install: &Install) -> String {
+    line(install, false)
+}
+
+fn line(install: &Install, with_path: bool) -> String {
     match install {
         Install::Homebrew => {
             "Installed with Homebrew. Upgrade: brew upgrade anthonytw/tap/fil".to_string()
@@ -236,6 +246,10 @@ pub fn upgrade_line(install: &Install) -> String {
             "Installed in ~/.local/bin. Upgrade: run the install script again, or copy bin/fil \
              from the new release's archive over it ({RELEASES})"
         ),
+        Install::Manual(_) if !with_path => format!(
+            "Installed by hand. Upgrade: copy bin/fil from the new release's archive over it \
+             ({RELEASES})"
+        ),
         Install::Manual(path) => format!(
             "Installed by hand at {}. Upgrade: copy bin/fil from the new release's archive over \
              it ({RELEASES})",
@@ -245,8 +259,9 @@ pub fn upgrade_line(install: &Install) -> String {
 }
 
 /// A release version, as far as ordering goes: `MAJOR.MINOR.PATCH`, and an optional pre-release
-/// after `-`, which sorts before the release (semver's rule, with the pre-release compared as a
-/// whole string, which is enough for fil's `rc.N`).
+/// after `-`, ordered by SemVer 2.0.0's precedence (section 11): a pre-release sorts before its
+/// release, and its dot-separated identifiers compare one by one, numeric ones as numbers and
+/// below alphanumeric ones, a shorter list first when all else is equal (`rc.9 < rc.10`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Version {
     core: [u64; 3],
@@ -302,8 +317,35 @@ impl Ord for Version {
                 (None, None) => Ordering::Equal,
                 (None, Some(_)) => Ordering::Greater,
                 (Some(_), None) => Ordering::Less,
-                (Some(a), Some(b)) => a.cmp(b),
+                (Some(a), Some(b)) => pre_release_cmp(a, b),
             })
+    }
+}
+
+/// SemVer's precedence of two pre-releases (`rc.10` against `rc.9`).
+fn pre_release_cmp(a: &str, b: &str) -> Ordering {
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    let mut x = a.split('.');
+    let mut y = b.split('.');
+    loop {
+        match (x.next(), y.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(p), Some(q)) => {
+                let o = match (numeric(p), numeric(q)) {
+                    // As numbers, without parsing: no leading zeros in SemVer, so the longer is
+                    // the larger, and equal lengths compare as text.
+                    (true, true) => p.len().cmp(&q.len()).then_with(|| p.cmp(q)),
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (false, false) => p.cmp(q),
+                };
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+        }
     }
 }
 
@@ -338,6 +380,8 @@ mod tests {
         env: HashMap<&'static str, PathBuf>,
         files: HashMap<PathBuf, String>,
         dirs: HashSet<PathBuf>,
+        /// Symbolic links: a path and what it resolves to.
+        links: HashMap<PathBuf, PathBuf>,
     }
 
     impl Fake {
@@ -360,6 +404,14 @@ mod tests {
             self.env.insert(name, path.into());
             self
         }
+        fn link(mut self, path: &str, to: &str) -> Fake {
+            self.links.insert(path.into(), to.into());
+            self
+        }
+        fn home(mut self, home: &str) -> Fake {
+            self.home = Some(home.into());
+            self
+        }
     }
 
     impl Facts for Fake {
@@ -378,8 +430,8 @@ mod tests {
         fn exists(&self, path: &Path) -> bool {
             self.dirs.contains(path) || self.files.contains_key(path)
         }
-        fn canonical(&self, _path: &Path) -> Option<PathBuf> {
-            None
+        fn canonical(&self, path: &Path) -> Option<PathBuf> {
+            self.links.get(path).cloned()
         }
         fn list(&self, dir: &Path) -> Vec<String> {
             // Every entry whose path, or a parent of it, is right below `dir`.
@@ -461,6 +513,36 @@ mod tests {
         }
     }
 
+    /// The executable's path is canonical; the places it is compared with may go through a
+    /// symbolic link (a home or `~/.cargo` that is a link, macOS's `/var` in `/private/var`).
+    #[test]
+    fn a_place_reached_through_a_symbolic_link_still_matches() {
+        // $HOME is a link to /data/u: ~/.cargo/bin, ~/.local/bin and the install root all match.
+        let linked = |exe: &str| {
+            Fake::at(exe)
+                .home("/home/u")
+                .link("/home/u/.cargo/bin", "/data/u/.cargo/bin")
+                .link("/home/u/.local/bin/fil", "/data/u/.local/bin/fil")
+                .link("/home/u/.local/share/fil", "/data/u/.local/share/fil")
+        };
+        assert_eq!(detect(&linked("/data/u/.cargo/bin/fil")), Install::Cargo);
+        assert_eq!(detect(&linked("/data/u/.local/bin/fil")), Install::LocalBin);
+        assert_eq!(
+            detect(&linked("/data/u/.local/share/fil/0.4.0-w1.16/fil")),
+            Install::FilInstall
+        );
+        // CARGO_HOME through a link.
+        let cargo = Fake::at("/private/var/cargo/bin/fil")
+            .env("CARGO_HOME", "/var/cargo")
+            .link("/var/cargo/bin", "/private/var/cargo/bin");
+        assert_eq!(detect(&cargo), Install::Cargo);
+        // Without the links the same paths are copies by hand.
+        assert_eq!(
+            detect(&Fake::at("/data/u/.cargo/bin/fil")),
+            Install::Manual("/data/u/.cargo/bin/fil".into())
+        );
+    }
+
     #[test]
     fn a_near_miss_is_not_taken_for_a_package() {
         // /usr/bin/fil that dpkg's list of another package names, or fil's list without it.
@@ -517,6 +599,16 @@ mod tests {
         assert!(upgrade_line(&Install::Homebrew).ends_with("brew upgrade anthonytw/tap/fil"));
         assert!(upgrade_line(&Install::Cargo).ends_with("cargo install --locked fil-shell"));
         assert!(upgrade_line(&Install::Manual("/opt/x/fil".into())).contains("/opt/x/fil"));
+        // Without the path, for pasted text; every other way is the same line.
+        let short = upgrade_line_without_path(&Install::Manual("/home/u/bin/fil".into()));
+        assert!(
+            !short.contains("/home/u") && short.contains("Upgrade: "),
+            "{short}"
+        );
+        assert_eq!(
+            upgrade_line_without_path(&Install::Cargo),
+            upgrade_line(&Install::Cargo)
+        );
         // A path is shown sanitized.
         let odd = upgrade_line(&Install::Manual("/tmp/\x1b[2Jfil".into()));
         assert!(!odd.contains('\x1b'), "{odd:?}");
@@ -530,6 +622,25 @@ mod tests {
         assert!(v("0.10.0") > v("0.9.0"), "numbers, not text");
         assert!(v("1.0.0") > v("1.0.0-rc.1"), "a pre-release comes first");
         assert!(v("1.0.0-rc.2") > v("1.0.0-rc.1"));
+        // SemVer's precedence, not text: numeric identifiers as numbers.
+        assert!(v("1.0.0-rc.10") > v("1.0.0-rc.9"));
+        assert!(v("1.0.0-rc.9") < v("1.0.0-rc.10"));
+        assert!(v("1.0.0-rc.1") < v("1.0.0"));
+        // SemVer 2.0.0's own example chain.
+        let chain = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ];
+        for w in chain.windows(2) {
+            assert!(v(w[0]) < v(w[1]), "{} < {}", w[0], w[1]);
+        }
+        assert_eq!(v("1.0.0-rc.1").cmp(&v("1.0.0-rc.1")), Ordering::Equal);
         assert_eq!(v("0.4.0").to_string(), "0.4.0");
         assert_eq!(v("1.0.0-rc.1").to_string(), "1.0.0-rc.1");
         for bad in [

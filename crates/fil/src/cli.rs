@@ -108,7 +108,7 @@ fil was stopped by signal N;
 attached elsewhere and you did not take it over;
 2 on a usage error;
 255 if a forward failed and forward_failure = \"exit\".
-With -N, a stop signal (Ctrl-C) detaches and exits 0.
+With -N, a stop signal (Ctrl-C) detaches and exits 0, or 255 before the session is attached.
 
 Source: every release publishes fil-<version>-source.tar.gz beside the binaries (GPL-3.0 Corresponding Source).";
 
@@ -187,7 +187,9 @@ pub struct AttachArgs {
 
     /// Tunnel only, as ssh -N: hold the forwards (and the agent relay, with -A) with no terminal,
     /// until interrupted. Needs a forward (-L, -R, -D, the config's) or -A. The session defaults
-    /// to "tunnel", not "main", so it never asks to take your shell's session
+    /// to "tunnel", not "main", so it never asks to take your shell's session. It asks nothing:
+    /// a session whose holder is disconnected is taken over, a connected holder is left alone
+    /// (status 1) unless --take-over is given, which an unattended tunnel should
     #[arg(short = 'N')]
     pub tunnel: bool,
 }

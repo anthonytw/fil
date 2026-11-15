@@ -105,6 +105,9 @@ pub struct Connect {
     ssh_host: OnceCell<Option<SshHost>>,
     lookup: Lookup,
     resolved: Mutex<Option<Resolved>>,
+    /// A tunnel (`fil -N`): the pipe commands start with the terminal's signals ignored
+    /// ([`pipe_config`]).
+    tunnel: bool,
 }
 
 struct Resolved {
@@ -140,7 +143,14 @@ impl Connect {
             ssh_host: OnceCell::new(),
             lookup: system_lookup(),
             resolved: Mutex::new(None),
+            tunnel: false,
         })
+    }
+
+    /// For a tunnel (`fil -N`, [`pipe_config`]'s `tunnel`).
+    pub fn for_tunnel(mut self, tunnel: bool) -> Self {
+        self.tunnel = tunnel;
+        self
     }
 
     /// The run's choice of remote command (`remote = ...`), shared with whoever else connects
@@ -163,7 +173,8 @@ impl Connect {
             // user's command is what runs.
             _ => &self.command,
         };
-        let cfg = pipe_config(self.params, interactive);
+        let mut cfg = pipe_config(self.params, interactive);
+        cfg.ignore_job_signals = self.tunnel;
         let command = if interactive {
             base.clone()
         } else {
@@ -419,6 +430,11 @@ impl Connector for Connect {
 ///   reader for the user's keystrokes, which would send the answer to the remote shell and the
 ///   offline-input log; the preamble timeout ends such a run and reaps the whole group. The
 ///   status note then says the pipe needs an interactive login. Its stderr is captured, not shown.
+///
+/// A tunnel (`fil -N`) also starts every run with SIGHUP, SIGINT and SIGQUIT ignored
+/// (`PipeConfig::ignore_job_signals`, set by [`Connect`]): its terminal stays cooked, so the
+/// terminal's `^C` and hangup go to the whole foreground group, the interactive run included, and
+/// would kill the link before the client could send its `Detach` over it.
 pub fn pipe_config(params: LinkParams, interactive: bool) -> PipeConfig {
     let mut cfg = PipeConfig::new(params);
     if interactive {

@@ -1847,6 +1847,153 @@ pub fn fwd_tunnel_only(ctx: &Ctx, host: &str) -> Res {
     Ok(notes)
 }
 
+/// `fil -N` over the pipe (no QUIC), where the link is the ssh (or relay) the client started in
+/// its own foreground group: the terminal's `^C` reaches that command too, and must not kill the
+/// link before the client's `Detach` goes over it (review of #5, F1). Asserted from the daemon's
+/// side: after Ctrl-C a second `-N` on the session attaches as to a free one, without taking it
+/// over from a disconnected holder (`fil ls` shows a disconnected holder as `-` too, so it cannot
+/// tell). Then `nohup`'s case (F2): a `-N` started with SIGHUP ignored lives through a SIGHUP, and
+/// SIGTERM then ends it with status 0, detached (a third `-N` again takes over from nobody).
+pub fn fwd_tunnel_pipe(ctx: &Ctx, host: &str) -> Res {
+    let p = mac_ports();
+    let mut notes = Vec::new();
+    let session = "dp-ftp";
+    let args = vec![
+        "-N".to_string(),
+        "-L".to_string(),
+        format!("{}:127.0.0.1:{PL}", p.l),
+    ];
+    let tunnel = |tag: &str| -> Result<Client, String> {
+        let c = ctx.client_with(
+            host,
+            Variant::Pipe,
+            session,
+            24,
+            80,
+            &crate::Extra {
+                args: &args,
+                ..Default::default()
+            },
+        );
+        if c.expect("holding the forwards of session", ATTACH_TIMEOUT)
+            .is_none()
+        {
+            return Err(format!(
+                "the {tag} -N client never said it was up\n{}",
+                c.dump()
+            ));
+        }
+        Ok(c)
+    };
+
+    // Ctrl-C on the first: a detach the daemon hears.
+    let mut first = tunnel("first")?;
+    first.send("\x03");
+    let exit = first.wait_exit(Duration::from_secs(10)).map(|e| e.1);
+    notes.push(format!(
+        "Ctrl-C on a -N over the pipe: exit {exit:?} (asserted: 0)"
+    ));
+    if exit != Some(0) {
+        notes.push(format!(
+            "{MISS}Ctrl-C on the -N: exit {exit:?}\n{}",
+            first.tail()
+        ));
+    }
+    // A second -N on the same session attaches as to a free session.
+    let mut second = tunnel("second")?;
+    let took = second.text().contains("taking session");
+    notes.push(format!(
+        "a second -N on the session: attached, took it from a ghost: {took} (asserted: false)"
+    ));
+    if took {
+        notes.push(format!(
+            "{MISS}the second -N found the first still holding the session: {}",
+            second.tail()
+        ));
+    }
+    second.send("\x03");
+    let _ = second.wait_exit(Duration::from_secs(10));
+
+    // nohup: SIGHUP ignored at start stays ignored.
+    let cfg = ctx.config(host, Variant::Pipe);
+    let state = ctx.work.join("state").join("ftp-nohup");
+    let _ = std::fs::create_dir_all(&state);
+    let log = ctx.work.join("ftp-nohup.err");
+    let err = std::fs::File::create(&log).map_err(|e| e.to_string())?;
+    let mut nh = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("trap '' HUP; exec \"$0\" \"$@\"")
+        .arg(&ctx.fil)
+        .arg("--config")
+        .arg(&cfg)
+        .args(&args)
+        .args([host, session])
+        .env("XDG_STATE_HOME", &state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(err)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let said = || std::fs::read_to_string(&log).unwrap_or_default();
+    let t0 = Instant::now();
+    while !said().contains("holding the forwards") {
+        if t0.elapsed() > ATTACH_TIMEOUT || nh.try_wait().ok().flatten().is_some() {
+            let _ = nh.kill();
+            let _ = nh.wait();
+            return Err(format!("the nohup -N never came up: {}", said()));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let pid = nh.id().to_string();
+    let signal = |sig: &str| {
+        let _ = Command::new("kill").args([sig, &pid]).status();
+    };
+    signal("-HUP");
+    thread::sleep(Duration::from_millis(1500));
+    let alive = nh.try_wait().ok().flatten().is_none();
+    notes.push(format!(
+        "a -N started with SIGHUP ignored, sent SIGHUP: still running {alive} (asserted)"
+    ));
+    if !alive {
+        notes.push(format!(
+            "{MISS}nohup's -N did not live through SIGHUP: said {}",
+            said()
+        ));
+    }
+    signal("-TERM");
+    let t1 = Instant::now();
+    let code = loop {
+        if let Some(st) = nh.try_wait().map_err(|e| e.to_string())? {
+            break st.code();
+        }
+        if t1.elapsed() > Duration::from_secs(10) {
+            let _ = nh.kill();
+            let _ = nh.wait();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    notes.push(format!("then SIGTERM: exit {code:?} (asserted: 0)"));
+    if code != Some(0) {
+        notes.push(format!(
+            "{MISS}SIGTERM on the nohup -N: exit {code:?}, said {}",
+            said()
+        ));
+    }
+    let mut third = tunnel("third")?;
+    let took = third.text().contains("taking session");
+    notes.push(format!(
+        "a third -N after the SIGTERM took it from a ghost: {took} (asserted: false)"
+    ));
+    if took {
+        notes.push(format!("{MISS}SIGTERM did not detach: {}", third.tail()));
+    }
+    third.send("\x03");
+    let _ = third.wait_exit(Duration::from_secs(10));
+    let _ = ctx.fil_cmd(host, Variant::Pipe, &["kill", host, session]);
+    Ok(notes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{accepts, kv};

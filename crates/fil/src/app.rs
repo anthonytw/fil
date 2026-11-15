@@ -32,7 +32,7 @@ const POST_RUN_WRITE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Exit status of a normal end.
 const OK: u8 = 0;
 /// Exit status when a forward cannot be set up and `forward_failure = "exit"`, as ssh's
-/// `ExitOnForwardFailure`.
+/// `ExitOnForwardFailure`; also of a `-N` stopped before its first attach, as `ssh -N`.
 const FORWARD_FAILED: u8 = 255;
 
 /// Exit status of an error, and of a session that was taken, replaced or detached from elsewhere.
@@ -181,7 +181,7 @@ enum Mode {
 /// thing, so a tunnel with nothing in it would only start an idle shell on the host and wait.
 fn tunnel_refusal(plan: &ForwardPlan) -> Option<&'static str> {
     (plan.specs.is_empty() && plan.agent == crate::config::AgentMode::Off).then_some(
-        "-N needs something to hold: a forward (-L, -R, -D, or the config's `forwards`) or the agent (-A)",
+        "-N needs something to hold: a forward (-L, -R, -D, or the config's `forward`) or the agent (-A)",
     )
 }
 
@@ -239,7 +239,9 @@ async fn attach(
         settings.direct_address.clone(),
         LinkParams::default(),
     ) {
-        Ok(c) => c.with_run(run.clone(), Offer::Attach(settings.install)),
+        Ok(c) => c
+            .with_run(run.clone(), Offer::Attach(settings.install))
+            .for_tunnel(mode == Mode::Tunnel),
         Err(e) => {
             eprintln!("fil: {e}");
             return FAILED;
@@ -273,7 +275,11 @@ async fn attach(
                 return FAILED;
             }
         },
-        Mode::Tunnel => match fil_client::tty::headless(std::env::var("TERM").ok()) {
+        Mode::Tunnel => match fil_client::tty::headless(
+            std::env::var("TERM").ok(),
+            // An inherited SIG_IGN (`nohup`, a script's `&` job) stays: no handler for it.
+            fil_session::proc::ignored_signals(std::process::id()).unwrap_or(0),
+        ) {
             Ok(term) => {
                 let sink: LineSink = std::sync::Arc::new(|line: &str| {
                     fil_client::tty::write_stderr_within(&format!("fil: {line}\n"), POST_RUN_WRITE);
@@ -312,9 +318,18 @@ async fn attach(
         };
         fil_client::tty::write_stderr_within(&line, POST_RUN_WRITE);
     }
-    // A tunnel is stopped by a signal, which detaches it (`ClientConfig::tunnel`): 0, as any
-    // detach. Everything else ends as an attach does.
-    exit_code(&result)
+    mode_exit_code(mode, &result)
+}
+
+/// [`exit_code`] for a run in `mode`. A tunnel is stopped by a signal, which detaches it
+/// (`ClientConfig::tunnel`): 0, as any detach. Stopped before its first attach it detached
+/// nothing (the engine ends it as `Signalled`): 255, as `ssh -N` exits when interrupted during
+/// its login. Everything else ends as an attach does.
+fn mode_exit_code(mode: Mode, result: &Result<Outcome, ClientError>) -> u8 {
+    match (mode, result) {
+        (Mode::Tunnel, Ok(Outcome::Signalled(_))) => FORWARD_FAILED,
+        _ => exit_code(result),
+    }
 }
 
 /// One run of the client on `term`; `tunnel` makes it a tunnel-only run.
@@ -546,6 +561,26 @@ mod tests {
             tunnel_refusal(&plan(&["-N", "devbox"], "[defaults]\nagent = \"on\"\n")),
             None
         );
+    }
+
+    #[test]
+    fn a_tunnel_stopped_before_its_first_attach_exits_255() {
+        assert_eq!(
+            mode_exit_code(Mode::Tunnel, &Ok(Outcome::Signalled(2))),
+            255
+        );
+        assert_eq!(
+            mode_exit_code(Mode::Attach, &Ok(Outcome::Signalled(2))),
+            130
+        );
+        // After it: a detach, 0; the rest as an attach.
+        assert_eq!(mode_exit_code(Mode::Tunnel, &Ok(Outcome::Detached)), 0);
+        let held = Ok(Outcome::Attached {
+            by: "x".into(),
+            since_unix_ms: 0,
+            connected: true,
+        });
+        assert_eq!(mode_exit_code(Mode::Tunnel, &held), 1);
     }
 
     #[test]

@@ -523,6 +523,39 @@ pub fn process_row(pid: u32) -> Option<ProcRow> {
     process_row_without_proc(pid)
 }
 
+/// The signals `pid` ignores (`SIG_IGN`), as a mask with bit `n - 1` for signal `n`, read without
+/// a signal call (rustix has none that is safe): `SigIgn` in `/proc/<pid>/status` on Linux, the
+/// process table's `p_sigignore` on macOS (what `ps -o ignored` shows). `None` when it cannot be
+/// read. For a client that must honor an inherited `SIG_IGN` (`nohup`, a script's `&` job) before
+/// it installs its own handlers, as OpenSSH does.
+pub fn ignored_signals(pid: u32) -> Option<u64> {
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        return parse_sig_ign(&status);
+    }
+    ignored_without_proc(pid)
+}
+
+/// `SigIgn:` of a `/proc/<pid>/status`: 16 hex digits.
+pub fn parse_sig_ign(status: &str) -> Option<u64> {
+    let hex = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigIgn:"))?
+        .trim();
+    u64::from_str_radix(hex, 16).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn ignored_without_proc(pid: u32) -> Option<u64> {
+    let pid_i = libc::c_int::try_from(pid).ok()?;
+    let buf = kinfo::read_one(pid_i).ok()?;
+    kinfo::sig_ignore(&buf, pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ignored_without_proc(_pid: u32) -> Option<u64> {
+    None
+}
+
 #[cfg(target_os = "macos")]
 fn process_row_without_proc(pid: u32) -> Option<ProcRow> {
     let pid_i = libc::c_int::try_from(pid).ok()?;
@@ -593,6 +626,23 @@ mod kinfo {
     const PPID: usize = 560;
     /// `SZOMB` in `<sys/proc.h>`.
     const SZOMB: u8 = 5;
+    /// `kp_proc.p_sigignore`, a `sigset_t` (`u32`, bit `n - 1` for signal `n`).
+    #[cfg(target_os = "macos")]
+    const SIGIGNORE: usize = 232;
+
+    /// `p_sigignore` of `pid`'s entry in the buffer, if it is there.
+    #[cfg(target_os = "macos")]
+    pub(super) fn sig_ignore(buf: &[u8], pid: u32) -> Option<u64> {
+        let (entries, _partial) = buf.as_chunks::<SIZE>();
+        entries
+            .iter()
+            .find(|k| i32::from_ne_bytes(k[PID..PID + 4].try_into().expect("4")) as u32 == pid)
+            .map(|k| {
+                u64::from(u32::from_ne_bytes(
+                    k[SIGIGNORE..SIGIGNORE + 4].try_into().expect("4"),
+                ))
+            })
+    }
 
     /// Rows from the buffer `sysctl` filled. A trailing partial entry (there is none from the
     /// kernel) is ignored.
@@ -1619,6 +1669,47 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The signals a live process ignores, from `/proc` on Linux and the process table on macOS
+    /// (`p_sigignore`, whose offset this checks against the real kernel).
+    #[test]
+    fn ignored_signals_are_read_for_a_live_process() {
+        // `sh` keeps a disposition it was started with ignored, and `exec` keeps it too: the
+        // sleeper ignores SIGHUP and SIGINT; the plain one ignores neither.
+        let spawn = |script: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .spawn()
+                .unwrap()
+        };
+        let mut ignoring = spawn("trap '' HUP INT; exec sleep 30");
+        let mut plain = spawn("exec sleep 30");
+        let bit = |n: u32| 1u64 << (n - 1);
+        // `exec` may not have happened yet: wait until the mask shows the traps.
+        let mut got = None;
+        for _ in 0..200 {
+            got = ignored_signals(ignoring.id());
+            if got.is_some_and(|m| m & bit(1) != 0) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let m = got.expect("readable");
+        assert_ne!(m & bit(1), 0, "SIGHUP not seen ignored: {m:#x}");
+        assert_ne!(m & bit(2), 0, "SIGINT not seen ignored: {m:#x}");
+        assert_eq!(m & bit(3), 0, "SIGQUIT seen ignored: {m:#x}");
+        let p = ignored_signals(plain.id()).expect("readable");
+        assert_eq!(p & (bit(1) | bit(2)), 0, "{p:#x}");
+        for c in [&mut ignoring, &mut plain] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        assert_eq!(
+            parse_sig_ign("Name:\tx\nSigIgn:\t0000000000000003\n"),
+            Some(3)
+        );
+        assert_eq!(parse_sig_ign("Name:\tx\n"), None);
     }
 
     /// The offsets in `kinfo` against the real kernel: this process, a running child and a

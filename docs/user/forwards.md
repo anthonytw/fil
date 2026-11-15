@@ -29,6 +29,24 @@ The specs are written as in ssh, with these differences:
 
 The list of forwards a host should have can also live in your config; see [`config.toml`](config.md).
 
+## Forwards without a terminal: `-N`
+
+`-N` holds a session's forwards with no terminal, as `ssh -N` does: nothing on your screen is the session's, no key is read, and it stays up, reconnecting as any fil does, until you stop it with Ctrl-C (or SIGTERM). It runs in the background, from a script, or from a service manager just as well.
+
+```sh
+fil -N devbox -L 5432         # localhost:5432 here → port 5432 on devbox, until Ctrl-C
+fil -N devbox db -R 9000 -A   # in the session "db", with your agent relayed to it
+fil -N devbox -L 5432 &       # in the background
+```
+
+- It needs something to hold: a forward (a flag, or your config's `forward`) or `-A`. With neither it exits with status 2 and connects nowhere.
+- The session is `tunnel` unless you name one, not `main`, so it never asks to take over the session your shell is attached to. It is an ordinary session with an idle shell on the host: `fil ls` lists it, `fil kill devbox tunnel` ends it, and attaching to it with a terminal takes it over.
+- It cannot ask you anything, so it says no: a forward the host asks for (`fil forward`, below) is refused, and a signature `agent = "confirm"` would ask about is refused.
+- A session another client holds: if that client is disconnected (an earlier tunnel that was killed, slept or lost its network without detaching), `-N` takes the session over and says so; if it is connected, `-N` leaves it alone and exits 1. `--take-over` takes it either way: give it to a tunnel that runs unattended (a service, a script) and must win.
+- A signal it was started with ignored stays ignored, so `nohup fil -N devbox -L 5432 &` survives closing the terminal.
+- What it has to say goes to stderr: when it holds the forwards, when the link is lost and back, and how it ended.
+- Ctrl-C detaches it and exits 0: the host's `-R` ports then refuse connections at once. Ctrl-C before it is attached (during the ssh login) exits 255, as `ssh -N` does. If the session ends it exits with the shell's status; taken over or detached elsewhere, or held by a connected client, 1; a forward that fails under `forward_failure = "exit"`, 255.
+
 ## Adding and removing forwards later
 
 ```sh

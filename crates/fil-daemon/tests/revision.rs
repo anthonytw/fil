@@ -62,6 +62,7 @@ fn other(revision: u16) -> OtherDaemon {
         major: PROTOCOL_MAJOR,
         revision,
         version: None,
+        ext: fil_proto::ext::RowExt::default(),
     }
 }
 
@@ -454,19 +455,20 @@ async fn a_client_from_before_revisions_is_routed_to_the_legacy_socket() {
     }
 }
 
-/// The 1.x wire is one wire (DESIGN.md section 8.5): a client of another 1.x revision whose own
-/// daemon is not running is served by the relay's daemon, not refused.
+/// The 1.x wire is one wire (DESIGN.md section 8.5): a daemon serves a client of another 1.x
+/// revision. (Straight to the socket: which daemon a relay routes a 1.x client to is decision
+/// D2's, PR #8.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_1x_client_of_another_revision_is_served_by_the_relays_daemon() {
+async fn a_1x_client_of_another_revision_lists_and_attaches() {
     let s = Scratch::new();
     let d = start_rev(&s, rev_new(), CAT).await;
-    let link = pipe_through_relay(relay_options(d.paths.clone())).await;
+    let link = d.direct_link().await;
     match request_rev(&link, Request::ListSessions, rev_old()).await {
         Response::Sessions { list, .. } => assert!(list.is_empty()),
         other => panic!("{other:?}"),
     }
-    // And an attach of the older revision works against the newer daemon, both ways round.
-    let link = d.pipe().await;
+    // And an attach of the older revision works against the newer daemon.
+    let link = d.direct_link().await;
     let mut c = Client::attach(link, Connect::new("mixed", key(1))).await;
     assert!(c.refused.is_none() && c.errors.is_empty(), "{:?}", c.errors);
     c.wait_screen("ready").await;
@@ -482,6 +484,11 @@ async fn a_1x_client_of_another_revision_is_served_by_the_relays_daemon() {
         .unwrap();
     c.link
         .send(ChannelId::CONTROL, Bytes::from_static(&[0xC8, 0x01, 9]))
+        .await
+        .unwrap();
+    // Data on a channel 1.0 does not use (a later build's channel, behind a feature): ignored.
+    c.link
+        .send(ChannelId(7), Bytes::from_static(&[0, b'x']))
         .await
         .unwrap();
     c.type_bytes(b"across revisions\n").await;
@@ -504,9 +511,12 @@ async fn a_later_1x_client_is_understood_as_far_as_this_daemon_can() {
 
     let link = d.direct_link().await;
     send_ctl(&link, &hello_rev(rev_new())).await;
+    // A message this daemon does not know comes first (a relay's `Route`, say), then the
+    // features: accepted anywhere before the request, once.
+    link.send(ChannelId::CONTROL, unknown()).await.unwrap();
     let future = FeatureSet::from_bytes(&[0xff, 0x00, 0x81]).unwrap();
     send_ctl(&link, &ControlMsg::Features(future)).await;
-    for _ in 0..MAX_SKIPPED_HANDSHAKE {
+    for _ in 1..MAX_SKIPPED_HANDSHAKE {
         link.send(ChannelId::CONTROL, unknown()).await.unwrap();
     }
     let mut attach = ControlMsg::Attach(Connect::new("later", key(1)).attach())
@@ -543,6 +553,18 @@ async fn a_later_1x_client_is_understood_as_far_as_this_daemon_can() {
         "{seen:?}"
     );
     link.close();
+
+    // A second `Features`: a protocol error.
+    let link = d.direct_link().await;
+    send_ctl(&link, &hello_rev(rev_new())).await;
+    send_ctl(&link, &ControlMsg::Features(FeatureSet::none())).await;
+    send_to_a_refusing_daemon(&link, &ControlMsg::Features(FeatureSet::none())).await;
+    let (seen, ended) = drain_to_end(&link).await;
+    assert!(ended, "{seen:?}");
+    assert!(
+        seen.contains(&ControlMsg::Error(ErrorCode::Protocol)),
+        "{seen:?}"
+    );
 
     // One unknown message too many before the request: a protocol error, and nothing attached.
     let link = d.direct_link().await;

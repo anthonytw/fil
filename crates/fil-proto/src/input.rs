@@ -53,8 +53,10 @@ pub enum InputRecord {
     Repaint,
 }
 
-/// How many variants [`InputRecord`] has: an index at or past it is a later build's record.
-const RECORD_KINDS: u32 = 2;
+/// How many variants [`InputRecord`] has: an index at or past it is a later build's record. Kept
+/// by hand; `tests/wire_golden.rs` parses every record it pins, so a kind added without raising
+/// it fails there.
+pub const RECORD_KINDS: u32 = 2;
 
 /// What a payload on the terminal channel, client to daemon, holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn a_segment_that_looks_like_the_mark_is_refused() {
+    fn a_segment_at_the_mark_is_never_keys() {
         // Seq u64::MAX with data: never a segment (seq + len overflows); read as a record, its
         // first byte is a kind no build has yet, so it is skipped as a later build's.
         let mut wire = postcard::to_allocvec(&u64::MAX).unwrap();

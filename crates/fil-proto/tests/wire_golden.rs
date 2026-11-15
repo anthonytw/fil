@@ -1165,6 +1165,7 @@ fn summary() -> SessionSummary {
         forwards: 2,
         agent: true,
         daemon_version: FilVersion::new("1.0.0").unwrap(),
+        ext: fil_proto::ext::RowExt::default(),
     }
 }
 
@@ -1178,11 +1179,13 @@ fn responses() -> Vec<Response> {
                     major: 1,
                     revision: 0,
                     version: None,
+                    ext: fil_proto::ext::RowExt::default(),
                 },
                 OtherDaemon {
                     major: 1,
                     revision: 2,
                     version: None,
+                    ext: fil_proto::ext::RowExt::default(),
                 },
             ],
         },
@@ -1619,6 +1622,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
                 forwards: u16::MAX,
                 agent: true,
                 daemon_version: FilVersion::new(longest('9', MAX_FIL_VERSION)).unwrap(),
+                ext: fil_proto::ext::RowExt::from_bytes(&[0xee; MAX_ROW_EXT]).unwrap(),
             }],
             truncated: true,
             others: vec![
@@ -1626,6 +1630,7 @@ fn control_msgs() -> Vec<(String, ControlMsg)> {
                     major: u16::MAX,
                     revision: u16::MAX,
                     version: Some(FilVersion::new(longest('9', MAX_FIL_VERSION)).unwrap()),
+                    ext: fil_proto::ext::RowExt::from_bytes(&[0xee; MAX_ROW_EXT]).unwrap(),
                 };
                 MAX_OTHER_DAEMONS
             ],
@@ -2001,6 +2006,7 @@ fn limits() -> Entries {
         // The extensible wire (docs/v1/wire.md).
         num("FIRST_STABLE_REVISION", FIRST_STABLE_REVISION),
         num("MAX_FEATURE_BYTES", MAX_FEATURE_BYTES),
+        num("MAX_ROW_EXT", MAX_ROW_EXT),
         num("MAX_SKIPPED_HANDSHAKE", MAX_SKIPPED_HANDSHAKE),
     ]
 }
@@ -2033,6 +2039,12 @@ fn revisioned() -> Entries {
     }
     // In-band records on the terminal channel, client to daemon (fil_proto::input).
     for (label, rec) in input_records() {
+        // This build knows its own records (`input::RECORD_KINDS`).
+        assert_eq!(
+            TerminalInput::parse(&rec.encode().unwrap()),
+            Ok(TerminalInput::Record(rec)),
+            "input/{label}: does not parse as itself (is RECORD_KINDS raised?)"
+        );
         e.push(bytes_entry(
             format!("input/{label}"),
             &rec.encode().unwrap(),
@@ -2040,10 +2052,16 @@ fn revisioned() -> Entries {
     }
     // Records on the MUX channel (fil_proto::mux): the length varint and the message.
     for (label, m) in mux_msgs() {
-        e.push(bytes_entry(
-            format!("mux/{label}"),
-            &encode_record(&m).unwrap(),
-        ));
+        let wire = encode_record(&m).unwrap();
+        // This build knows its own records: none is skipped as a later build's
+        // (`mux::record::MUX_KINDS`).
+        let mut input = &wire[..];
+        assert_eq!(
+            fil_proto::mux::RecordDecoder::new().push(&mut input),
+            Ok(Some(m.clone())),
+            "mux/{label}: does not decode as itself (is MUX_KINDS raised?)"
+        );
+        e.push(bytes_entry(format!("mux/{label}"), &wire));
     }
     // The QUIC stream layout (fil-transport): stream headers, flush markers, length prefixes.
     for (k, v) in fil_transport::quic::pinned::stream_layout() {
@@ -2259,26 +2277,40 @@ fn revisioned() -> Entries {
     }
     for v in [u64::from(u16::MAX), u64::from(u16::MAX) + 1] {
         // Response::Sessions { list: [], truncated, others: [OtherDaemon { major, revision,
-        // version: None }] }.
+        // version: None, ext: [] }] }.
         e.push((
             format!("decode/other-daemon-major-{v}"),
             control_outcome(&raw_msg(
                 response_index(),
-                &[vec![0, 0, 0], vec![1], varint(v), varint(1), vec![0]],
+                &[
+                    vec![0, 0, 0],
+                    vec![1],
+                    varint(v),
+                    varint(1),
+                    vec![0],
+                    vec![0],
+                ],
             )),
         ));
         e.push((
             format!("decode/other-daemon-revision-{v}"),
             control_outcome(&raw_msg(
                 response_index(),
-                &[vec![0, 0, 0], vec![1], varint(1), varint(v), vec![0]],
+                &[
+                    vec![0, 0, 0],
+                    vec![1],
+                    varint(1),
+                    varint(v),
+                    vec![0],
+                    vec![0],
+                ],
             )),
         ));
     }
     // The list of other daemons is capped by the receiver as well as the sender.
     for n in [MAX_OTHER_DAEMONS, MAX_OTHER_DAEMONS + 1] {
         let mut fields = vec![vec![0, 0, 0], varint(n as u64)];
-        fields.extend((0..n).map(|_| vec![1, 1, 0]));
+        fields.extend((0..n).map(|_| vec![1, 1, 0, 0]));
         e.push((
             format!("decode/others-{n}"),
             control_outcome(&raw_msg(response_index(), &fields)),
@@ -2349,6 +2381,21 @@ fn revisioned() -> Entries {
     e.push((
         "decode/control-hello-appended".into(),
         control_outcome(&hello),
+    ));
+    // A row's extension: the longest, and one byte past it.
+    e.push((
+        format!("decode/row-ext-{MAX_ROW_EXT}"),
+        outcome::<fil_proto::ext::RowExt>(&counted(MAX_ROW_EXT, 0)),
+    ));
+    e.push((
+        format!("decode/row-ext-{}", MAX_ROW_EXT + 1),
+        outcome::<fil_proto::ext::RowExt>(&counted(MAX_ROW_EXT + 1, 0)),
+    ));
+    // Non-canonical varints (a variant index written in more bytes than it needs) are accepted,
+    // and frozen so for 1.x: no honest sender writes one, and no misparse follows (docs/v1/wire.md).
+    e.push((
+        "decode/control-non-canonical-index".into(),
+        control_outcome(&[0x85, 0x00]),
     ));
     // Features: the longest set, and one byte past it.
     let feature_index = VARIANTS as u8 - 1;
@@ -2741,7 +2788,7 @@ fn forward_probes() -> Entries {
     }
     for v in [u64::from(u16::MAX), u64::from(u16::MAX) + 1] {
         // SessionSummary { name, term, created, last, attached: None, forwards, agent,
-        // daemon_version }.
+        // daemon_version, ext: [] }.
         let summary = [
             counted_str("main"),
             counted_str("xterm"),
@@ -2751,6 +2798,7 @@ fn forward_probes() -> Entries {
             varint(v),
             vec![1],
             counted_str("1.0.0"),
+            vec![0],
         ]
         .concat();
         e.push((
@@ -3110,6 +3158,20 @@ fn next_history(old: Option<&Parsed>, now: &Now) -> Result<History, String> {
     Ok(h)
 }
 
+/// The variant count the decoder uses to tell a later build's type is this file's count, and
+/// every pinned instance decodes as itself, not as "unknown".
+#[test]
+fn this_build_knows_every_type_it_has() {
+    assert_eq!(fil_proto::msg::CONTROL_VARIANTS as usize, VARIANTS);
+    for (label, m) in control_msgs() {
+        assert_eq!(
+            ControlMsg::decode(&m.encode().unwrap()).as_ref(),
+            Ok(&m),
+            "control/{label}: does not decode as itself (is CONTROL_VARIANTS raised?)"
+        );
+    }
+}
+
 #[test]
 fn every_control_variant_has_an_instance() {
     let mut seen = vec![false; VARIANTS];
@@ -3172,14 +3234,54 @@ fn the_wire_matches_the_golden_for_this_revision() {
 /// `wire.txt` made once, never regenerated (docs/v1/wire.md).
 const GOLDEN_1_0: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/wire-1.0.txt");
 
+/// The `decode/` probes that ask about the first variant past an enum's last (or a type no
+/// build has yet): they change by design when 1.x adds a variant, from a refusal to an accept.
+/// Every other probe pins a decoder's limit, which 1.x may not move.
+const PAST_THE_END: &[&str] = &[
+    "decode/error-code-",
+    "decode/snapshot-reason-",
+    "decode/attach-refusal-",
+    "decode/take-over-",
+    "decode/request-",
+    "decode/response-",
+    "decode/bind-addr-",
+    "decode/open-kind-",
+    "decode/mux-msg-",
+];
+
+/// The probes of "a type no build has yet": the first index past the last control message,
+/// input record and MUX record. When 1.x adds that type the probe's bytes may become a malformed
+/// instance of it, or the probe moves to the next index, so these may change in any way.
+const FIRST_UNKNOWN: &[&str] = &[
+    "decode/control-18-unknown",
+    "decode/input-record-unknown-kind",
+    "decode/mux-record-unknown-kind",
+];
+
+/// Whether a `decode/` outcome refuses (or skips as unknown), and whether it accepts.
+fn refuses(v: &str) -> bool {
+    v.starts_with("err") || v == "unknown"
+}
+fn accepts(v: &str) -> bool {
+    v == "ok" || v == "record" || v.starts_with("records ")
+}
+
 /// What a 1.x wire `now` broke of the 1.0 wire `base`, if anything: every line a 1.0 peer reads
-/// (`[frozen]`, `[limits]`, and the encodings in `[revisioned]`) must still be there, with the
-/// same value. The `decode/` probes are left out: some (the first variant past the last) change
-/// by design when 1.x adds a variant.
+/// (`[frozen]`, `[limits]`, and `[revisioned]`: the encodings and the decoder probes) must still
+/// be there, with the same value. The exceptions: a probe in [`PAST_THE_END`] may go from a
+/// refusal to an accept (1.x added the variant it asks about), and no other way; a probe in
+/// [`FIRST_UNKNOWN`] may change or go.
 fn baseline_problem(base: &Parsed, now: &Now) -> Option<String> {
     if now.major != base.major {
         return None;
     }
+    let current: std::collections::HashMap<&str, &str> = now
+        .frozen
+        .iter()
+        .chain(&now.limits)
+        .chain(&now.revisioned)
+        .filter_map(|l| l.split_once(" = "))
+        .collect();
     let lines: std::collections::HashSet<&String> = now
         .frozen
         .iter()
@@ -3190,8 +3292,19 @@ fn baseline_problem(base: &Parsed, now: &Now) -> Option<String> {
         .iter()
         .chain(&base.limits)
         .chain(&base.revisioned)
-        .filter(|l| !l.starts_with("decode/"))
-        .find(|l| !lines.contains(l))
+        .filter(|l| !lines.contains(l))
+        .find(|l| {
+            let Some((key, was)) = l.split_once(" = ") else {
+                return true;
+            };
+            if FIRST_UNKNOWN.iter().any(|p| key.starts_with(p)) {
+                return false;
+            }
+            let grown = PAST_THE_END.iter().any(|p| key.starts_with(p))
+                && refuses(was)
+                && current.get(key).is_some_and(|now| accepts(now));
+            !grown
+        })
         .map(|l| {
             format!(
                 "the 1.x wire is frozen: `{l}` (golden/wire-1.0.txt) is gone or changed. A 1.x \
@@ -3229,9 +3342,39 @@ fn the_1x_wire_keeps_everything_a_1_0_peer_reads() {
     let mut limit = Now::get();
     limit.limits.pop();
     assert!(baseline_problem(&base, &limit).is_some());
+    // A decoder limit may not move.
     let mut probe = Now::get();
-    probe.revisioned.retain(|l| !l.starts_with("decode/"));
-    assert!(baseline_problem(&base, &probe).is_none());
+    let i = probe
+        .revisioned
+        .iter()
+        .position(|l| l.starts_with("decode/session-name-65 = "))
+        .unwrap();
+    probe.revisioned[i] = "decode/session-name-65 = ok".into();
+    assert!(baseline_problem(&base, &probe).is_some());
+    // A past-the-end probe may go from refused to accepted (1.x added the variant), not back.
+    let mut grown = Now::get();
+    let i = grown
+        .revisioned
+        .iter()
+        .position(|l| l.starts_with("decode/request-5 = "))
+        .unwrap();
+    grown.revisioned[i] = "decode/request-5 = ok".into();
+    assert!(baseline_problem(&base, &grown).is_none());
+    let mut shrunk = Now::get();
+    let i = shrunk
+        .revisioned
+        .iter()
+        .position(|l| l.starts_with("decode/request-4 = "))
+        .unwrap();
+    shrunk.revisioned[i] = "decode/request-4 = err".into();
+    assert!(baseline_problem(&base, &shrunk).is_some());
+    // Every past-the-end prefix names probes that exist, so the list cannot rot.
+    for p in PAST_THE_END.iter().chain(FIRST_UNKNOWN) {
+        assert!(
+            base.revisioned.iter().any(|l| l.starts_with(p)),
+            "{p} names no probe in golden/wire-1.0.txt"
+        );
+    }
 }
 
 /// The checker itself: it is what stops a wire change from shipping under an old revision.

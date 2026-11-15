@@ -268,12 +268,15 @@ struct Conn {
     /// a 1.x feature checks it before sending what the daemon must understand (DESIGN.md
     /// section 8.5).
     features: FeatureSet,
+    /// The daemon's `Features` arrived (it counts once).
+    features_seen: bool,
 }
 
 impl Conn {
     fn new(kind: LinkKind, resumed: bool) -> Self {
         Self {
             features: FeatureSet::none(),
+            features_seen: false,
             kind,
             awaiting_reply: true,
             resumed,
@@ -1733,7 +1736,14 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                     "the daemon sent a management message during an attach".into(),
                 ));
             }
-            ControlMsg::Features(theirs) => conn.features = FeatureSet::ours().common(&theirs),
+            // At most once per link (the daemon sends it right after its hello; on a swap's
+            // candidate link it is replayed after the reply): a second one is ignored, as the
+            // daemon refuses a second one of ours.
+            ControlMsg::Features(theirs) if !conn.features_seen => {
+                conn.features_seen = true;
+                conn.features = FeatureSet::ours().common(&theirs);
+            }
+            ControlMsg::Features(_) => tracing::debug!("ignored a late or second Features"),
             ControlMsg::Heartbeat { .. }
             | ControlMsg::Ack { .. }
             | ControlMsg::Resume { .. }

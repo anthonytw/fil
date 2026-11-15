@@ -42,8 +42,10 @@ pub fn encode_record(msg: &MuxMsg) -> Result<Vec<u8>, RecordError> {
     Ok(out)
 }
 
-/// How many variants [`MuxMsg`] has: an index at or past it is a later build's record.
-pub(crate) const MUX_KINDS: u32 = 13;
+/// How many variants [`MuxMsg`] has: an index at or past it is a later build's record. Kept by
+/// hand; `tests/wire_golden.rs` decodes every record it pins, so a variant added without raising
+/// it fails there.
+pub const MUX_KINDS: u32 = 13;
 
 /// Decode one record body (without its length). `None` is a record of a kind from a later build,
 /// to skip.

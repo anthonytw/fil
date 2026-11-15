@@ -515,6 +515,7 @@ async fn summary(h: &SessionHandle) -> Option<SessionSummary> {
         forwards: h.forward_count(),
         agent: h.agent_relayed(),
         daemon_version: fil_proto::msg::FilVersion::ours(),
+        ext: fil_proto::ext::RowExt::default(),
     })
 }
 
@@ -523,8 +524,9 @@ async fn summary(h: &SessionHandle) -> Option<SessionSummary> {
 /// have encoded its `Attach` in a way this daemon cannot decode, and the answer then must be
 /// "different version", not "protocol error".
 ///
-/// The client's `Features`, if it sent one, is the message right after its hello; a client that
-/// sent none has none. Messages of a type from a later 1.x build are skipped, at most
+/// The client's `Features`, if it sent one, comes at most once anywhere between its hello and its
+/// request (right after the hello by convention); a client that sent none has none, and a second
+/// one is a protocol error. Messages of a type from a later 1.x build are skipped, at most
 /// [`MAX_SKIPPED_HANDSHAKE`] of them: the handshake has only its deadline otherwise.
 ///
 /// Returns the request and the features in use (ours and the client's). 1.0 defines none, so
@@ -540,8 +542,7 @@ async fn negotiate<L: Link>(link: &L, revision: u16) -> Result<(Next, FeatureSet
         tracing::warn!(peer = %theirs.agent, "{e}");
         return Err(Fail::Tell(ErrorCode::VersionMismatch));
     }
-    let mut features = FeatureSet::none();
-    let mut right_after_hello = true;
+    let mut features: Option<FeatureSet> = None;
     let mut skipped = 0;
     loop {
         match recv_ctl(link).await? {
@@ -551,14 +552,19 @@ async fn negotiate<L: Link>(link: &L, revision: u16) -> Result<(Next, FeatureSet
                     return Err(Fail::Tell(ErrorCode::Protocol));
                 }
             }
-            Some(ControlMsg::Features(theirs)) if right_after_hello => {
-                features = FeatureSet::ours().common(&theirs);
+            // At most once, anywhere before the request: a later 1.x client may put messages
+            // this daemon does not know (a relay's `Route`) ahead of it.
+            Some(ControlMsg::Features(theirs)) if features.is_none() => {
+                features = Some(FeatureSet::ours().common(&theirs));
             }
-            Some(ControlMsg::Attach(a)) => return Ok((Next::Attach(a), features)),
-            Some(ControlMsg::Request(r)) => return Ok((Next::Request(r), features)),
+            Some(ControlMsg::Attach(a)) => {
+                return Ok((Next::Attach(a), features.unwrap_or_default()));
+            }
+            Some(ControlMsg::Request(r)) => {
+                return Ok((Next::Request(r), features.unwrap_or_default()));
+            }
             Some(_) => return Err(Fail::Tell(ErrorCode::Protocol)),
         }
-        right_after_hello = false;
     }
 }
 

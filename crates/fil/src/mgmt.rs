@@ -382,6 +382,7 @@ mod tests {
             forwards: 0,
             agent: false,
             daemon_version: fil_proto::msg::FilVersion::ours(),
+            ext: fil_proto::ext::RowExt::default(),
         }
     }
 
@@ -707,11 +708,13 @@ mod tests {
                 major: 1,
                 revision: 0,
                 version: None,
+                ext: fil_proto::ext::RowExt::default(),
             },
             OtherDaemon {
                 major: 1,
                 revision: 4,
                 version: None,
+                ext: fil_proto::ext::RowExt::default(),
             },
         ];
         let reply = Response::Sessions {
@@ -735,11 +738,13 @@ mod tests {
                     major: 2,
                     revision: 3,
                     version: None,
+                    ext: fil_proto::ext::RowExt::default(),
                 },
                 OtherDaemon {
                     major: 2,
                     revision: 0,
                     version: None,
+                    ext: fil_proto::ext::RowExt::default(),
                 },
             ],
         };
@@ -768,6 +773,7 @@ mod tests {
                 major: 1,
                 revision: 2,
                 version: None,
+                ext: fil_proto::ext::RowExt::default(),
             }],
         };
         let out = render(&Request::ListSessions, &only, "devbox", NOW).unwrap();

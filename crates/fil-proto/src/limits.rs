@@ -24,6 +24,8 @@ pub const FIRST_STABLE_REVISION: u16 = 16;
 const _: () = assert!(PROTOCOL_REVISION >= FIRST_STABLE_REVISION);
 /// Longest feature set (`crate::ext::FeatureSet`), in bytes: 256 features.
 pub const MAX_FEATURE_BYTES: usize = 32;
+/// Longest extension of a list row (`crate::ext::RowExt`).
+pub const MAX_ROW_EXT: usize = 64;
 /// Most messages of unknown type the daemon skips between a client's hello and its attach or
 /// request (the handshake has only its deadline otherwise). One more is a protocol error.
 pub const MAX_SKIPPED_HANDSHAKE: usize = 16;

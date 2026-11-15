@@ -80,6 +80,7 @@ fn summary(n: &str, attached: Option<(&str, u64)>, forwards: u16, agent: bool) -
         forwards,
         agent,
         daemon_version: fil_proto::msg::FilVersion::ours(),
+        ext: fil_proto::ext::RowExt::default(),
     }
 }
 

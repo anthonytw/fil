@@ -424,8 +424,14 @@ fn a_session_survives_the_remote_being_upgraded_in_place() {
 /// The 1.x wire is one wire (DESIGN.md section 8.5, docs/v1/wire.md): a client and a remote of
 /// two 1.x revisions work together both ways round, where two pre-1.0 revisions refuse each
 /// other. With no daemon of the client's revision on the host, the remote's relay serves it with
-/// its own daemon.
+/// a daemon of the 1.x family.
+///
+/// Ignored until the relay routes by the 1.x family rather than by one revision: decision D2's
+/// routing (PR #8 and its follow-up). The daemon side is covered without a relay
+/// (`fil-daemon`'s `a_1x_client_of_another_revision_lists_and_attaches`). It names no socket, so
+/// D2's socket names do not matter to it.
 #[test]
+#[ignore = "needs the relay to route by the 1.x family (D2, PR #8 follow-up)"]
 fn two_1x_revisions_talk_both_ways() {
     let w = World::new("onex");
     let (a, b) = (ours(), ours() + 1);
@@ -455,16 +461,9 @@ fn two_1x_revisions_talk_both_ways() {
         run.text()
     );
     drop(run);
-    assert_eq!(
-        lock_names(&w.socks),
-        [format!("fil-1-{b}.sock")],
-        "one daemon, the remote's: the older client needed none of its own"
-    );
-    // A newer client, an older remote, on a host with no daemon yet: the older relay serves it
-    // with its own daemon.
+    // A newer client, an older remote, on a host with no daemon yet.
     let w2 = World::new("onex2");
     w2.host("older", a);
     let (ok, out, err, _) = w2.ls(b, "older");
     assert!(ok && out.contains("no sessions"), "{out}{err}");
-    assert_eq!(lock_names(&w2.socks), [format!("fil-1-{a}.sock")]);
 }

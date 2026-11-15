@@ -19,7 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::net::IpAddr;
 use std::num::NonZeroU16;
 
-use crate::ext::{self, FeatureSet};
+use crate::ext::{self, FeatureSet, RowExt};
 use crate::frame::{ChannelId, Frame};
 use crate::limits::*;
 use crate::mux::{
@@ -678,6 +678,8 @@ pub struct SessionSummary {
     /// The version of the daemon that holds the session (decision D2: daemons of several
     /// versions on one host; `fil ls` shows it).
     pub daemon_version: FilVersion,
+    /// Fields a later 1.x release adds to the row (empty in 1.0; `crate::ext::RowExt`).
+    pub ext: RowExt,
 }
 
 /// Session management (`fil ls`, `fil kill`, `fil detach`). The remote command is fixed
@@ -729,8 +731,9 @@ pub enum ForwardResult {
 }
 
 /// A daemon of another wire revision, running next to the one that answers (DESIGN.md section
-/// 5.3). Its sessions cannot be listed or reached from here: only a fil of its own revision can
-/// speak to it. Numbers only: it names no session and no host.
+/// 5.3). Its sessions are not listed by this daemon. A fil of an incompatible wire cannot speak
+/// to it; any 1.x fil can (which daemon a relay routes it to is decision D2's). Numbers only: it
+/// names no session and no host.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OtherDaemon {
     pub major: u16,
@@ -739,6 +742,8 @@ pub struct OtherDaemon {
     /// Its fil version, when the daemon that answers knows it (decision D2 keys daemons by
     /// version); `None` for one found only by its wire (`fil-<major>-<rev>.lock`).
     pub version: Option<FilVersion>,
+    /// Fields a later 1.x release adds to the row (empty in 1.0; `crate::ext::RowExt`).
+    pub ext: RowExt,
 }
 
 impl OtherDaemon {
@@ -1210,7 +1215,10 @@ pub enum ControlMsg {
 }
 
 /// How many variants [`ControlMsg`] has: an index at or past it is a type from a later build.
-const CONTROL_VARIANTS: u32 = 18;
+/// Kept by hand; `tests/wire_golden.rs` ties it to its exhaustive match and decodes every
+/// instance it pins, so a variant added without raising it fails there (it would otherwise be
+/// skipped by its own build).
+pub const CONTROL_VARIANTS: u32 = 18;
 
 impl ControlMsg {
     /// Encode as the payload of a control frame.
@@ -1343,6 +1351,7 @@ mod tests {
             major: 1,
             revision: 2,
             version: None,
+            ext: RowExt::default(),
         };
         let sessions = |n: usize| {
             // Built by hand: `Response::sessions` would cut the list.
@@ -1481,11 +1490,13 @@ mod tests {
                     forwards: 2,
                     agent: true,
                     daemon_version: FilVersion::ours(),
+                    ext: RowExt::default(),
                 }],
                 vec![OtherDaemon {
                     major: 1,
                     revision: 0,
                     version: None,
+                    ext: RowExt::default(),
                 }],
             )),
             ControlMsg::Detach,
@@ -1584,6 +1595,7 @@ mod tests {
             forwards: u16::MAX,
             agent: true,
             daemon_version: FilVersion::ours(),
+            ext: RowExt::default(),
         };
         let r = Response::sessions((0..500).map(one).collect(), Vec::new());
         let Response::Sessions {

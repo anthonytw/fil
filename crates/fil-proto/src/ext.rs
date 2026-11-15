@@ -13,7 +13,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::limits::MAX_FEATURE_BYTES;
+use crate::limits::{MAX_FEATURE_BYTES, MAX_ROW_EXT};
 
 /// What a receiver makes of a payload by its variant index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +141,35 @@ impl FeatureSet {
     /// A set from a raw bitmap, as a peer may send it (tests stand in for a later build with it).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         (bytes.len() <= MAX_FEATURE_BYTES).then(|| Self(bytes.to_vec()))
+    }
+}
+
+/// Room for fields a later 1.x release adds to a row of a list (`SessionSummary`,
+/// `OtherDaemon`): a row sits in the middle of its message, so nothing can be appended after its
+/// fields. Empty in 1.0; a later release puts its row fields here, encoded as one tail struct,
+/// read back with [`tail`]. At most [`MAX_ROW_EXT`] bytes: a longer one does not decode.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+pub struct RowExt(Vec<u8>);
+
+impl<'de> Deserialize<'de> for RowExt {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let bytes: Vec<u8> = Vec::deserialize(d)?;
+        if bytes.len() > MAX_ROW_EXT {
+            return Err(serde::de::Error::custom("row extension too long"));
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl RowExt {
+    /// The extension's bytes, for [`tail`].
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// An extension holding `bytes`, or `None` past [`MAX_ROW_EXT`].
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        (bytes.len() <= MAX_ROW_EXT).then(|| Self(bytes.to_vec()))
     }
 }
 

@@ -508,7 +508,8 @@ fn an_in_session_command_reaches_its_session_on_an_older_daemon() {
     let out = w.inside_as(new, "work", &["forward", "-L", "80"]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert!(out.stdout.contains("to session \"work\""), "{}", out.stdout);
-    // A session that is in neither is still "no such session", with the other daemon named.
+    // A session that is in neither is still "no such session" (the other daemon is of this fil's
+    // family and was looked in, so the note names no daemon).
     let out = w.inside_as(new, "nowhere", &["forward", "-L", "81"]);
     assert_eq!(out.code, Some(1));
     assert!(
@@ -517,6 +518,7 @@ fn an_in_session_command_reaches_its_session_on_an_older_daemon() {
         "{}",
         out.stderr
     );
+    assert!(!out.stderr.contains("also running"), "{}", out.stderr);
 }
 
 /// No daemon at all: the message says what these commands are for.

@@ -31,7 +31,7 @@ fil kill --outdated devbox    # end the sessions on daemons older than this fil,
 
 Each version of fil runs its own daemon on a host. After you upgrade, your next connection starts the new version's daemon beside the old one, and the old daemon keeps its sessions until they end, then exits. Nothing is lost, and nothing has to be ended first:
 
-- `fil ls devbox` lists the sessions of every daemon, in one table; the FIL column says which version's daemon holds each. (It asks each daemon over a connection of its own, so an older daemon costs one more ssh connection while it runs.)
+- `fil ls devbox` lists the sessions of every daemon, in one table; the FIL column says which version's daemon holds each. It asks each daemon over an ssh connection of its own, so with an older daemon running it makes two.
 - `fil devbox build`, and `fil kill`, `fil detach`, `fil forward` and `fil ports` with a session name, reach that session on whichever daemon holds it. A name no daemon has is a new session on the newest daemon.
 - `fil kill --outdated devbox` ends the sessions on daemons older than your fil, for when the new version fixes something in the daemon (a security fix, say) and the old sessions should not wait to end on their own. It lists them first, with the jobs still running in each, then asks:
 
@@ -44,6 +44,12 @@ Each version of fil runs its own daemon on a host. After you upgrade, your next 
   ```
 
   `y` ends them, each on its own daemon; anything else ends nothing (status 1). With stdin not a terminal it ends nothing unless you pass `--yes` (`-y`). A daemon from 1.0.0 has no jobs check: its sessions are listed with `not checked (fil 1.0.0 cannot report them)` and are still ended on `y`.
+
+  It never reports a host as clean when it could not check all of it. A daemon it could not reach (one of another wire, such as a 0.x daemon, which only that fil version can end; one whose list it could not get; a list cut short because the daemon has very many sessions) is named under "not checked, so not ended", and the status is then 1 even when every session it did find was ended. If the fil on the host is itself older than yours (only with `remote = "plain"`), it ends nothing and says to upgrade the host's fil first, since new sessions would go to that old version again.
+
+  Exit status: 0 when every session on an older daemon was ended, or there was none, and nothing was left unchecked; 1 when it asked nothing (no terminal and no `--yes`) or you declined, when a kill failed, when a daemon could not be checked, or when the host's fil is older; 2 on a usage error.
+
+Each of these is a separate ssh login: `fil ls` makes one per daemon, and `fil kill --outdated` one per daemon to list them, one per older daemon for its jobs, and one per session it ends (two older daemons with three sessions each: 11). With key or agent authentication that is only time. If ssh asks you for a password, let it share one connection: `ControlMaster auto`, `ControlPath ~/.ssh/cm-%C` and `ControlPersist 10m` in `~/.ssh/config` for the host, and you are asked once.
 
 This works when the fil that runs on the host is this version or later, which the install command makes sure of (it runs your own version there). With `remote = "plain"` and an older fil installed on the host, connections go where that fil sends them: the newest daemon.
 

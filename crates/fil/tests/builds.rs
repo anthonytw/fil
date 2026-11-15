@@ -63,8 +63,13 @@ impl World {
         } else {
             "FIL_TEST_NO_FEATURES=1 "
         };
+        self.host_env(name, version, no_features);
+    }
+
+    /// [`World::host`] with `env` (`VAR=value `, each followed by a space) before the command.
+    fn host_env(&self, name: &str, version: &str, env: &str) {
         let script = format!(
-            "SHELL=/bin/sh {no_features}FIL_TEST_VERSION={version} FIL_TEST_SOCKET_DIR={} exec {FIL} server --stdio",
+            "SHELL=/bin/sh {env}FIL_TEST_VERSION={version} FIL_TEST_SOCKET_DIR={} exec {FIL} server --stdio",
             self.socks.display()
         );
         let path = self.home.join(".config/fil/config.toml");
@@ -351,5 +356,61 @@ fn after_an_upgrade_every_session_is_listed_reached_and_ended() {
             .contains("no session on new runs on a daemon older than this fil (0.0.3)"),
         "{}",
         k.stdout
+    );
+}
+
+/// On a host whose fil cannot route (its relay passes a `Route` on, as one from before them does:
+/// `FIL_TEST_RELAY_NO_ROUTE`), with a session of one name on an older and on the newest daemon,
+/// `fil kill --outdated` must not end the newest daemon's session in the older one's place. Every
+/// connection to an older build checks that build's `Hello` before it asks anything, so the older
+/// daemon is reported as not checked, nothing is ended, and the status is 1; `fil ls` lists the
+/// session once, and names the daemon it could not list.
+#[test]
+fn a_host_that_cannot_route_never_has_the_wrong_session_killed() {
+    let w = World::new("noroute");
+    w.host("old", "0.0.1", true);
+    w.host("new", "0.0.3", true);
+    w.host_env("stuck", "0.0.3", "FIL_TEST_RELAY_NO_ROUTE=1 ");
+    drop(w.attach("0.0.1", "old", "same"));
+    // Through the relay that cannot route, the newest client's attach goes to the default: the
+    // newest daemon, which makes a second "same" there.
+    drop(w.attach("0.0.3", "stuck", "same"));
+    let both = |w: &World| {
+        let mut v: Vec<String> = rows(&w.run("0.0.3", &["ls", "new"]).stdout)
+            .into_iter()
+            .filter(|r| r[0] == "same")
+            .map(|r| r.last().unwrap().clone())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(both(&w), ["0.0.1", "0.0.3"]);
+
+    let k = w.run("0.0.3", &["kill", "--outdated", "--yes", "stuck"]);
+    assert_eq!(k.code, Some(1), "{}{}", k.stdout, k.stderr);
+    assert!(!k.stdout.contains("ended session"), "{}", k.stdout);
+    assert!(
+        !k.stdout.contains("no session on"),
+        "no all-clear: {}",
+        k.stdout
+    );
+    assert!(
+        k.stderr.contains("not checked") && k.stderr.contains("fil 0.0.1"),
+        "{}",
+        k.stderr
+    );
+    assert_eq!(both(&w), ["0.0.1", "0.0.3"], "both sessions are alive");
+
+    let ls = w.run("0.0.3", &["ls", "stuck"]);
+    let same: Vec<Vec<String>> = rows(&ls.stdout)
+        .into_iter()
+        .filter(|r| r[0] == "same")
+        .collect();
+    assert_eq!(same.len(), 1, "{}", ls.stdout);
+    assert!(
+        ls.stdout
+            .contains("fil 0.0.1; fil could not list its sessions"),
+        "{}",
+        ls.stdout
     );
 }

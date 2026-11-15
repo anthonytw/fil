@@ -1276,6 +1276,14 @@ pub const CONTROL_VARIANTS: u32 = 19;
 /// of any 1.x build) before it decodes the rest.
 pub const ROUTE_INDEX: u32 = 18;
 
+/// Whether `payload` is a [`ControlMsg::Route`], by its variant index alone, without decoding the
+/// rest: a `Route` of a later release (a [`RouteTo`] variant past the last, a field it relaxed)
+/// does not decode here, and a receiver that only skips it never needs to. Every receiver of a
+/// `Route` but the relay skips it by this test (docs/v1/wire.md, *D2 under the frozen wire*).
+pub fn is_route(payload: &[u8]) -> bool {
+    crate::ext::classify(payload, ROUTE_INDEX) == crate::ext::Kind::Unknown(ROUTE_INDEX)
+}
+
 /// [`ControlMsg::Route`]: the daemon a client wants. Fields a later 1.x release adds go at the
 /// end, as for any message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

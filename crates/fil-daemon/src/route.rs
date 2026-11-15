@@ -11,15 +11,17 @@
 //! - [`RouteTo::Session`] is the daemon that holds the session, the newest first when more than
 //!   one does. Only when the default might be wrong does it ask: when no daemon runs, or the only
 //!   one running is where the default goes anyway, nothing is asked. Otherwise each daemon is asked
-//!   for its list (`ListSessions`, over its socket, with a short deadline), as `fil ls` would; that
+//!   for its list (`ListSessions`, over its socket), all at once on threads of their own, within
+//!   [`ASK_WAIT`] in total (a daemon that has not answered by then counts as not holding it), as
+//!   `fil ls` would; that
 //!   happens only while daemons of several builds run (after an upgrade, until the old one's
 //!   sessions end).
 //!
 //! The questions are plain blocking frames, like the relay's: a `Hello`, an empty `Features` and
 //! one `Request`, then the frames back until the `Response`. The daemons are the ones in the socket
 //! directory, which the caller has checked (ours, 0700, not a link) as the relay does before it
-//! connects to any of them, and each daemon checks our uid; nothing it answers goes anywhere but this decision: the
-//! session names are compared and dropped, never logged.
+//! connects to any of them, and each daemon checks our uid. Nothing a daemon answers goes anywhere
+//! but this decision: the session names are compared and dropped, never logged.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -35,8 +37,9 @@ use fil_proto::opening;
 
 use crate::paths::{RunningDaemon, compare_builds, sockets_of_wire};
 
-/// How long one daemon may take to answer whether it holds a session. A local socket: one that
-/// does not answer in this time is skipped, and the client goes where it would have gone anyway.
+/// How long the daemons, asked together, may take to answer whether they hold a session. Local
+/// sockets: one that does not answer in this time is skipped, and the client goes where it would
+/// have gone anyway. A total, so a wedged daemon costs an attach at most this.
 pub const ASK_WAIT: Duration = Duration::from_secs(2);
 
 /// What a control payload says about routing, if it is a [`ControlMsg::Route`]: `Some(Some(to))`
@@ -44,11 +47,7 @@ pub const ASK_WAIT: Duration = Duration::from_secs(2);
 /// release), which is dropped and routed as if it were not there, and `None` for any other
 /// message. The relay reads it by its variant index ([`fil_proto::msg::ROUTE_INDEX`]) first.
 pub fn read_route(payload: &[u8]) -> Option<Option<RouteTo>> {
-    // `classify` against the count up to `Route` and past it: unknown to the first, known to the
-    // second, is exactly `Route`'s index.
-    use fil_proto::ext::{Kind, classify};
-    use fil_proto::msg::ROUTE_INDEX;
-    if classify(payload, ROUTE_INDEX) != Kind::Unknown(ROUTE_INDEX) {
+    if !fil_proto::msg::is_route(payload) {
         return None;
     }
     Some(match ControlMsg::decode(payload) {
@@ -86,26 +85,63 @@ pub fn pick(
             match running.as_slice() {
                 [] => None,
                 [only] if default_is(only) => None,
-                _ => running
-                    .into_iter()
-                    .find(|d| holds(&d.socket, revision, name)),
+                _ => holders(running, revision, name),
             }
         }
     }
 }
 
-/// Whether the daemon on `socket` says it holds session `name`. `false` when it cannot be asked
-/// in time or answers anything else.
-fn holds(socket: &Path, revision: u16, name: &SessionName) -> bool {
-    sessions_of(socket, revision).is_some_and(|list| list.contains(name))
+/// The first of `running` (newest first) that says it holds session `name`, all of them asked at
+/// once and given [`ASK_WAIT`] in total. One that cannot be asked in time, or answers anything
+/// else, does not hold it.
+fn holders(
+    running: Vec<RunningDaemon>,
+    revision: u16,
+    name: &SessionName,
+) -> Option<RunningDaemon> {
+    let deadline = Instant::now() + ASK_WAIT;
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (i, d) in running.iter().enumerate() {
+        let (tx, socket, name) = (tx.clone(), d.socket.clone(), name.clone());
+        std::thread::spawn(move || {
+            let holds = sessions_of(&socket, revision, deadline).is_some_and(|l| l.contains(&name));
+            let _ = tx.send((i, holds));
+        });
+    }
+    drop(tx);
+    let mut answers: Vec<Option<bool>> = vec![None; running.len()];
+    loop {
+        // The newest that holds it, once every newer one has said it does not.
+        for (i, a) in answers.iter().enumerate() {
+            match a {
+                Some(true) => return running.into_iter().nth(i),
+                Some(false) => {}
+                None => break,
+            }
+        }
+        if answers.iter().all(Option::is_some) {
+            return None;
+        }
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((i, holds)) => answers[i] = Some(holds),
+            // Out of time (or every thread done): the newest that said so, if any.
+            Err(_) => {
+                let i = answers.iter().position(|a| *a == Some(true))?;
+                return running.into_iter().nth(i);
+            }
+        }
+    }
 }
 
 /// The sessions the daemon on `socket` lists (`ListSessions`), saying wire revision `revision` in
-/// the `Hello`. `None` when it cannot be asked within [`ASK_WAIT`] or does not answer with a list.
-pub fn sessions_of(socket: &Path, revision: u16) -> Option<Vec<SessionName>> {
-    let deadline = Instant::now() + ASK_WAIT;
+/// the `Hello`. `None` when it cannot be asked by `deadline` or does not answer with a list.
+pub fn sessions_of(socket: &Path, revision: u16, deadline: Instant) -> Option<Vec<SessionName>> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return None;
+    }
     let mut s = UnixStream::connect(socket).ok()?;
-    s.set_write_timeout(Some(ASK_WAIT)).ok()?;
+    s.set_write_timeout(Some(left)).ok()?;
     let agent = Agent::new(format!("fil-relay {}", env!("CARGO_PKG_VERSION"))).ok()?;
     let mut out = Vec::new();
     for msg in [

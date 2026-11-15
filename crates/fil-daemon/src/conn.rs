@@ -116,6 +116,13 @@ async fn recv_ctl<L: Link>(link: &L) -> Result<Option<ControlMsg>, Fail> {
     if chan != ChannelId::CONTROL {
         return Err(Fail::Tell(ErrorCode::Protocol));
     }
+    // A `Route` is for the relay; one that reaches a daemon (behind a relay too old to read it,
+    // or on QUIC) is skipped by its index, never decoded: a later release's `Route` (a `RouteTo`
+    // variant this daemon does not know) must not make the connection fail.
+    if fil_proto::msg::is_route(&payload) {
+        tracing::debug!("skipped a Route");
+        return Ok(None);
+    }
     match ControlMsg::decode(&payload) {
         Ok(msg) => Ok(Some(msg)),
         Err(MsgError::Unknown(kind)) => {
@@ -602,10 +609,11 @@ async fn negotiate<L: Link>(
     let mut skipped = 0;
     loop {
         match recv_ctl(link).await? {
-            // A `Route` is for the relay, which does not pass it on; one reaches a daemon only
-            // through a relay too old to know it (or a client that talks to the socket itself),
-            // and is skipped like a type this daemon does not know, within the same budget.
-            None | Some(ControlMsg::Route(_)) => {
+            // A type this daemon does not know, or a `Route` (for the relay, which does not pass
+            // it on; one reaches a daemon only through a relay too old to know it, on QUIC, or
+            // from a client that talks to the socket itself), skipped by `recv_ctl` within the
+            // same budget.
+            None => {
                 skipped += 1;
                 if skipped > MAX_SKIPPED_HANDSHAKE {
                     return Err(Fail::Tell(ErrorCode::Protocol));
@@ -622,6 +630,8 @@ async fn negotiate<L: Link>(
             Some(ControlMsg::Request(r)) => {
                 return Ok((Next::Request(r), features.unwrap_or_default()));
             }
+            // Never decoded (above); kept so the match says what a `Route` is to the daemon.
+            Some(ControlMsg::Route(_)) => {}
             Some(_) => return Err(Fail::Tell(ErrorCode::Protocol)),
         }
     }

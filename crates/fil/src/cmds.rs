@@ -774,29 +774,89 @@ async fn list(host: &str, config: &Config) -> u8 {
 /// without it is said not to report them, and its sessions are still listed), shows them, asks
 /// (`[y/N]` on the terminal; without one, only `--yes` goes on), then kills each through a
 /// `Route` to its daemon, which must say it is that build first.
+///
+/// It never gives a false all-clear: every daemon it could not check (one of this fil's family it
+/// could not list, one of another wire, a list cut short, a daemon that did not say its build) is
+/// named, the "no session" line is said only when nothing was skipped, and the status is then 1
+/// even if every kill it made worked. When the host's default daemon is itself older than this fil
+/// (`remote = "plain"` with an older fil on the host), it ends nothing and says to upgrade the
+/// host's fil first: new sessions would go to that old build again.
+///
+/// Exit status: 0 when every session on an older daemon was ended (or there was none) and
+/// nothing was skipped; 1 when nothing was asked or you declined, a kill failed, something could
+/// not be checked, or the host's fil is older.
 pub async fn kill_outdated(host: &str, yes: bool, config: &Config) -> u8 {
     let ours = mgmt::Build::ours();
     let listing = match gather(host, config).await {
         Ok(l) => l,
         Err(code) => return code,
     };
-    for (d, why) in &listing.unreached {
-        eprint!("fil: {}", mgmt::unreached_note(d, why));
-    }
-    let older: Vec<(mgmt::Build, Vec<SessionSummary>)> = listing
-        .parts
-        .into_iter()
-        .filter(|p| !p.list.is_empty())
-        .filter_map(|p| Some((p.build?, p.list)))
-        .filter(|(b, _)| b.older_than(&ours))
-        .collect();
-    if older.is_empty() {
-        write_stdout(&format!(
-            "no session on {} runs on a daemon older than this fil ({})\n",
+    if let Some(first) = listing.parts.first().and_then(|p| p.build.as_ref())
+        && first.older_than(&ours)
+    {
+        eprintln!(
+            "fil: the fil on {} is older than this one: its newest daemon is fil {} and this fil is {}, so new sessions would go to fil {} again. Upgrade the fil on the host first (`fil install {}`, or the host's package manager), then run this again; nothing was ended",
             fil_client::text::sanitize_inline(host),
-            ours.version
+            first.version,
+            ours.version,
+            first.version,
+            fil_client::text::sanitize_inline(host),
+        );
+        return FAILED;
+    }
+    // What this command could not check, in our words: said, and the status is 1.
+    let mut skipped: Vec<String> = Vec::new();
+    for (d, why) in &listing.unreached {
+        skipped.push(format!(
+            "{}: fil could not list its sessions ({why})",
+            d.describe()
         ));
-        return OK;
+    }
+    for d in &listing.others {
+        skipped.push(format!(
+            "{}: this fil cannot reach it; end its sessions with that fil version",
+            d.describe()
+        ));
+    }
+    let mut older: Vec<(mgmt::Build, Vec<SessionSummary>)> = Vec::new();
+    for p in listing.parts {
+        match p.build {
+            None if !p.list.is_empty() => skipped.push(format!(
+                "a daemon with {} session(s) that did not say which fil it is",
+                p.list.len()
+            )),
+            None => {}
+            Some(b) if b.older_than(&ours) && !p.list.is_empty() => {
+                if p.truncated {
+                    skipped.push(format!(
+                        "fil {}: it has more sessions than one answer holds; run this again once these have ended",
+                        b.version
+                    ));
+                }
+                older.push((b, p.list));
+            }
+            Some(_) => {}
+        }
+    }
+    let say_skipped = |skipped: &[String]| {
+        if !skipped.is_empty() {
+            eprintln!("fil: not checked, so not ended:");
+            for line in skipped {
+                eprintln!("  {line}");
+            }
+        }
+    };
+    if older.is_empty() {
+        if skipped.is_empty() {
+            write_stdout(&format!(
+                "no session on {} runs on a daemon older than this fil ({})\n",
+                fil_client::text::sanitize_inline(host),
+                ours.version
+            ));
+            return OK;
+        }
+        say_skipped(&skipped);
+        return FAILED;
     }
     let mut table: Vec<(SessionName, String, mgmt::Jobs)> = Vec::new();
     let mut targets: Vec<(mgmt::Build, SessionName)> = Vec::new();
@@ -826,6 +886,7 @@ pub async fn kill_outdated(host: &str, yes: bool, config: &Config) -> u8 {
         }
     }
     write_stdout(&mgmt::format_outdated(&table, &ours.version, host));
+    say_skipped(&skipped);
     let n = targets.len();
     let these = if n == 1 {
         "this session".to_string()
@@ -889,6 +950,17 @@ pub async fn kill_outdated(host: &str, yes: bool, config: &Config) -> u8 {
                 code = FAILED;
             }
         }
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "fil: {} not checked (above): their sessions may still run",
+            if skipped.len() == 1 {
+                "one daemon was".to_string()
+            } else {
+                format!("{} daemons were", skipped.len())
+            }
+        );
+        code = FAILED;
     }
     code
 }

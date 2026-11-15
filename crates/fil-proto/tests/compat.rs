@@ -135,6 +135,26 @@ fn every_message_takes_a_tail_but_the_hello() {
     );
 }
 
+/// A `Route` is told by its index alone, so a receiver that only skips it (a daemon) skips one
+/// of a later release that it cannot decode, a `RouteTo` variant past the last.
+#[test]
+fn a_later_route_is_still_a_route_to_skip() {
+    use fil_proto::msg::{Route, RouteTo, is_route};
+    let later = [18u8, 3, 0xAA, 0xBB];
+    assert_eq!(ControlMsg::decode(&later), Err(MsgError::Malformed));
+    assert!(is_route(&later));
+    let now = ControlMsg::Route(Route {
+        to: RouteTo::Newest,
+    })
+    .encode()
+    .unwrap();
+    assert!(is_route(&now));
+    let features = ControlMsg::Features(FeatureSet::none()).encode().unwrap();
+    assert!(!is_route(&features));
+    assert!(!is_route(&[19, 0]));
+    assert!(!is_route(&[]));
+}
+
 /// A later build's new message, MUX record and input record are skipped; the stream around them
 /// is read as ever.
 #[test]

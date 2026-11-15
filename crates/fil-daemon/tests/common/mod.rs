@@ -289,8 +289,9 @@ pub struct Connect {
     pub take_over: fil_proto::msg::TakeOver,
     /// The wire revision the `Hello` states; the build's own when unset.
     pub revision: Option<u16>,
-    /// A `Route` sent after the `Hello`, for the relay (decision D2).
-    pub route: Option<fil_proto::msg::RouteTo>,
+    /// A `Route` sent after the `Hello`, for the relay (decision D2): its payload, which may be
+    /// one this build cannot decode (a later release's).
+    pub route: Option<Vec<u8>>,
 }
 
 impl Connect {
@@ -308,7 +309,13 @@ impl Connect {
     }
     /// A client that names the daemon it wants (`Route`, right after its `Hello`).
     pub fn route(mut self, to: fil_proto::msg::RouteTo) -> Self {
-        self.route = Some(to);
+        let msg = ControlMsg::Route(fil_proto::msg::Route { to });
+        self.route = Some(msg.encode().unwrap());
+        self
+    }
+    /// A client that sends `payload` where its `Route` goes (a later release's, say).
+    pub fn route_raw(mut self, payload: &[u8]) -> Self {
+        self.route = Some(payload.to_vec());
         self
     }
     /// A client whose `Hello` states wire revision `revision` (another build's client).
@@ -382,12 +389,11 @@ impl<L: Link> Client<L> {
             }
             None => send_ctl(&cl.link, &hello()).await,
         }
-        if let Some(to) = &c.route {
-            send_ctl(
-                &cl.link,
-                &ControlMsg::Route(fil_proto::msg::Route { to: to.clone() }),
-            )
-            .await;
+        if let Some(route) = &c.route {
+            cl.link
+                .send(ChannelId::CONTROL, Bytes::from(route.clone()))
+                .await
+                .unwrap();
         }
         send_ctl(&cl.link, &ControlMsg::Attach(c.attach())).await;
         cl.wait("the attach reply", |c| {

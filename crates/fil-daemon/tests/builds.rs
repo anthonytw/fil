@@ -777,3 +777,34 @@ async fn the_jobs_pre_check_counts_what_runs_and_kills_nothing() {
     assert_eq!(all, [("quiet".to_string(), Some(0))]);
     quiet.stop().await;
 }
+
+/// A `Route` of a later release (a `RouteTo` variant past the last, which this build cannot
+/// decode) is dropped harmlessly wherever it goes: a daemon reached on its socket skips it by its
+/// index and attaches; a relay takes it out and routes as if there were none. (Over QUIC:
+/// `direct.rs`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_releases_route_is_dropped_harmlessly() {
+    let later: &[u8] = &[18, 3, 0xAA, 0xBB];
+    let s = Scratch::new();
+    let d = start_build(&s, "0.0.5", CAT).await;
+    let mut a = Client::attach(
+        d.direct_link().await,
+        Connect::new("direct", key(1)).route_raw(later),
+    )
+    .await;
+    assert!(a.reply.is_some(), "{:?} {:?}", a.refused, a.errors);
+    a.wait_screen("ready").await;
+    a.detach().await;
+    let mut b = Client::attach(
+        pipe_through_relay(relay_of(&s, "0.0.5")).await,
+        Connect::new("relayed", key(2)).route_raw(later),
+    )
+    .await;
+    assert!(b.reply.is_some(), "{:?} {:?}", b.refused, b.errors);
+    b.wait_screen("ready").await;
+    b.detach().await;
+    let mut names = names_on(&d).await;
+    names.sort();
+    assert_eq!(names, ["direct", "relayed"]);
+    d.stop().await;
+}

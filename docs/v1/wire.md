@@ -306,7 +306,10 @@ As built in revision 17:
   hello names a 1.x revision of its own family, takes it out of the stream whether or not it can
   decode it (a `RouteTo` variant of a later release routes as if there were none), and starts
   nothing for it. A daemon that receives one (behind an older relay, or on QUIC) skips it within
-  `MAX_SKIPPED_HANDSHAKE`.
+  `MAX_SKIPPED_HANDSHAKE`, by its index alone (`msg::is_route`): it never decodes a `Route`, so
+  one with a `RouteTo` variant of a later release is skipped too, by every daemon from revision
+  17 on (a revision-16 daemon skips index 18 as an unknown type anyway). A later release may
+  therefore add a `RouteTo` variant without a feature.
 - `Request::Jobs { session: Option<SessionName> }` (index 5) and
   `Response::Jobs { list: Vec<JobsRow>, truncated }` (index 6), with
   `JobsRow { name, jobs: Option<u16>, ext: RowExt }`, behind `Feature::JOBS` (bit 0).

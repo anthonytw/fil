@@ -54,6 +54,9 @@ pub enum MgmtError {
     Protocol(String),
 }
 
+/// How long a request that waits for the daemon's `Features` waits for them after its `Hello`.
+const FEATURES_WAIT: Duration = Duration::from_secs(2);
+
 /// Why a routed connection can reach another daemon than the one it named.
 const NOT_ROUTED: &str = "the fil on the remote host cannot reach a particular daemon (it predates 1.0's routing), or that daemon has just exited";
 
@@ -232,7 +235,21 @@ async fn exchange<L: Link>(
         // The daemon's `Hello` and `Features` come first, unasked.
         let mut features: Option<FeatureSet> = None;
         while peer_hello.is_none() || features.is_none() {
-            let (channel, payload) = link.recv().await.map_err(MgmtError::Lost)?;
+            // Every 1.x daemon sends its `Features` right after its `Hello`; a peer that has said
+            // its `Hello` and nothing more for a while has none (a test peer that speaks only 1.0
+            // messages), rather than holding the request until the answer's timeout.
+            let next = if peer_hello.is_some() {
+                match tokio::time::timeout(FEATURES_WAIT, link.recv()).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        features = Some(FeatureSet::none());
+                        continue;
+                    }
+                }
+            } else {
+                link.recv().await
+            };
+            let (channel, payload) = next.map_err(MgmtError::Lost)?;
             if channel != ChannelId::CONTROL {
                 continue;
             }

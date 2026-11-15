@@ -429,6 +429,17 @@ fn take_route(
     }
 }
 
+/// Whether this relay ignores `Route`s, as one from before them does: never, but **test only**
+/// (`test-hooks`) `FIL_TEST_RELAY_NO_ROUTE` makes it pass them on, so a real-binary test can show
+/// what a client does on a host whose fil cannot route.
+fn route_off() -> bool {
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("FIL_TEST_RELAY_NO_ROUTE").is_some() {
+        return true;
+    }
+    false
+}
+
 /// A control frame holding `payload`, written to the client.
 fn write_payload<W: Write>(output: &mut W, payload: &[u8]) -> Result<(), RelayError> {
     let frame = opening::frame_of(payload)
@@ -510,7 +521,8 @@ where
     let route = match want {
         Want::Wire { major, revision }
             if revision >= fil_proto::limits::FIRST_STABLE_REVISION
-                && crate::paths::same_family((major, revision), own) =>
+                && crate::paths::same_family((major, revision), own)
+                && !route_off() =>
         {
             take_route(&rx, &mut held, &mut ended, opts.hello_wait)
         }

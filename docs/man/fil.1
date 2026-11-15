@@ -187,6 +187,13 @@ attached elsewhere and you did not take it over;
 2 on a usage error;
 255 if a forward failed and forward_failure = "exit".
 With \-N, a stop signal (Ctrl\-C) detaches and exits 0, or 255 before the session is attached.
+fil kill \-\-outdated exits 0 only when every session on an older daemon was ended (or there was
+none) and every daemon could be checked; 1 when it asked nothing (no terminal, no \-\-yes) or you
+declined, a kill failed, a daemon could not be checked (each is named), or the host\*(Aqs own fil is
+older than this one.
+After an upgrade, fil ls HOST and fil kill \-\-outdated make one ssh connection per daemon (kill
+\-\-outdated also one per older daemon for its jobs and one per session it ends): with a password
+login, set ControlMaster auto and ControlPersist in ~/.ssh/config to be asked once.
 .PP
 Source: every release publishes fil\-<version>\-source.tar.gz beside the binaries (GPL\-3.0 Corresponding Source).
 .SH "SEE ALSO"

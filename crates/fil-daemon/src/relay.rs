@@ -28,8 +28,9 @@
 //!   it holds ([`crate::route`]). The relay takes the `Route` out of the stream (the daemon never
 //!   sees it) and starts nothing for it; when it names nothing that runs, the rules below apply;
 //! - **another family whose daemon is running** (the newest of `fil-<major>-<rev>-v<ver>.sock`,
-//!   then `fil-<major>-<rev>.sock`; revision 0 is the pre-revision `fil-<major>.sock`): connect
-//!   to it. Nothing is started;
+//!   then `fil-<major>-<rev>.sock`): connect to it. Nothing is started. (Revision 0's path, the
+//!   pre-revision `fil-<major>.sock`, is still known to [`Paths::socket_of`], but no client
+//!   reaches it any more: those builds' openings are not recognised, see "The opening is frozen".);
 //! - **another family with no daemon:** answer with this relay's `Hello` and
 //!   `Error(VersionMismatch)` and end, so the client can say which side is newer. Nothing is
 //!   started: a daemon of a wire nobody asked for would only idle.
@@ -45,12 +46,8 @@
 //! the wire golden's `[frozen]` section, so no later revision can change them and strand an older
 //! client's session.
 //!
-//! Builds from before the opening was frozen (revision 0, the dev builds up to the wire revision
-//! change, and revisions 1 and 2) opened with a `Heartbeat` control message whose variant index
-//! had been 7 and became 6 when `Resize` was removed. Those two byte strings are known and
-//! recognised by value ([`LEGACY_PINGS`]), and answered in the form that client reads. Nothing
-//! more is guessed about old builds: any other first frame is not an opening, and goes with the
-//! rest of the stream to the relay's own daemon unchanged, as does a stream with no `Hello` within
+//! Nothing is guessed about other first frames: one that is not the opening goes with the rest
+//! of the stream to the relay's own daemon unchanged, as does a stream with no `Hello` within
 //! [`RelayOptions::hello_wait`].
 //!
 //! The relay is plain blocking `std` code on threads: stdin and stdout may be a terminal, a
@@ -251,24 +248,6 @@ impl Read for EofWatch {
 const CHUNKS_QUEUED: usize = 8;
 /// The most pings the relay answers before it wants a hello: one is what a client sends.
 const MAX_PINGS: usize = 4;
-/// The opening pings of builds from before it was frozen, each with the answer that build reads.
-/// Both are a `Heartbeat { nonce: 0, .. }` control message in the encoding of its time: variant
-/// index 7 up to the removal of `Resize` (the `ede9cb2` build and the dev builds until then), 6
-/// since (wire revisions 1 and 2). The first is the real bytes of an `ede9cb2` client's opening
-/// (`tests/opening.rs` carries them as captured).
-const LEGACY_PINGS: [(&[u8], &[u8]); 2] = [(&[7, 0, 0], &[7, 0, 1]), (&[6, 0, 0], &[6, 0, 1])];
-
-/// The payload to answer a client's opening ping with, if `payload` is one.
-fn pong_for(payload: &[u8]) -> Option<&'static [u8]> {
-    if payload == opening::PING {
-        return Some(opening::PONG);
-    }
-    LEGACY_PINGS
-        .iter()
-        .find(|(ping, _)| *ping == payload)
-        .map(|(_, pong)| *pong)
-}
-
 /// A chunk of the client's side of the pipe.
 enum Chunk {
     Data(Vec<u8>),
@@ -347,11 +326,8 @@ fn read_opening<W: Write>(
         match frame_at(&buf) {
             Ok(Some((frame, used))) => {
                 let is_control = frame.channel == fil_proto::ChannelId::CONTROL;
-                if is_control
-                    && answered < MAX_PINGS
-                    && let Some(pong) = pong_for(&frame.payload)
-                {
-                    write_payload(output, pong)?;
+                if is_control && answered < MAX_PINGS && frame.payload == opening::PING {
+                    write_payload(output, opening::PONG)?;
                     buf.drain(..used);
                     answered += 1;
                     continue;

@@ -68,7 +68,7 @@ fil devbox --predict off
 
 ### `install`
 
-`"ask"` (default), `"never"` or `"always"`: whether an attach that finds no fil on the host offers to install it. It asks only on an interactive first attach.
+`"ask"` (default), `"never"` or `"always"`: whether an attach that finds no fil on the host offers to install it. It asks only on an interactive first attach. A tunnel (`fil -N`) never asks: with `"ask"` it says to run `fil install HOST`; with `"always"` it installs when `fil -N` is started from a terminal (stdin is one), and otherwise says to run `fil install HOST` too.
 
 ### `takeover`
 
@@ -137,7 +137,7 @@ How much typing is held while the link is down, as a size (`"4KiB"`) or a number
 
 ### `offline_input.confirm`
 
-`"off"` (default) or `"after 10s"` (a whole number with `ms`, `s` or `m`; `s` if no unit): after a disconnect that long, show what was typed and ask before sending it.
+`"off"` (default) or `"after 10s"` (a whole number with `ms`, `s`, `m` or `h`; `s` if no unit; a value too large is an error): after a disconnect that long, show what was typed and ask before sending it.
 
 ### `offline_input.log`
 

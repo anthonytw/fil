@@ -2253,8 +2253,7 @@ impl<I: TermInput, O: TermOutput> Core<I, O> {
                 return Self::reconnect("terminal data out of order");
             };
             if !fresh.is_empty() {
-                let fresh = fresh.to_vec();
-                self.apply_output(pos, &fresh)?;
+                self.apply_output(pos, fresh)?;
             }
         }
         if limit.is_some_and(|until| self.sess.recv.received() < until)

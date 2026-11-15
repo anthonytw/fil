@@ -3710,3 +3710,28 @@ fn the_golden_covers_the_whole_wire() {
     }
     assert!(!g.history.is_empty());
 }
+
+/// The relay's hello reader is byte-exact by design (sweep A-01; `docs/v1/wire.md` decision 15):
+/// a hello whose variant index is the non-canonical varint `80 00` is a `Hello` to
+/// `ControlMsg::decode`, which accepts non-canonical varints, but not a hello to the frozen
+/// `opening::hello_of`, so the relay takes it as an unknown opening (its own daemon), never
+/// as a hello of some other wire. Pinned here without a golden line: nothing about the wire
+/// changes.
+#[test]
+fn a_non_canonical_hello_index_is_not_a_hello_to_the_relay() {
+    let canonical = ControlMsg::Hello(Hello::with_revision(Agent::new("fil test").unwrap(), 16))
+        .encode()
+        .unwrap();
+    assert_eq!(canonical[0], 0, "the hello's index is the one byte 0");
+    assert!(opening::hello_of(&canonical).is_some());
+    let mut wide = vec![0x80, 0x00];
+    wide.extend_from_slice(&canonical[1..]);
+    assert!(
+        matches!(ControlMsg::decode(&wide), Ok(ControlMsg::Hello(_))),
+        "the decoder takes a non-canonical index (decision 15)"
+    );
+    assert!(
+        opening::hello_of(&wide).is_none(),
+        "the relay's frozen reader does not"
+    );
+}

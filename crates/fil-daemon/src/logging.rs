@@ -678,7 +678,16 @@ pub fn init(path: &Path, log_panics: bool) -> bool {
     if installed && log_panics {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            tracing::error!(panic = %info, "the process panicked");
+            // The location only at error level: a panic's message can quote the data it
+            // was handling (a `str` slicing panic quotes the string), which may be the
+            // user's terminal text or a session name. The message itself is debug only.
+            match info.location() {
+                Some(at) => {
+                    tracing::error!(file = at.file(), line = at.line(), "the process panicked")
+                }
+                None => tracing::error!("the process panicked"),
+            }
+            tracing::debug!(panic = %info, "the panic's message");
             previous(info);
         }));
     }

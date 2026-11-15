@@ -43,7 +43,9 @@ pub enum Install {
     /// `~/.local/bin/fil`: where the install script puts it, and where the docs say to copy the
     /// archive's `bin/fil`.
     LocalBin,
-    /// Anywhere else: copied by hand from a release archive.
+    /// Anywhere else: copied by hand from a release archive. The path is for showing: under
+    /// `$HOME` it starts with `~` in its place, so a pasted `fil --version` does not name the
+    /// user (DESIGN.md section 11.1).
     Manual(PathBuf),
 }
 
@@ -174,7 +176,23 @@ pub fn detect(f: &dyn Facts) -> Install {
             return Install::Rpm;
         }
     }
-    Install::Manual(exe)
+    Install::Manual(tilde(&exe, home.as_deref(), f))
+}
+
+/// `exe` with `$HOME` (as set, or with its links resolved) shown as `~`; unchanged elsewhere.
+fn tilde(exe: &Path, home: Option<&Path>, f: &dyn Facts) -> PathBuf {
+    let Some(home) = home.filter(|h| h.parent().is_some()) else {
+        return exe.to_path_buf();
+    };
+    [Some(home.to_path_buf()), f.canonical(home)]
+        .into_iter()
+        .flatten()
+        .find_map(|h| {
+            exe.strip_prefix(&h)
+                .ok()
+                .map(|rest| Path::new("~").join(rest))
+        })
+        .unwrap_or_else(|| exe.to_path_buf())
 }
 
 /// dpkg's file list of the package `fil` (`fil.list`, or `fil:<arch>.list` for a multi-arch
@@ -568,7 +586,7 @@ mod tests {
         // Not a version directory, or not under the install root.
         assert_eq!(
             detect(&Fake::at("/home/u/.local/share/fil/latest/fil")),
-            Install::Manual("/home/u/.local/share/fil/latest/fil".into())
+            Install::Manual("~/.local/share/fil/latest/fil".into())
         );
         assert_eq!(
             detect(&Fake::at("/tmp/0.4.0-w1.16/fil")),
@@ -577,6 +595,38 @@ mod tests {
         // No executable path at all.
         let none = Fake::default();
         assert_eq!(detect(&none), Install::Manual("fil".into()));
+    }
+
+    /// `fil --version` is pasted into reports: a copy by hand under `$HOME` is shown with `~`,
+    /// never with the home directory (which names the user).
+    #[test]
+    fn a_copy_by_hand_under_home_is_shown_with_a_tilde() {
+        let hand = detect(&Fake::at("/home/u/tools/fil"));
+        assert_eq!(hand, Install::Manual("~/tools/fil".into()));
+        let line = upgrade_line(&hand);
+        assert!(
+            line.contains("at ~/tools/fil.") && !line.contains("/home/u"),
+            "{line}"
+        );
+        // $HOME through a link: the executable's path is resolved, $HOME as set is not.
+        let linked = Fake::at("/data/u/tools/fil")
+            .home("/home/u")
+            .link("/home/u", "/data/u");
+        assert_eq!(detect(&linked), Install::Manual("~/tools/fil".into()));
+        // A path that only starts with the same letters is not under $HOME.
+        assert_eq!(
+            detect(&Fake::at("/home/u2/fil")),
+            Install::Manual("/home/u2/fil".into())
+        );
+        // Outside $HOME the path is shown as it is; a $HOME of / changes nothing.
+        assert_eq!(
+            detect(&Fake::at("/opt/tools/fil")),
+            Install::Manual("/opt/tools/fil".into())
+        );
+        assert_eq!(
+            detect(&Fake::at("/opt/tools/fil").home("/")),
+            Install::Manual("/opt/tools/fil".into())
+        );
     }
 
     #[test]

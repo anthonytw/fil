@@ -922,10 +922,11 @@ impl Daemon {
         }
         let dir_lock = hold_dir_lock_on(dir, Duration::from_secs(2));
         tracing::info!(
-            socket = %sock.display(),
             udp_port = inner.host.direct_now().map_or(0, |d| d.udp_port),
             "daemon started"
         );
+        // The path names the uid; the default log keeps such details to a minimum.
+        tracing::debug!(socket = %sock.display(), "the daemon's socket");
         Ok(Daemon {
             inner,
             paths,

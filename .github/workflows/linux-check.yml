@@ -7,8 +7,9 @@
 #             change touches the release paths, tests/ci/release-paths.sh).
 #   extended  once per merge batch, on `main` (the run of each push of main,
 #             which is also what saves the rust-cache every other run restores; save-if below), about
-#             15 min: the gate's jobs, realnet's functional parts, the terminals, and the arm64 smoke
-#             (the static aarch64 build installed through the gate, pi_e2e, the drop-in quick set).
+#             15 min: the gate's jobs, realnet's functional parts, the terminals, the arm64 smoke
+#             (the static aarch64 build installed through the gate, pi_e2e, the drop-in quick set),
+#             and `compat` (each released 1.x tag against HEAD, both ways; docs/v1/wire.md).
 #   all       the release candidate (`tests/release/just.sh release` dispatches it), about 20 min:
 #             extended's jobs, release-test always, every test at full size in three shards, realnet
 #             with the cable pulls and the measurements, and the arm64 run in two shards (the full
@@ -196,6 +197,44 @@ jobs:
       - name: The release scripts' own tests
         if: steps.relpaths.outputs.run == 'true'
         run: tests/release/just.sh release-test
+
+  compat:
+    # Old against new within 1.x (docs/v1/wire.md; suites extended and all): every released 1.x tag
+    # in tests/compat/tags.txt is built and run against HEAD with the drop-in quick set, its client
+    # against HEAD's daemon and HEAD's client against its daemon. While the list is empty (until
+    # v1.0.0) the script says so and passes; crates/fil-proto/tests/compat.rs stands in.
+    if: contains(fromJSON('["extended","all"]'), (inputs.suite || (github.event_name == 'push' && 'extended' || 'check')))
+    runs-on: ubuntu-24.04
+    # Per tag: two ci-profile builds and two quick sets (an estimate: 8 min each).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          # The tags it builds.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: false
+      - name: Drop-in tools (htop; top, git and ssh-add come with the image)
+        run: sudo apt-get update && sudo apt-get install -y htop vim less
+      - name: Each released 1.x tag against HEAD, both ways
+        run: tests/compat/run.sh
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compat-dropin
+          path: |
+            ~/.local/state/fil
+            target/dropin
+            !target/dropin/agentkey-*
+            !target/dropin/agent-*.sock
+          if-no-files-found: ignore
+          retention-days: 14
 
   full-scale:
     # suite=all: every test at full size (FIL_TEST_SCALE=full), the `soak_` tests included

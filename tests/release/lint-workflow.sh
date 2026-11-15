@@ -36,7 +36,8 @@
 #      `build-macos` records each attempt's universal binary (outputs sha256_a and sha256_b of its
 #      step `digest`); a job `docs` runs docs/man/build.sh (unowned crate code, via cargo run) and
 #      records its tar (output docs of its step `docs`); `package` runs neither docs/man/build.sh
-#      nor `cargo run`, checks the docs tar against that output before it unpacks it, checks both
+#      nor `cargo run`, checks the docs tar against that output and that it holds only regular files
+#      and directories inside it (digest.sh tar-safe) before it unpacks it, checks both
 #      sets/*/universal-apple-darwin/fil against build-macos's outputs before
 #      tests/release/package.sh reads them and both assemblies' macOS archives after it, and
 #      records SHA256SUMS (output sums of its step `sums`) after those checks and before any
@@ -257,6 +258,7 @@ awk '
       if (t ~ /^run: tests\/release\/digest\.sh out docs docs-tar\/docs\.tar$/) d12[job, "emit_docs"] = NR
       if (t ~ /^DOCS_SHA256: \$\{\{ needs\.docs\.outputs\.docs \}\}$/) d12[job, "env_docs"] = NR
       if (t ~ /^tests\/release\/digest\.sh check "\$DOCS_SHA256" docs-in\/docs\.tar$/ && !d12[job, "check_docs"]) d12[job, "check_docs"] = NR
+      if (t ~ /^tests\/release\/digest\.sh tar-safe docs-in\/docs\.tar$/ && !d12[job, "safe_docs"]) d12[job, "safe_docs"] = NR
       if (t ~ /^MACOS_SHA256_A: \$\{\{ needs\.build-macos\.outputs\.sha256_a \}\}$/) d12[job, "env_a"] = NR
       if (t ~ /^MACOS_SHA256_B: \$\{\{ needs\.build-macos\.outputs\.sha256_b \}\}$/) d12[job, "env_b"] = NR
       if (t ~ /^tests\/release\/digest\.sh check "\$MACOS_SHA256_A" sets\/a\/universal-apple-darwin\/fil$/ && !d12[job, "check_a"]) d12[job, "check_a"] = NR
@@ -310,6 +312,8 @@ awk '
       bad("package runs docs/man/build.sh or cargo run (unowned crate code beside the release files; the docs job builds the docs)")
     if (!d12["package", "env_docs"] || !d12["package", "check_docs"] || !first_docs_untar["package"] || d12["package", "check_docs"] > first_docs_untar["package"])
       bad("package does not check the docs tar against the docs job output docs before it unpacks it (tests/release/digest.sh check)")
+    if (!d12["package", "safe_docs"] || !first_docs_untar["package"] || d12["package", "safe_docs"] > first_docs_untar["package"])
+      bad("package does not check that the docs tar holds only regular files and directories inside it before it unpacks it (tests/release/digest.sh tar-safe)")
     if (!d12["package", "env_a"] || !d12["package", "env_b"] || !d12["package", "check_a"] || !d12["package", "check_b"])
       bad("package does not check both macOS binaries against build-macos outputs sha256_a and sha256_b (tests/release/digest.sh check)")
     else if (!first_pkg["package"] || d12["package", "check_a"] > first_pkg["package"] || d12["package", "check_b"] > first_pkg["package"])

@@ -202,7 +202,9 @@ mutate_wf "build-macos loses an output" 's/      sha256_b: \$\{\{ steps.digest.o
 mutate_wf "no docs job (the docs tar is not recorded)" 's/        id: docs\n        run: tests\/release\/digest.sh out docs docs-tar\/docs.tar\n/        run: sha256sum docs-tar\/docs.tar\n/'
 mutate_wf "package builds the docs itself again" 's/(          tar -xf docs-in\/docs.tar -C docs-out-b\n)/$1          docs\/man\/build.sh docs-out\n/'
 mutate_wf "package runs cargo run" 's/(            cargo --version\n)/$1            cargo run --locked -p fil-shell --example gen_docs -- --help\n/'
-mutate_wf "package unpacks the docs before checking them" 's/(          tests\/release\/digest.sh check "\$DOCS_SHA256" docs-in\/docs.tar\n)(          mkdir docs-out docs-out-b\n          tar -xf docs-in\/docs.tar -C docs-out\n)/$2$1/'
+mutate_wf "package unpacks the docs before checking them" 's/(          tests\/release\/digest.sh check "\$DOCS_SHA256" docs-in\/docs.tar\n)((?:[^\n]*\n){2})(          mkdir docs-out docs-out-b\n          tar -xf docs-in\/docs.tar -C docs-out\n)/$2$3$1/'
+mutate_wf "package no longer checks the docs tar's members" 's/          tests\/release\/digest.sh tar-safe docs-in\/docs.tar\n//'
+mutate_wf "package checks the docs tar's members after unpacking it" 's/(          tests\/release\/digest.sh tar-safe docs-in\/docs.tar\n)(          mkdir docs-out docs-out-b\n          tar -xf docs-in\/docs.tar -C docs-out\n)/$2$1/'
 mutate_wf "package no longer checks the docs tar" 's/          tests\/release\/digest.sh check "\$DOCS_SHA256" docs-in\/docs.tar\n//'
 mutate_wf "package records SHA256SUMS after release-check runs the binary" 's/(      # Before release-check, which runs[^\n]*\n[^\n]*\n      - name: SHA256SUMS.s SHA-256, as a job output\n        id: sums\n        run: tests\/release\/digest.sh out sums out\/SHA256SUMS\n)(.*?)(      - name: The amd64 .deb and .rpm install)/$2$1$3/s'
 mutate_wf "package no longer checks the macOS archive of assembly b" 's/          tests\/release\/digest.sh check-tar "\$MACOS_SHA256_B" out-b\/[^\n]*\n//'
@@ -236,6 +238,33 @@ printf 'z\n' > "$dg/rel/fil-1.0.0-x86_64-linux-gnu.tar.gz"
 expect_fail "digest.sh: listed fails an unlisted file" "$RELEASE_DIR/digest.sh" listed "$dg/rel"
 rm "$dg/rel/fil-1.0.0-x86_64-linux-gnu.tar.gz" "$dg/rel/fil-install.sh"
 expect_fail "digest.sh: listed fails a listed file that is missing" "$RELEASE_DIR/digest.sh" listed "$dg/rel"
+# tar-safe: tars made with python's tarfile, one odd member each
+python3 -I - "$dg" << 'EOF2'
+import io, sys, tarfile
+d = sys.argv[1]
+def mk(name, members):
+    with tarfile.open(f"{d}/{name}.tar", "w", format=tarfile.GNU_FORMAT) as t:
+        for m in members:
+            data = b"x\n" if m.type == tarfile.REGTYPE else b""
+            m.size = len(data)
+            t.addfile(m, io.BytesIO(data) if data else None)
+def reg(n):
+    return tarfile.TarInfo(n)
+def dir_(n):
+    m = tarfile.TarInfo(n); m.type = tarfile.DIRTYPE; m.mode = 0o755; return m
+def link(n, kind, target):
+    m = tarfile.TarInfo(n); m.type = kind; m.linkname = target; return m
+mk("ok", [dir_("./"), dir_("./share"), reg("./share/a.1")])
+mk("symlink", [dir_("./share"), link("./share/a.1", tarfile.SYMTYPE, "/etc/passwd")])
+mk("hardlink", [reg("./share/a.1"), link("./share/b.1", tarfile.LNKTYPE, "./share/a.1")])
+mk("dotdot", [reg("./share/../../x")])
+mk("abs", [reg("/abs")])
+EOF2
+expect_pass "digest.sh: tar-safe passes regular files and directories" "$RELEASE_DIR/digest.sh" tar-safe "$dg/ok.tar"
+expect_fail "digest.sh: tar-safe fails a symbolic link" "$RELEASE_DIR/digest.sh" tar-safe "$dg/symlink.tar"
+expect_fail "digest.sh: tar-safe fails a hard link" "$RELEASE_DIR/digest.sh" tar-safe "$dg/hardlink.tar"
+expect_fail "digest.sh: tar-safe fails a .. component" "$RELEASE_DIR/digest.sh" tar-safe "$dg/dotdot.tar"
+expect_fail "digest.sh: tar-safe fails an absolute path" "$RELEASE_DIR/digest.sh" tar-safe "$dg/abs.tar"
 # --locked: scripts in a copy of the directory
 mkdir -p "$tmp/scripts"
 cp "$RELEASE_DIR"/*.sh "$tmp/scripts/"

@@ -297,6 +297,8 @@ jobs:
         run: |
           set -euo pipefail
           tests/release/digest.sh check "$DOCS_SHA256" docs-in/docs.tar
+          # only regular files and directories, inside the target: no link can point a later write elsewhere
+          tests/release/digest.sh tar-safe docs-in/docs.tar
           mkdir docs-out docs-out-b
           tar -xf docs-in/docs.tar -C docs-out
           tar -xf docs-in/docs.tar -C docs-out-b

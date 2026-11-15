@@ -10,6 +10,9 @@
 #   digest.sh check-tar WANT TGZ...  the one TOP/bin/fil inside each .tar.gz has SHA-256 WANT
 #   digest.sh listed DIR             DIR holds exactly SHA256SUMS and the files it lists (regular
 #                                    files), so nothing unlisted is attested or uploaded
+#   digest.sh tar-safe TAR           every member of TAR is a regular file or a directory, with no
+#                                    leading / and no .. component, so unpacking it writes only
+#                                    plain files under the target directory
 #
 # Exit status 0 only if every check passed.
 set -euo pipefail
@@ -71,5 +74,26 @@ case $cmd in
     done
     echo "digest: $dir holds exactly SHA256SUMS and the $(($(printf '%s\n' "$want" | wc -l) - 1)) files it lists" >&2
     ;;
-  *) die "usage: digest.sh out NAME FILE | check WANT FILE... | check-tar WANT TGZ... | listed DIR" ;;
+  tar-safe)
+    [ $# = 1 ] || die "usage: digest.sh tar-safe TAR"
+    [ -f "$1" ] || die "digest: no archive $1"
+    python3 -I - "$1" << 'EOF' || die "digest: $1 is not safe to unpack (above)"
+import sys, tarfile
+bad = []
+with tarfile.open(sys.argv[1]) as t:
+    for m in t.getmembers():
+        parts = m.name.split("/")
+        if m.name.startswith("/"):
+            bad.append(f"{m.name!r}: an absolute path")
+        elif ".." in parts:
+            bad.append(f"{m.name!r}: a .. component")
+        elif not (m.isreg() or m.isdir()):
+            bad.append(f"{m.name!r}: not a regular file or a directory (type {m.type!r})")
+for b in bad:
+    print(f"release: digest: {b}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+EOF
+    echo "digest: $1 holds only regular files and directories, inside it" >&2
+    ;;
+  *) die "usage: digest.sh out NAME FILE | check WANT FILE... | check-tar WANT TGZ... | listed DIR | tar-safe TAR" ;;
 esac

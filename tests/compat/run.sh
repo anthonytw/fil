@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Old against new within 1.x (docs/v1/wire.md, DESIGN.md section 8.5 "Compatibility"): for every
-# tag in tests/compat/tags.txt, build that tag's `fil` and `fil-daemon-dev` and run the drop-in
-# quick set against a private daemon twice: the old `fil` with HEAD's daemon, then HEAD's `fil`
-# with the old daemon. linux-check's `compat` job runs it (suites extended and all); it needs the
-# tags fetched (a full clone). With no tag listed it says so and passes.
+# Old against new within 1.x (docs/v1/wire.md, DESIGN.md section 8.5 "Compatibility").
+#
+# 1. Once v1.0.0 is tagged, the 1.0 wire baseline (crates/fil-proto/tests/golden/wire-1.0.txt)
+#    must be the tagged one, byte for byte: nobody may re-take it after the freeze.
+# 2. A bounded set of the tags in tests/compat/tags.txt (v1.0.0, and the newest patch of each of
+#    the two newest minors after it: at most three, so the job's time stays bounded however many
+#    releases there are) is built (`--locked`) and run against HEAD with the drop-in quick set,
+#    against a private daemon, twice: the old `fil` with HEAD's daemon, then HEAD's `fil` with
+#    the old daemon.
+#
+# linux-check's `compat` job runs it (suites extended and all); it needs the tags (a full clone).
+# With no tag listed it says so and passes.
 #
 #   tests/compat/run.sh [TAGS_FILE]
 set -euo pipefail
@@ -12,7 +19,20 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 list=${1:-$root/tests/compat/tags.txt}
 target=${CARGO_TARGET_DIR:-$root/target}
 work=$target/compat
+baseline=crates/fil-proto/tests/golden/wire-1.0.txt
 
+cd "$root"
+if git rev-parse -q --verify 'refs/tags/v1.0.0^{commit}' > /dev/null; then
+  if ! git show "v1.0.0:$baseline" | cmp -s - "$baseline"; then
+    echo "compat: $baseline differs from v1.0.0's: the 1.0 wire baseline never changes after the tag" >&2
+    exit 1
+  fi
+  echo "compat: $baseline is v1.0.0's"
+else
+  echo "compat: no v1.0.0 tag yet: the baseline is not anchored to it yet"
+fi
+
+tags=()
 lines=()
 while IFS= read -r line || [ -n "$line" ]; do
   line=${line%%#*}
@@ -28,27 +48,48 @@ while IFS= read -r line || [ -n "$line" ]; do
     echo "compat: the extra arguments for $tag may hold only dropin flags and names: '$extra'" >&2
     exit 2
   fi
+  tags+=("$tag")
   lines+=("$line")
 done < "$list"
 
-if [ ${#lines[@]} -eq 0 ]; then
+if [ ${#tags[@]} -eq 0 ]; then
   echo "compat: no released 1.x tag is listed in ${list#"$root"/} yet: nothing to run against HEAD."
   echo "compat: skipped; crates/fil-proto/tests/compat.rs (a simulated later 1.x peer) stands in."
   exit 0
 fi
 
-cd "$root"
+# The bounded set: v1.0.0 if listed, and the newest patch of each of the two newest minors.
+selected=()
+while IFS= read -r t; do selected+=("$t"); done < <(
+  printf '%s\n' "${tags[@]}" | sort -t. -k2,2n -k3,3n | awk -F. '
+    { newest[$2 + 0] = $0; if ($0 == "v1.0.0") first = 1 }
+    END {
+      n = 0; for (m in newest) keys[n++] = m + 0
+      for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) if (keys[j] > keys[i]) { t = keys[i]; keys[i] = keys[j]; keys[j] = t }
+      if (first) print "v1.0.0"
+      for (i = 0; i < n && i < 2; i++) print newest[keys[i]]
+    }' | sort -u
+)
+echo "compat: against HEAD: ${selected[*]} (of ${#tags[@]} listed)"
+
 echo "compat: building HEAD"
-cargo build -q --profile ci -p fil-shell --bin fil --example dropin
-cargo build -q --profile ci -p fil-daemon --bin fil-daemon-dev
-cargo build -q --profile ci -p fil-testbins --bin fwdprobe
+cargo build -q --locked --profile ci -p fil-shell --bin fil --example dropin
+cargo build -q --locked --profile ci -p fil-daemon --bin fil-daemon-dev
+cargo build -q --locked --profile ci -p fil-testbins --bin fwdprobe
 head_bin=$target/ci
 rm -rf "$work"
 mkdir -p "$work"
+trees=()
+cleanup() {
+  for t in ${trees[@]+"${trees[@]}"}; do git worktree remove --force "$t" 2> /dev/null || true; done
+}
+trap cleanup EXIT
 status=0
-for line in "${lines[@]}"; do
-  tag=${line%% *}
-  read -r -a extra <<< "${line#"$tag"}"
+for tag in "${selected[@]}"; do
+  extra=()
+  for l in "${lines[@]}"; do
+    if [ "${l%% *}" = "$tag" ]; then read -r -a extra <<< "${l#"$tag"}"; fi
+  done
   git rev-parse -q --verify "refs/tags/$tag^{commit}" > /dev/null || {
     echo "compat: tag $tag is not in this clone (fetch the tags: a full clone)" >&2
     exit 2
@@ -56,8 +97,9 @@ for line in "${lines[@]}"; do
   echo "compat: building $tag"
   tree=$work/src-$tag
   git -c advice.detachedHead=false worktree add -q --detach "$tree" "$tag"
-  (cd "$tree" && CARGO_TARGET_DIR=$work/target-$tag cargo build -q --profile ci -p fil-shell --bin fil &&
-    CARGO_TARGET_DIR=$work/target-$tag cargo build -q --profile ci -p fil-daemon --bin fil-daemon-dev)
+  trees+=("$tree")
+  (cd "$tree" && CARGO_TARGET_DIR=$work/target-$tag cargo build -q --locked --profile ci -p fil-shell --bin fil &&
+    CARGO_TARGET_DIR=$work/target-$tag cargo build -q --locked --profile ci -p fil-daemon --bin fil-daemon-dev)
   old_bin=$work/target-$tag/ci
   # The drop-in driver takes the daemon from next to --fil: one directory per direction.
   mkdir -p "$work/$tag/old-client" "$work/$tag/new-client"
@@ -75,6 +117,5 @@ for line in "${lines[@]}"; do
       status=1
     fi
   done
-  git worktree remove --force "$tree"
 done
 exit $status

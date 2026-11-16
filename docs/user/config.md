@@ -72,7 +72,7 @@ fil devbox --predict off
 
 ### `takeover`
 
-`"ask"` (default) or `"always"`: what happens when you attach to a session that another client is attached to. `ask` shows who has it and since when, and asks whether to take it over; `n` leaves it alone and fil exits with status 1. A client whose link is down (a laptop asleep) still counts, and the question says it is disconnected. `always` takes the session over without asking, as fil 0.2 and earlier always did (the key is new in 0.3.0; earlier versions refuse it as unknown). A session nobody is attached to never asks.
+`"ask"` (default) or `"always"`: what happens when you attach to a session that another client is attached to. `ask` shows who has it and since when, and asks whether to take it over; `n` leaves it alone and fil exits with status 1. A client whose link is down (a laptop asleep) still counts, and the question says it is disconnected. `always` takes the session over without asking. A session nobody is attached to never asks.
 
 `--take-over` does the same as `always` for one run:
 

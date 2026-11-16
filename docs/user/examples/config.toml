@@ -5,7 +5,7 @@
 [defaults]
 transport = "auto"        # auto | pipe | direct
 host_label = "laptop"     # shown to other clients on a takeover; default: this machine's short host name
-predict = "adaptive"      # off | adaptive | always: predictive echo (from 0.2.0); --predict overrides it
+predict = "adaptive"      # off | adaptive | always: predictive echo; --predict overrides it
 takeover = "ask"          # ask | always: a session attached elsewhere is taken over only after you say yes;
                           # --take-over is always, for one run
 

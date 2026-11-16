@@ -8,7 +8,7 @@ Say what you found, the fil version (`fil --version`), the platforms and transpo
 
 ## Supported versions
 
-Only the latest release gets security fixes. A fix ships as a new release; older releases are not patched. Before 1.0 a minor release can change the wire, so a fix can mean upgrading both ends.
+Only the latest release gets security fixes. A fix ships as a new release; older releases are not patched.
 
 ## What happens next
 

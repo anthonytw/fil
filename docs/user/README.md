@@ -2,7 +2,7 @@
 
 fil is a remote shell for development over SSH. It keeps your place: the connection can drop, your laptop can sleep or change networks, and your shell, its output and your port forwards are still there when you come back. This guide is for people who use fil and for the admins of the hosts they use it on.
 
-This is the guide for **0.3.0**. 0.2.0 added [predictive echo](#predictive-echo) to the ssh/et drop-in that 0.1.0 was, and 0.3.0 asks before taking over a session another client holds. Where something is new in 0.2.0 or 0.3.0, the page says so.
+This is the guide for **1.0.0**.
 
 ## Start here
 
@@ -20,13 +20,13 @@ This is the guide for **0.3.0**. 0.2.0 added [predictive echo](#predictive-echo)
 
 ## Predictive echo
 
-New in 0.2.0. Over a slow link, every key you type takes a round trip before it appears, because the host echoes it. fil can draw the character in your terminal at once, as a guess, and replace it with what the host really sends when that arrives, as mosh does.
+Over a slow link, every key you type takes a round trip before it appears, because the host echoes it. fil can draw the character in your terminal at once, as a guess, and replace it with what the host really sends when that arrives, as mosh does.
 
 **What you see.** With the default, `predict = "adaptive"`, fil guesses only when the round trip is above about 30 ms (and stops below about 20 ms), so on a fast link you see no difference. For 30 s after an echo that took more than 250 ms from its key, it shows guesses even on a fast link. While the round trip is above about 80 ms, or in those 30 s, the guesses are **underlined**, so you can tell them from what the host has confirmed; the underline goes when the echo arrives. On a link in between, guesses are drawn plain. A guess that turns out wrong is replaced by what the host sent, usually within one round trip.
 
 **What it predicts.** Printable characters (ASCII and Latin-script characters) at a shell or REPL prompt, Backspace over what you just typed, and the left and right arrows (and Ctrl-B, Ctrl-F) within what you just typed. It never predicts Enter, Tab completion, history, Ctrl-R, Ctrl-U, Ctrl-W or other control keys, never draws anything that would wrap a line or scroll the screen, and stays off in full-screen programs that use the alternate screen (vim, less, htop, tmux). Your keys go to the host exactly as they would without prediction.
 
-**After an interruption** (changed in 0.3.0). In 0.2.0, once something interrupted the run of guesses, prediction stayed off until your typing slowed below about one key per round trip: about 7 keys a second at a 150 ms round trip and 2.5 at 400 ms. What interrupts it: Enter, Tab, Ctrl-W, a Backspace while keys are still on their way to the host, and reaching the end of the line. From 0.3.0 fil waits until the keys before the interruption have reached the host (about one round trip), then guesses the keys you have typed since and goes on as before, while you keep typing. What remains: typing steadily faster than about 12 keys a second gets no new guesses until it slows, and in fish, or with zsh's autosuggestions, fil guesses only while at most one key is on its way, so not while you type fast. None of this shows anything wrong: fil just does not guess, and you see your keys when the host echoes them, as over ssh. The measurements are in [the latency cells](../m3/latency.md#coverage-at-long-round-trips-the-known-limit-020-ships-with).
+**After an interruption.** Some keys interrupt the run of guesses: Enter, Tab, Ctrl-W, a Backspace while keys are still on their way to the host, and reaching the end of the line. fil then waits until the keys before the interruption have reached the host (about one round trip), guesses the keys you have typed since, and goes on as before, while you keep typing. What remains: typing steadily faster than about 12 keys a second gets no new guesses until it slows, and in fish, or with zsh's autosuggestions, fil guesses only while at most one key is on its way, so not while you type fast. None of this shows anything wrong: fil just does not guess, and you see your keys when the host echoes them, as over ssh. The measurements are in [the latency cells](../m3/latency.md#coverage-at-long-round-trips-the-known-limit-020-ships-with).
 
 **Turning it off.** In [`config.toml`](config.md#predict), for one host or for all:
 

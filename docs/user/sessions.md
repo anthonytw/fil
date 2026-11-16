@@ -43,9 +43,9 @@ Each version of fil runs its own daemon on a host. After you upgrade, your next 
   fil: end these 2 sessions and everything running in them? [y/N]
   ```
 
-  `y` ends them, each on its own daemon; anything else ends nothing (status 1). With stdin not a terminal it ends nothing unless you pass `--yes` (`-y`). A daemon from 1.0.0 has no jobs check: its sessions are listed with `not checked (fil 1.0.0 cannot report them)` and are still ended on `y`.
+  `y` ends them, each on its own daemon; anything else ends nothing (status 1). With stdin not a terminal it ends nothing unless you pass `--yes` (`-y`).
 
-  It never reports a host as clean when it could not check all of it. A daemon it could not reach (one of another wire, such as a 0.x daemon, which only that fil version can end; one whose list it could not get; a list cut short because the daemon has very many sessions) is named under "not checked, so not ended", and the status is then 1 even when every session it did find was ended. If the fil on the host is itself older than yours (only with `remote = "plain"`), it ends nothing and says to upgrade the host's fil first, since new sessions would go to that old version again.
+  It never reports a host as clean when it could not check all of it. A daemon it could not reach (one of another major version, which only that fil can end; one whose list it could not get; a list cut short because the daemon has very many sessions) is named under "not checked, so not ended", and the status is then 1 even when every session it did find was ended. If the fil on the host is itself older than yours (only with `remote = "plain"`), it ends nothing and says to upgrade the host's fil first, since new sessions would go to that old version again.
 
   Exit status: 0 when every session on an older daemon was ended, or there was none, and nothing was left unchecked; 1 when it asked nothing (no terminal and no `--yes`) or you declined, when a kill failed, when a daemon could not be checked, or when the host's fil is older; 2 on a usage error.
 
@@ -78,7 +78,7 @@ Pasted text is never read as an escape.
 
 ## One client at a time: takeover
 
-At most one client is attached to a session. If you attach to a session that is attached elsewhere, fil first asks whether to take it over (new in 0.3.0; before, the attach took it over at once):
+At most one client is attached to a session. If you attach to a session that is attached elsewhere, fil first asks whether to take it over:
 
 ```
 fil: "build" is attached from laptop since 2026-11-13 14:02:00. Take it over?  y = yes, n = no

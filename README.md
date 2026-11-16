@@ -10,7 +10,7 @@ fil is a remote shell for development over SSH that keeps your place:
 - **Connects directly over QUIC**, or over a plain SSH pipe when UDP is blocked, and moves between the two by itself.
 - **Needs no root and no service** on the host: one program, run as you. It respects the host admin's sshd forwarding settings.
 
-- **Shows what you type before the host echoes it**, as mosh does, when the round trip is long enough for that to help. This predictive local echo is on by default (`predict = "adaptive"`) from 0.2.0.
+- **Shows what you type before the host echoes it**, as mosh does, when the round trip is long enough for that to help. This predictive local echo is on by default (`predict = "adaptive"`).
 
 It has no panes: your terminal already does that.
 

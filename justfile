@@ -29,7 +29,7 @@ default:
 ci: lint test
 
 # `ci` without the tests: linux-check's `lint` job (which then runs the drop-in quick set).
-lint: deny notices ci-workflow-test exporter-lock fmt-check clippy check-default release-deps
+lint: deny dep-age notices ci-workflow-test exporter-lock fmt-check clippy check-default release-deps
 
 # Before a release (docs/m4/release.md §9.2), on a quiet machine (about 20 min; docs/dev/timing-tests.md
 # "Tiers"): only what needs a quiet host and a real clock, which no shared runner gives: the
@@ -102,6 +102,7 @@ shipped-no-test-hooks:
 # (tests/ci/release-paths.sh: Linux's list and macOS's `--mac`). Part of `ci`; needs python3 and git.
 ci-workflow-test:
     python3 -I -B tests/ci/test_push_skip.py
+    python3 -I -B tests/ci/test_dep_age.py
     tests/ci/test_release_paths.sh
 
 fmt-check:
@@ -209,6 +210,12 @@ wire-golden-1-0:
 # License, source and ban policy, RustSec advisories and yanked crates (deny.toml).
 deny:
     cargo deny {{deny_flags}} check advisories licenses bans sources
+
+# No locked crates.io version younger than fourteen days (tests/ci/dep_age.py; exceptions in
+# tests/ci/dep-age-allow.txt). Fetches the publish times from the crates.io index, so it needs the
+# network, like `deny`. Part of `lint`, so every PR and the release candidate run it.
+dep-age:
+    python3 -I -B tests/ci/dep_age.py
 
 # Slow link-simulator soak: many seeds, harsh conditions (a `soak_` test: `test-release` runs it,
 # not `ci`).

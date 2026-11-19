@@ -29,9 +29,7 @@ INDEX = {
         {"vers": "2.0.0", "pubtime": ago(30)},
         {"vers": "2.0.1", "pubtime": ago(2)},
     ],
-    "ancient": [
-        {"vers": "0.1.0"}
-    ],  # no pubtime: published before the index recorded times
+    "notime": [{"vers": "0.1.0"}],
 }
 
 
@@ -54,8 +52,10 @@ class Check(unittest.TestCase):
         self.assertEqual(self.run_check([("old", "1.0.1")], days=8), [])
         self.assertEqual(len(self.run_check([("old", "1.0.1")], days=8.01)), 1)
 
-    def test_missing_pubtime_is_old(self):
-        self.assertEqual(self.run_check([("ancient", "0.1.0")]), [])
+    def test_missing_pubtime_fails(self):
+        problems = self.run_check([("notime", "0.1.0")])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("no publish time", problems[0])
 
     def test_unknown_version_fails(self):
         problems = self.run_check([("old", "9.9.9")])

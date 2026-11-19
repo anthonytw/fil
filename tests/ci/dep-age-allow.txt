@@ -1,3 +1,4 @@
 # Exceptions to the minimum age of locked crates.io versions (tests/ci/dep_age.py, `just dep-age`).
 # One line per version: NAME VERSION REASON. Only for a fix that cannot wait (a security release),
-# with the advisory or reason; remove the line once the version is old enough (a stale line fails).
+# with the advisory or reason. A line fails the check once its version is old enough, so open the
+# follow-up that removes it within the fourteen days, before it turns every PR red.

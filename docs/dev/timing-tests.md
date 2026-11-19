@@ -161,7 +161,7 @@ ruleset requires:
 
 | Runner | Job | Contents |
 |---|---|---|
-| Linux | `linux-check` `lint` | `just lint` (deny, notices, the workflow test, the exporter lock, fmt, clippy, the default-features check, release-deps); then the drop-in quick set against a private daemon on Linux (`just dropin --local --set quick`: every scenario under about 6 s, and `predict_secret`) |
+| Linux | `linux-check` `lint` | `just lint` (deny, the dependency age check, notices, the workflow test, the exporter lock, fmt, clippy, the default-features check, release-deps); then the drop-in quick set against a private daemon on Linux (`just dropin --local --set quick`: every scenario under about 6 s, and `predict_secret`) |
 | Linux | `linux-check` `check` | `just test` (every test but `wallclock_` and `soak_` at smoke size, logic and OS, and the doctests); the `ci`-profile no-test-hooks check; fidelity `--no-perf`; the prediction guard sweep; the PTY prediction harness at 2 seeds; the client's PTY tests |
 | Linux | `linux-check` `release-test` | the release scripts' own tests, only when the change touches the release paths (`tests/ci/release-paths.sh`: what CODEOWNERS owns as deciding a release, the justfile, and the other files selftest.sh reads; `git diff --no-renames` against the merge base with main) |
 | macOS arm64 | `macos-check` `check (arm64)` | clippy; `just test-os` (the OS tests at smoke size); `cargo check --target x86_64-apple-darwin -p fil-shell`; the client's PTY tests |

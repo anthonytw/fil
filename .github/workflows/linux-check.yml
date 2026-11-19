@@ -68,7 +68,7 @@ concurrency:
 jobs:
   lint:
     # The PR gate's first half (suite check, extended, all): `just lint` (cargo deny with the fetched
-    # RustSec database, the notices, the CI workflow test, the exporter lock, fmt, clippy, the
+    # RustSec database, the dependency age check, the notices, the CI workflow test, the exporter lock, fmt, clippy, the
     # default-features check, release-deps), then the drop-in quick set (`dropin --set quick`:
     # every scenario under about 6 s, and predict_secret) against a private daemon on Linux: the
     # end-to-end run per PR now that macOS's drop-in is per merge batch.
@@ -96,7 +96,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y htop vim less
       # The steps after the first run even when an earlier one failed, so one run shows every red
       # step; the job is red if any of them is.
-      - name: just lint (deny, notices, workflow test, exporter lock, fmt, clippy, default features, release-deps)
+      - name: just lint (deny, dep-age, notices, workflow test, exporter lock, fmt, clippy, default features, release-deps)
         run: just lint
       - name: The 1.0 wire baseline is v1.0.0's (skips while the tag does not exist)
         if: ${{ !cancelled() }}

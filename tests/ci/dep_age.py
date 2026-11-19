@@ -11,8 +11,10 @@ less than `--days` days (default 14) ago. The check runs on every PR (`just lint
 release candidate, so a release never ships a dependency younger than that.
 
 The publish time is the `pubtime` field of the crates.io sparse index (index.crates.io, a static
-CDN; one request per crate, not per version). A version with no `pubtime` predates the field and
-is old. Anything that cannot be fetched or read fails the check: it never passes silently.
+CDN; one request per crate, not per version). crates.io stamps it at publish time (a publisher
+cannot backdate it) and has filled it in for every older version too, so a version without one is
+a problem. Anything that cannot be fetched or read fails the check: it never passes silently.
+Needs Python 3.11 or later (tomllib).
 
 An urgent fix (a security release we must take now) goes in tests/ci/dep-age-allow.txt as
 `NAME VERSION REASON`, with a reason, and comes out once it is old enough; a stale entry fails.
@@ -21,6 +23,7 @@ An urgent fix (a security release we must take now) goes in tests/ci/dep-age-all
 import argparse
 import concurrent.futures
 import datetime
+import http.client
 import json
 import os
 import subprocess
@@ -79,7 +82,13 @@ def fetch_index(name, tries=3):
             with urllib.request.urlopen(req, timeout=30) as r:
                 body = r.read().decode()
             return [json.loads(line) for line in body.splitlines() if line.strip()]
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ) as e:
             if attempt == tries - 1:
                 raise SystemExit(f"dep-age: cannot fetch {url}: {e}")
             time.sleep(2 * (attempt + 1))
@@ -121,7 +130,10 @@ def check(crates, index, now, days, allow):
             continue
         pubtime = entry.get("pubtime")
         if pubtime is None:
-            continue  # published before the index recorded times: old
+            problems.append(
+                f"{name} {version}: the crates.io index gives no publish time"
+            )
+            continue
         age = now - parse_time(pubtime)
         if age >= min_age:
             continue

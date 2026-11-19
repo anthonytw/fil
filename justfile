@@ -99,7 +99,8 @@ shipped-no-test-hooks:
 
 # The cases of the Gitea workflow's push-to-main skip decision (tests/ci/push_skip.py, issue #38):
 # offline fakes of git and the API, under a second; and of the release-test jobs' path filter
-# (tests/ci/release-paths.sh: Linux's list and macOS's `--mac`). Part of `ci`; needs python3 and git.
+# (tests/ci/release-paths.sh: Linux's list and macOS's `--mac`); and of the dependency age check
+# (tests/ci/dep_age.py, offline, with a fake index). Part of `ci`; needs python3 (3.11 or later) and git.
 ci-workflow-test:
     python3 -I -B tests/ci/test_push_skip.py
     python3 -I -B tests/ci/test_dep_age.py
@@ -213,7 +214,8 @@ deny:
 
 # No locked crates.io version younger than fourteen days (tests/ci/dep_age.py; exceptions in
 # tests/ci/dep-age-allow.txt). Fetches the publish times from the crates.io index, so it needs the
-# network, like `deny`. Part of `lint`, so every PR and the release candidate run it.
+# network, like `deny`, and Python 3.11 or later. Part of `lint`, so every PR and the release
+# candidate run it.
 dep-age:
     python3 -I -B tests/ci/dep_age.py
 
